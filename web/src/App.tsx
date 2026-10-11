@@ -37,6 +37,9 @@ const NAV: NavItem[] = [
 /** Pages built around wide tables get more room, like the map. */
 const TABLE_PAGES = new Set(['pods', 'workloads', 'storage', 'activity', 'agents'])
 
+/** Sources a metrics page explains in its own notice. */
+const METRICS_PAGE = ['prometheus']
+
 /** Old paths that still work. */
 const ALIAS: Record<string, string> = { volumes: 'storage' }
 
@@ -129,6 +132,8 @@ export function App() {
   else if (parts[0] === 'activity') page = <Gate state={infoState} title="Activity" cap="audit">{(i) => <Activity route={route} info={i} />}</Gate>
   else if (parts[0] === 'agents') page = <Gate state={infoState} title="Agents" cap="agents">{() => <Agents onMissing={() => hideRoute('/agents')} />}</Gate>
   else page = <Findings info={info} />
+  // Pages that read metrics say "Prometheus is unavailable" themselves; the banner leaves it out there.
+  const explained = page.type === Findings || page.type === Memory || page.type === PodDetail ? METRICS_PAGE : undefined
 
   const section = parts[0] ? '/' + parts[0] : '/'
   // Gated tabs appear once the server says it has them and the user may use them, so there are no dead links.
@@ -165,7 +170,7 @@ export function App() {
       </header>
       <ClusterBar info={info} />
       <main id="main" className={parts[0] === 'map' ? 'wide' : TABLE_PAGES.has(parts[0] ?? '') && parts.length === 1 ? 'tables' : undefined}>
-        <StatusBanners info={info} />
+        <StatusBanners info={info} explained={explained} />
         {page}
       </main>
     </InfoContext.Provider>

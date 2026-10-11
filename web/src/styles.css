@@ -93,6 +93,8 @@ input, select { font: inherit; color: var(--ink); background: var(--surface); bo
 .notice.warn { border-left-color: var(--warning); }
 .notice.crit { border-left-color: var(--critical); }
 .notice p { margin: 0 0 8px; }
+.notice.busy p:last-child { margin-bottom: 0; }
+.countdown { font-variant-numeric: tabular-nums; }
 .empty { padding: 40px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
 .empty p { margin: 6px 0 0; color: var(--pencil); }
 .refetching { opacity: 0.6; transition: opacity 0.15s; }

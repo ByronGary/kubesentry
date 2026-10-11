@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { can, hiddenNote } from '../access'
 import { qs } from '../api'
 import { auditTarget } from '../components/ActivityTable'
-import { Async, Empty, PageHead, WindowSelect } from '../components/ui'
+import { Async, BusyNotice, Empty, PageHead, WindowSelect } from '../components/ui'
 import { Lines, VirtualTable, type Column } from '../components/VirtualTable'
 import { ago, formatDateTime } from '../format'
 import { auditHistoryHours, auditWhy, windowChoices, type WindowOption } from '../retention'
@@ -60,7 +60,8 @@ export function Activity({ route, info }: { route: Route; info: Info }) {
   const user = p.get('user') ?? ''
   const set = (k: string, v: string) => setQuery('/activity', { since, tag, user, [k]: v })
 
-  const summary = useApi<AuditSummary>(info.audit ? `/api/v1/audit/summary${qs({ since })}` : null, 60_000)
+  // A busy audit store answers 503 with Retry-After: both wait it out and ask again (retry.ts).
+  const summary = useApi<AuditSummary>(info.audit ? `/api/v1/audit/summary${qs({ since })}` : null, 60_000, { retryBusy: true })
   // Newest first, one page at a time: "Load older" follows the cursor.
   const events = usePaged<AuditEventsResponse, AuditEvent>(info.audit ? `/api/v1/audit/events${qs({ since, tag, user })}` : null, {
     items: eventItems,
@@ -68,7 +69,10 @@ export function Activity({ route, info }: { route: Route; info: Info }) {
     limit: PAGE,
     mode: 'manual',
     refreshMs: 60_000,
+    retryBusy: true,
   })
+  const eventsBusy = events.error !== undefined && events.retry !== undefined
+  const summaryBusy = summary.error !== undefined && summary.retry !== undefined
   const tags = Object.keys(summary.data?.byTag ?? {}).sort()
   const users = (summary.data?.users ?? []).map((u) => u.username)
   const choices = useMemo(() => windowChoices(SINCE, auditHistoryHours(info.auditStore), auditWhy(info.auditStore)), [info.auditStore])
@@ -103,8 +107,10 @@ export function Activity({ route, info }: { route: Route; info: Info }) {
         </label>
       </div>
       {!can(info, 'clusterAudit') && <p className="notice">{hiddenNote('clusterAudit')}</p>}
+      {/* One notice is enough when both are waiting: the events one below. */}
+      {summaryBusy && !eventsBusy && <BusyNotice retry={summary.retry} note="Per-user totals and the filter lists follow once it answers." />}
 
-      <Async state={events} what="activity">
+      <Async state={events} what="activity" busy="Audit store is busy">
         {(d) => (
           <>
             {summary.data && summary.data.users.length > 0 && !user && !tag && (
@@ -142,13 +148,18 @@ export function Activity({ route, info }: { route: Route; info: Info }) {
                     {events.hasMore ? '; older ones follow' : ''}
                   </p>
                   <VirtualTable rows={d.items} columns={columns} rowKey={(e) => e.auditID + e.stage} caption="Audit events, newest first" rowHeight={44} minWidth={900} />
-                  {events.hasMore && (
-                    <p className="load-more">
-                      <button type="button" className="btn" onClick={events.loadMore} disabled={events.loadingMore}>
-                        {events.loadingMore ? 'Loading…' : 'Load older events'}
-                      </button>
-                    </p>
-                  )}
+                  {events.hasMore &&
+                    (events.moreRetry ? (
+                      <div className="load-more">
+                        <BusyNotice retry={events.moreRetry} note="Older events load once it answers." />
+                      </div>
+                    ) : (
+                      <p className="load-more">
+                        <button type="button" className="btn" onClick={events.loadMore} disabled={events.loadingMore}>
+                          {events.loadingMore ? 'Loading…' : 'Load older events'}
+                        </button>
+                      </p>
+                    ))}
                 </>
               )}
             </section>

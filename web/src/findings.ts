@@ -286,3 +286,21 @@ export function rank(findings: Finding[]): Finding[] {
     return a.id.localeCompare(b.id)
   })
 }
+
+/** What the empty Findings page checked: only sources that answered are named. */
+export interface Checked {
+  /** Prometheus answered, so leaks were looked for. */
+  leaks: boolean
+  security: boolean
+  certs: boolean
+  /** The audit log answered. */
+  activity: boolean
+}
+
+/** "No OOM kills, leaking containers or unused volumes in the last 24 hours." */
+export function nothingFoundText(c: Checked, lookback: string): string {
+  const parts = ['OOM kills', c.leaks && 'leaking containers', c.security && 'security risks', c.certs && 'failing certificates', 'unused volumes', c.activity && 'notable activity'].filter(
+    (p): p is string => typeof p === 'string',
+  )
+  return `No ${parts.slice(0, -1).join(', ')} or ${parts[parts.length - 1]} ${lookback}.`
+}
