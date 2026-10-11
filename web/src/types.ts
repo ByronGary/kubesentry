@@ -13,6 +13,8 @@ export interface Info {
   certs: boolean
   /** Who is calling, when the server knows (proxy or token mode). */
   identity?: { user: string; groups: string[]; source: 'proxy' | 'token' | 'none' }
+  /** Proxy mode: where "Sign out" goes (the oauth2-proxy sign-out path), from -auth-sign-out-url. */
+  signOutURL?: string
   /** What this caller may see beyond namespaced data; absent means everything. */
   capabilities?: Partial<Record<Capability, boolean>>
   cluster?: { name?: string; version: string; platform: string; provider?: string; region?: string }
@@ -467,6 +469,11 @@ export interface NodeSummary {
   pods: NodePod[]
   podCount?: number
   placement?: Placement
+}
+
+/** POST /api/v1/auth/recheck: the caller's capabilities after their cached access decisions were dropped. */
+export interface RecheckResponse {
+  capabilities: Partial<Record<Capability, boolean>>
 }
 
 export interface AgentStatus {

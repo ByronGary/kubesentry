@@ -42,6 +42,13 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 | `GET /api/v1/oom` | leaks come from the background `LeakReport` when the window matches its window |
 | `GET /api/v1/audit/events` | `?continue=` (opaque cursor); scope-filtered |
 | `GET /api/v1/agents` | new: `[{node, lastReport, processes, bytes, stale}]` |
+| `POST /api/v1/auth/recheck` | new: forgets the caller's cached authorization decisions and returns `{capabilities}`; at most once a minute per identity (429 otherwise) |
+
+### Authentication rules
+- Proxy mode reads identity headers only from `-auth-trusted-proxy-cidrs`; from anywhere else they are ignored.
+- A proxy user starting with `system:` is refused. IdP groups starting with `system:` are dropped (so no IdP group can become `system:masters`); groups produced by the admin's group map are kept as written.
+- Every identity, including the token and `none` identities, carries `system:authenticated`.
+- The UI learns the mode from `/info` `identity.source`. In proxy mode oauth2-proxy guards every path, so a 401 mid-session means the SSO session expired: the UI reloads the page to sign in again. In token mode a 401 shows the token prompt.
 
 Pagination: `limit` (default 200, max 1000) and an opaque `continue` token; the response carries `continue` when there is more.
 
@@ -57,7 +64,8 @@ Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in 
 | `-auth-username-prefix` / `-auth-groups-prefix` | `""` | match the API server's (or EKS OIDC provider's) prefixes |
 | `-auth-group-map-file` | | JSON `{ "idp-group": ["k8s-group", ...] }` |
 | `-auth-trusted-proxy-cidrs` | `127.0.0.1/32,::1/128` | only these may send identity headers |
-| `-authz-qps` / `-authz-cache-ttl` / `-authz-deny-ttl` | `200` / `5m` / `1m` | SubjectAccessReview budget and cache |
+| `-auth-sign-out-url` | `""` | returned in `/info` as `signOutURL`; the chart sets `/oauth2/sign_out` when oauth2-proxy is enabled |
+| `-authz-qps` / `-authz-cache-ttl` / `-authz-deny-ttl` | `200` / `5m` / `5m` | SubjectAccessReview budget and cache. Grants and revocations take up to the TTL to show; a user can force a recheck (below) |
 | `-authz-share-by-groups` | `false` | cache by RBAC-relevant group set instead of per user |
 | `-ingest-addr` / `-ops-addr` / `-pprof` | | listeners (above) |
 | `-cache` | `true` | informer cache; `false` lists per request (debugging) |
@@ -98,7 +106,7 @@ Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (headless S
 `image`, `agent`, `replicas`, `resources`, `serviceAccount{create,name,annotations}`, `auth{mode,userHeader,groupsHeader,usernamePrefix,groupsPrefix,groupMap,trustedProxyCIDRs,authzQPS,shareByGroups}`, `oauth2Proxy{enabled,image,provider,issuerURL,clientID,existingSecret,extraArgs,sessionStore}`, `prometheus{url,autodiscover,service,selector,ksmLimits,amp{enabled,workspaceURL,region}}`, `audit{store,retention,redactExecArgs,postgres{existingSecret,schema,sslmode},sources{webhook,cloudwatch{enabled,logGroup,streamPrefix,start},file{path}}}`, `eks{clusterName,region,awsAuth{read}}`, `systemNamespaces{replace,add}`, `thresholds{...}`, `pricing{defaultPrice,ebsPrices,classPrices}`, `pdb`, `networkPolicy`, `topologySpread`, `ingress`, `metrics{serviceMonitor,prometheusRule}`, `apf{enabled}`, `extraArgs`.
 
 ## Metrics (`/metrics` on the ops listener)
-`kubesentry_http_requests_total{route,code}`, `kubesentry_http_request_duration_seconds{route}`, `kubesentry_http_inflight`, `kubesentry_snapshot_build_seconds`, `kubesentry_snapshot_age_seconds`, `kubesentry_snapshot_version`, `kubesentry_informer_objects{resource}`, `kubesentry_kube_requests_total{verb,resource,code}`, `kubesentry_authz_reviews_total{result}`, `kubesentry_authz_cache_total{result}`, `kubesentry_prometheus_query_seconds{kind}`, `kubesentry_prometheus_cache_total{result}`, `kubesentry_audit_ingested_total{source}`, `kubesentry_audit_queue_depth`, `kubesentry_audit_store_errors_total`, `kubesentry_cloudwatch_lag_seconds`, `kubesentry_agent_reports_total{code}`, `kubesentry_agent_nodes_reporting`, plus Go runtime metrics.
+`kubesentry_http_requests_total{route,code}`, `kubesentry_http_request_duration_seconds{route}`, `kubesentry_http_inflight`, `kubesentry_http_cache_total{result}`, `kubesentry_snapshot_build_seconds`, `kubesentry_snapshot_age_seconds`, `kubesentry_snapshot_version`, `kubesentry_informer_objects{resource}`, `kubesentry_kube_requests_total{verb,resource,code}`, `kubesentry_authz_reviews_total{result}`, `kubesentry_authz_cache_total{result}`, `kubesentry_prometheus_query_seconds{kind}`, `kubesentry_prometheus_cache_total{result}`, `kubesentry_audit_ingested_total{source}`, `kubesentry_audit_queue_depth`, `kubesentry_audit_store_errors_total`, `kubesentry_cloudwatch_lag_seconds`, `kubesentry_agent_reports_total{code}`, `kubesentry_agent_nodes_reporting`, plus Go runtime metrics.
 
 ## Postgres schema (`internal/pgstore/migrations/0001_audit.sql`)
 ```sql
