@@ -41,7 +41,10 @@ export interface UnusedPVC {
   capacityBytes: number
   created: string
   ageHours: number
+  /** 0 when costKnown is false. */
   estMonthlyCostUSD: number
+  costKnown?: boolean
+  priceSource?: PriceSource
 }
 
 export interface UnusedPVCResponse {
