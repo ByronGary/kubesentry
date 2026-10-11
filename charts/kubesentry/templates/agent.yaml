@@ -1,0 +1,150 @@
+{{- if .Values.agent.enabled }}
+{{- $g := .Values.agent -}}
+{{- $fullname := include "kubesentry.fullname" . -}}
+{{- $ns := include "kubesentry.agentNamespace" . -}}
+{{- $ca := include "kubesentry.agentCASource" . -}}
+{{- if and $g.createNamespace (ne $ns .Release.Namespace) }}
+# The agent needs hostPID, which only the "privileged" Pod Security level
+# allows. Keeping it in its own namespace lets the server's namespace enforce
+# "restricted".
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    {{- with $g.namespaceLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+{{- end }}
+{{- if $g.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kubesentry.agentServiceAccountName" . }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+# The agent never talks to the Kubernetes API.
+automountServiceAccountToken: false
+---
+{{- end }}
+# Node agent: reports the processes inside pods. It reads
+# /proc/<pid>/{cgroup,stat,statm,cmdline} of pod processes only, never
+# environment variables, files or memory, and redacts command lines. hostPID is
+# its only host access: it is not privileged, runs as non-root and mounts
+# nothing from the host.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullname }}-agent
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: agent
+spec:
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "kubesentry.agentSelectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: {{ $g.updateStrategy.type }}
+    {{- if and (eq $g.updateStrategy.type "RollingUpdate") $g.updateStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml $g.updateStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubesentry.agentSelectorLabels" . | nindent 8 }}
+        app.kubernetes.io/version: {{ include "kubesentry.imageTag" (dict "image" $g.image "root" .) | trunc 63 | quote }}
+        {{- with $g.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $g.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "kubesentry.agentServiceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostPID: true
+      {{- with $g.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  # Fargate runs no DaemonSets; its virtual nodes would leave pods Pending.
+                  - key: eks.amazonaws.com/compute-type
+                    operator: NotIn
+                    values: ["fargate"]
+                  {{- range $g.nodeAffinity.excludeLabels }}
+                  - key: {{ .key }}
+                    operator: NotIn
+                    values: {{ toJson .values }}
+                  {{- end }}
+      {{- with $g.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $g.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: {{ include "kubesentry.image" (dict "image" $g.image "root" .) }}
+          imagePullPolicy: {{ $g.image.pullPolicy }}
+          args:
+            {{- include "kubesentry.agentArgs" . | nindent 12 }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubesentry.agentTokenSecret" . }}
+                  key: {{ .Values.tokens.agent.key }}
+            {{- with $g.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          securityContext:
+            {{- toYaml $g.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml $g.resources | nindent 12 }}
+          {{- if $ca }}
+          volumeMounts:
+            - name: server-ca
+              mountPath: /etc/kubesentry/ca
+              readOnly: true
+          {{- end }}
+      {{- if $ca }}
+      volumes:
+        - name: server-ca
+          {{- if eq $ca "configMap" }}
+          configMap:
+            name: {{ $g.tls.caConfigMap }}
+          {{- else }}
+          secret:
+            secretName: {{ ternary $g.tls.caSecret .Values.tls.existingSecret (eq $ca "secret") }}
+            items:
+              - key: {{ $g.tls.caKey }}
+                path: {{ $g.tls.caKey }}
+          {{- end }}
+      {{- end }}
+{{- end }}

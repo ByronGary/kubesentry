@@ -1,0 +1,113 @@
+# kubesentry on the local kind cluster from hack/kind-up.sh, through the Helm
+# chart. Reproduces deploy/kind/kubesentry.yaml + deploy/agent-daemonset.yaml:
+#
+#   hack/build-images.sh --kind            # kubesentry:dev and kubesentry-agent:dev into kind
+#   kubectl create namespace kubesentry
+#   kubectl label namespace kubesentry pod-security.kubernetes.io/enforce=privileged
+#   helm upgrade --install kubesentry charts/kubesentry -n kubesentry -f deploy/kind/values-kind.yaml
+#
+# Dev-cluster settings, not for production:
+#   - The server runs on the control-plane node as uid 0 with a hostPath mount,
+#     so it can read the API server's audit log (root-owned, mode 0600). The
+#     namespace therefore needs the "privileged" Pod Security level.
+#   - Agents report over plain http inside the cluster.
+#
+# Switching a cluster that runs the kustomize manifests: remove what they
+# created, except the Namespace and the token Secrets, then let Helm adopt the
+# Secrets so the tokens stay the same (the chart's lookup keeps their values):
+#   kubectl -n kubesentry delete --ignore-not-found deployment/kubesentry service/kubesentry \
+#     serviceaccount/kubesentry daemonset/kubesentry-agent serviceaccount/kubesentry-agent
+#   kubectl delete --ignore-not-found clusterrole/kubesentry clusterrolebinding/kubesentry
+#   for s in kubesentry-api kubesentry-agent kubesentry-audit; do
+#     kubectl -n kubesentry label secret "$s" app.kubernetes.io/managed-by=Helm --overwrite
+#     kubectl -n kubesentry annotate secret "$s" --overwrite \
+#       meta.helm.sh/release-name=kubesentry meta.helm.sh/release-namespace=kubesentry
+#   done
+
+clusterName: kind-kubesentry
+
+image:
+  repository: kubesentry
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicas: 1
+# One tailer of the audit log at a time, as before.
+updateStrategy:
+  type: Recreate
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    # Today's limit. The stress profiles raise it for the larger load levels.
+    memory: 256Mi
+
+# The audit log lives on the control-plane node.
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+# Dev only: root reads the root-owned 0600 audit log. The container-level
+# settings override the chart's non-root pod defaults.
+securityContext:
+  runAsUser: 0
+  runAsNonRoot: false
+
+# No load balancer in front: no need to wait for deregistration.
+preStopSleepSeconds: 0
+terminationGracePeriodSeconds: 30
+
+# Token auth (the UI asks for the API token; hack/dashboard.sh prints it).
+auth:
+  mode: token
+
+# kube-prometheus-stack in "monitoring" is found by discovery. To pin it:
+#   service: monitoring/kps-kube-prometheus-stack-prometheus:9090
+prometheus:
+  autodiscover: true
+
+audit:
+  store: memory
+  sources:
+    # Bulk import and the stress harness's audit firehose.
+    webhook:
+      enabled: true
+    file:
+      path: /var/log/kubernetes/audit/audit.log
+      fromStart: true
+      hostPathDir: /var/log/kubernetes/audit
+
+thresholds:
+  pvcMinAge: 5m
+
+agent:
+  enabled: true
+  image:
+    repository: kubesentry-agent
+    tag: dev
+    pullPolicy: IfNotPresent
+  # KWOK fake nodes have no kubelet; an agent pod there would never run.
+  nodeAffinity:
+    excludeLabels:
+      - key: type
+        values: ["kwok"]
+
+# Single replica: no PDB, nothing to spread.
+topologySpread:
+  enabled: false
+
+# kube-prometheus-stack (release "kps") selects ServiceMonitors and rules by this label.
+metrics:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kps
+  prometheusRule:
+    enabled: true
+    labels:
+      release: kps

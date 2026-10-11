@@ -1,0 +1,35 @@
+{{- $sm := .Values.metrics.serviceMonitor -}}
+{{- if and $sm.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor") }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kubesentry.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    {{- with $sm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "kubesentry.selectorLabels" . | nindent 6 }}
+      kubesentry.io/listener: ops
+  endpoints:
+    - port: ops
+      path: /metrics
+      interval: {{ $sm.interval }}
+      scrapeTimeout: {{ $sm.scrapeTimeout }}
+      {{- with $sm.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

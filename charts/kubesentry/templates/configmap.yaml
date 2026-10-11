@@ -1,0 +1,16 @@
+{{- if .Values.auth.groupMap }}
+# IdP group -> Kubernetes groups, read by -auth-group-map-file. kubesentry
+# adds the mapped groups to the signed-in user's identity before asking the
+# API server what they may see.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubesentry.fullname" . }}-auth
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+data:
+  group-map.json: |
+    {{- toPrettyJson .Values.auth.groupMap | nindent 4 }}
+{{- end }}

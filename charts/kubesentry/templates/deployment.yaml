@@ -1,0 +1,364 @@
+{{- include "kubesentry.validate" . -}}
+{{- $fullname := include "kubesentry.fullname" . -}}
+{{- $o := .Values.oauth2Proxy -}}
+{{- $pg := .Values.audit.postgres -}}
+{{- $file := .Values.audit.sources.file -}}
+{{- $preStop := and (gt (int .Values.preStopSleepSeconds) 0) (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: {{ .Values.replicas }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if and (eq .Values.updateStrategy.type "RollingUpdate") .Values.updateStrategy.rollingUpdate }}
+    rollingUpdate:
+      {{- toYaml .Values.updateStrategy.rollingUpdate | nindent 6 }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kubesentry.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubesentry.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/version: {{ include "kubesentry.imageTag" (dict "image" .Values.image "root" .) | trunc 63 | quote }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        kubectl.kubernetes.io/default-container: server
+        {{- if .Values.auth.groupMap }}
+        checksum/group-map: {{ toJson .Values.auth.groupMap | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "kubesentry.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpread.topologyKeys }}
+        - topologyKey: {{ . }}
+          maxSkew: {{ $.Values.topologySpread.maxSkew }}
+          whenUnsatisfiable: {{ $.Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "kubesentry.selectorLabels" $ | nindent 14 }}
+          matchLabelKeys:
+            - pod-template-hash
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ include "kubesentry.image" (dict "image" .Values.image "root" .) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- include "kubesentry.serverArgs" . | nindent 12 }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The Go GC works to stay under the container's memory limit.
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: server
+                  resource: limits.memory
+            {{- with include "kubesentry.awsRegion" . }}
+            - name: AWS_REGION
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.tokens.api.enabled }}
+            - name: KUBESENTRY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubesentry.apiTokenSecret" . }}
+                  key: {{ .Values.tokens.api.key }}
+            {{- end }}
+            {{- if include "kubesentry.agentTokenWanted" . }}
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubesentry.agentTokenSecret" . }}
+                  key: {{ .Values.tokens.agent.key }}
+            {{- end }}
+            {{- if .Values.audit.sources.webhook.enabled }}
+            - name: KUBESENTRY_AUDIT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubesentry.auditTokenSecret" . }}
+                  key: {{ .Values.tokens.audit.key }}
+            {{- end }}
+            {{- if eq .Values.audit.store "postgres" }}
+            - name: KUBESENTRY_PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pg.existingSecret }}
+                  key: {{ $pg.dsnKey }}
+            {{- with $pg.sslmode }}
+            - name: PGSSLMODE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if or $pg.sslRootCert.configMap $pg.sslRootCert.secret }}
+            - name: PGSSLROOTCERT
+              value: /etc/kubesentry/pg-ca/{{ $pg.sslRootCert.key }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.prometheus.bearerTokenSecret.name }}
+            - name: PROMETHEUS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.prometheus.bearerTokenSecret.name }}
+                  key: {{ .Values.prometheus.bearerTokenSecret.key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            {{- if not $o.enabled }}
+            - name: web
+              containerPort: 8080
+              protocol: TCP
+            {{- end }}
+            - name: ingest
+              containerPort: 8081
+              protocol: TCP
+            - name: ops
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          {{- if $preStop }}
+          lifecycle:
+            preStop:
+              # Keep serving while the load balancer deregisters this pod.
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.auth.groupMap }}
+            - name: auth-group-map
+              mountPath: /etc/kubesentry/auth
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/kubesentry/tls
+              readOnly: true
+            {{- end }}
+            {{- if and (eq .Values.audit.store "postgres") (or $pg.sslRootCert.configMap $pg.sslRootCert.secret) }}
+            - name: pg-ca
+              mountPath: /etc/kubesentry/pg-ca
+              readOnly: true
+            {{- end }}
+            {{- if and $file.path $file.hostPathDir }}
+            - name: audit-log
+              mountPath: {{ $file.hostPathDir }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+        {{- if $o.enabled }}
+        - name: oauth2-proxy
+          image: {{ printf "%s:%s" $o.image.repository $o.image.tag }}
+          imagePullPolicy: {{ $o.image.pullPolicy }}
+          args:
+            - --http-address=0.0.0.0:4180
+            {{- if .Values.tls.enabled }}
+            # kubesentry's certificate names the Service, not the loopback address.
+            - --upstream=https://127.0.0.1:8080
+            - --ssl-upstream-insecure-skip-verify=true
+            {{- else }}
+            - --upstream=http://127.0.0.1:8080
+            {{- end }}
+            - --provider={{ $o.provider }}
+            {{- with $o.issuerURL }}
+            - --oidc-issuer-url={{ . }}
+            {{- end }}
+            - --client-id={{ $o.clientID }}
+            {{- if $o.redirectURL }}
+            - --redirect-url={{ $o.redirectURL }}
+            {{- else if .Values.ingress.host }}
+            - --redirect-url=https://{{ .Values.ingress.host }}/oauth2/callback
+            {{- end }}
+            - --scope={{ $o.scope }}
+            - --oidc-groups-claim={{ $o.groupsClaim }}
+            - --oidc-email-claim={{ $o.emailClaim }}
+            {{- with $o.codeChallengeMethod }}
+            - --code-challenge-method={{ . }}
+            {{- end }}
+            {{- range $o.emailDomains }}
+            - --email-domain={{ . }}
+            {{- end }}
+            {{- range $o.allowedGroups }}
+            - --allowed-group={{ . }}
+            {{- end }}
+            # Identity reaches kubesentry only in these headers, and only from loopback.
+            - --pass-user-headers=true
+            - --set-xauthrequest=true
+            - --skip-auth-strip-headers=true
+            # API calls get 401 instead of a login redirect.
+            - --api-route=^/api/
+            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects.
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --silence-ping-logging=true
+            - --cookie-name={{ $o.cookie.name }}
+            - --cookie-secure={{ $o.cookie.secure }}
+            - --cookie-expire={{ $o.cookie.expire }}
+            {{- with $o.cookie.refresh }}
+            - --cookie-refresh={{ . }}
+            {{- end }}
+            - --cookie-samesite={{ $o.cookie.sameSite }}
+            - --session-store-type={{ $o.sessionStore.type }}
+            {{- if eq $o.sessionStore.type "redis" }}
+            {{- with $o.sessionStore.redis.connectionURL }}
+            - --redis-connection-url={{ . }}
+            {{- end }}
+            {{- if $o.sessionStore.redis.useCluster }}
+            - --redis-use-cluster=true
+            {{- range $o.sessionStore.redis.clusterConnectionURLs }}
+            - --redis-cluster-connection-urls={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range $o.extraArgs }}
+            - {{ . }}
+            {{- end }}
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $o.existingSecret }}
+                  key: {{ $o.clientSecretKey }}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $o.existingSecret }}
+                  key: {{ $o.cookieSecretKey }}
+            {{- if and (eq $o.sessionStore.type "redis") $o.sessionStore.redis.existingSecret }}
+            - name: OAUTH2_PROXY_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $o.sessionStore.redis.existingSecret }}
+                  key: {{ $o.sessionStore.redis.passwordKey }}
+            {{- end }}
+            {{- with $o.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: web
+              containerPort: 4180
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: web
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: web
+            periodSeconds: 20
+            timeoutSeconds: 5
+          {{- if $preStop }}
+          lifecycle:
+            preStop:
+              # Keep serving while the load balancer deregisters this pod.
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $o.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml $o.resources | nindent 12 }}
+        {{- end }}
+        {{- with .Values.extraContainers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if .Values.auth.groupMap }}
+        - name: auth-group-map
+          configMap:
+            name: {{ $fullname }}-auth
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+        {{- if eq .Values.audit.store "postgres" }}
+        {{- if $pg.sslRootCert.configMap }}
+        - name: pg-ca
+          configMap:
+            name: {{ $pg.sslRootCert.configMap }}
+        {{- else if $pg.sslRootCert.secret }}
+        - name: pg-ca
+          secret:
+            secretName: {{ $pg.sslRootCert.secret }}
+        {{- end }}
+        {{- end }}
+        {{- if and $file.path $file.hostPathDir }}
+        - name: audit-log
+          hostPath:
+            path: {{ $file.hostPathDir }}
+            type: Directory
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

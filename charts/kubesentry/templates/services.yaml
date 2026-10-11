@@ -1,0 +1,87 @@
+{{- $fullname := include "kubesentry.fullname" . -}}
+{{- $webPort := include "kubesentry.webPort" . | int -}}
+# Web: the UI and /api/. The oauth2-proxy sidecar when enabled, else kubesentry.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: web
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "kubesentry.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: web
+      port: {{ $webPort }}
+      targetPort: web
+      protocol: TCP
+---
+# Ingest: POST /agent/report and /audit/webhook, token-authenticated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "kubesentry.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+---
+# Headless ingest: one DNS record per ready replica, so agents post every
+# report to each replica (-server-fanout).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-ingest-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "kubesentry.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+---
+# Ops: /metrics, /healthz, /readyz (and /debug/pprof/ with server.pprof).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-ops
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ops
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "kubesentry.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ops
+      port: 9090
+      targetPort: ops
+      protocol: TCP

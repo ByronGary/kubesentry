@@ -1,0 +1,83 @@
+{{- $pr := .Values.metrics.prometheusRule -}}
+{{- if and $pr.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule") }}
+{{- $m := default (printf "namespace=%q" .Release.Namespace) $pr.matchers -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kubesentry.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+    {{- with $pr.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: kubesentry
+      rules:
+        - alert: KubesentrySnapshotStale
+          expr: max by (namespace, pod) ({{ printf "kubesentry_snapshot_age_seconds{%s}" $m }}) > {{ $pr.snapshotStaleSeconds }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is serving a stale view of the cluster.
+            description: >-
+              {{ "{{" }} $labels.pod {{ "}}" }} has served a snapshot older than {{ $pr.snapshotStaleSeconds }}s for 5 minutes.
+              Its informers are not keeping up with the API server, or the API server is unreachable.
+        {{- if .Values.audit.sources.cloudwatch.enabled }}
+        - alert: KubesentryCloudWatchLag
+          expr: max by (namespace) ({{ printf "kubesentry_cloudwatch_lag_seconds{%s}" $m }}) > {{ $pr.cloudwatchLagSeconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's CloudWatch audit reader is behind.
+            description: >-
+              Audit events from CloudWatch Logs are more than {{ $pr.cloudwatchLagSeconds }}s behind.
+              Check for throttling (FilterLogEvents quota), IAM errors, and that one replica holds the reader lock.
+        {{- end }}
+        {{- if eq .Values.audit.store "postgres" }}
+        - alert: KubesentryPostgresErrors
+          expr: sum by (namespace, pod) (rate({{ printf "kubesentry_audit_store_errors_total{%s}" $m }}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot write audit events to Postgres.
+            description: >-
+              {{ "{{" }} $labels.pod {{ "}}" }} has failed audit store operations for 10 minutes.
+              Events queue in memory and the webhook answers 503 once the queue is full.
+        {{- end }}
+        - alert: KubesentryAuthzReviewErrors
+          expr: |
+            sum by (namespace) (rate({{ printf "kubesentry_authz_reviews_total{%s,result=\"error\"}" $m }}[5m]))
+              / sum by (namespace) (rate({{ printf "kubesentry_authz_reviews_total{%s}" $m }}[5m]))
+              > {{ $pr.authzErrorRatio }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's SubjectAccessReviews are failing.
+            description: >-
+              More than {{ mulf $pr.authzErrorRatio 100 }}% of SubjectAccessReviews failed over 10 minutes, so users see
+              less than their RBAC allows. Check API server health and APF throttling of kubesentry's ServiceAccount.
+        {{- if .Values.agent.enabled }}
+        - alert: KubesentryAgentNodesDropped
+          expr: |
+            max by (namespace) ({{ printf "kubesentry_agent_nodes_reporting{%s}" $m }})
+              < {{ subf 1 $pr.agentDropRatio }} * max by (namespace) (max_over_time({{ printf "kubesentry_agent_nodes_reporting{%s}" $m }}[1h]))
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fewer nodes report processes to kubesentry.
+            description: >-
+              Nodes reporting processes dropped by more than {{ mulf $pr.agentDropRatio 100 }}% within an hour.
+              Agents may be failing, or the cluster scaled down. Compare with the agent DaemonSet's ready count.
+        {{- end }}
+        {{- with $pr.extraRules }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

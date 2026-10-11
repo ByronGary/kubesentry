@@ -1,0 +1,23 @@
+apiVersion: v2
+name: kubesentry
+description: >-
+  Self-hosted Kubernetes observability dashboard: audit-log user activity,
+  OOMKilled and memory-leak detection, process monitoring and unused volumes,
+  each user scoped by their Kubernetes RBAC.
+type: application
+# Chart version. Bump it on every chart change.
+version: 0.1.0
+# The kubesentry version this chart deploys by default. image.tag and
+# agent.image.tag default to it, and hack/build-images.sh stamps the same value
+# into the binaries (-X main.version).
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+home: https://github.com/ByronGary/kubesentry
+sources:
+  - https://github.com/ByronGary/kubesentry
+keywords:
+  - kubernetes
+  - observability
+  - audit
+  - oom
+  - eks

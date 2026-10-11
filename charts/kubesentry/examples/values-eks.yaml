@@ -1,0 +1,214 @@
+# kubesentry on Amazon EKS: SSO through oauth2-proxy behind an internal ALB,
+# Amazon Managed Prometheus, CloudWatch audit logs stored in RDS Postgres, two
+# replicas spread across zones. docs/deploy-eks.md explains each piece and the
+# AWS-side setup (IAM role, audit logging, RDS, IdP app, VPC CNI network policy).
+#
+#   helm upgrade --install kubesentry charts/kubesentry -n kubesentry --create-namespace \
+#     -f charts/kubesentry/examples/values-eks.yaml
+#
+# Replace every 111122223333, ws-..., sg-/subnet CIDR, host name and ARN below.
+# Secrets created beforehand (docs/deploy-eks.md, "Secrets"):
+#   kubesentry-oauth2   client-secret, cookie-secret
+#   kubesentry-redis    redis-password (ElastiCache AUTH token)
+#   kubesentry-pg       dsn
+#   ConfigMap rds-ca    global-bundle.pem (RDS CA bundle)
+
+eks:
+  clusterName: prod-eks
+  region: us-east-1
+  awsAuth:
+    # Flags system:masters mappings in kube-system/aws-auth (clusters still using it).
+    read: true
+
+image:
+  repository: ghcr.io/byrongary/kubesentry
+  # tag: defaults to the chart's appVersion; pin a digest in production:
+  # digest: sha256:...
+
+replicas: 2
+pdb:
+  enabled: true
+  minAvailable: 1
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  whenUnsatisfiable: ScheduleAnyway
+  topologyKeys:
+    - topology.kubernetes.io/zone
+    - kubernetes.io/hostname
+
+# Sized for about 500 nodes / 10,000 pods; see docs/deploy-eks.md, "Sizing".
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1536Mi
+
+# Longer than the target group's deregistration delay below (10s).
+preStopSleepSeconds: 15
+terminationGracePeriodSeconds: 45
+
+serviceAccount:
+  annotations:
+    # IRSA. With EKS Pod Identity, drop this and create a pod identity
+    # association for kubesentry/kubesentry instead.
+    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/kubesentry-prod-eks
+
+# Break-glass API token, usable only through kubectl port-forward to a pod.
+tokens:
+  api:
+    enabled: true
+
+auth:
+  # proxy, implied by oauth2Proxy.enabled.
+  mode: ""
+  # Match the prefixes of the EKS OIDC identity provider if you associated one,
+  # so the RoleBindings you wrote for kubectl users apply here too.
+  usernamePrefix: ""
+  groupsPrefix: ""
+  # IdP groups -> Kubernetes groups used in RoleBindings and access entries.
+  groupMap:
+    platform-team: ["platform-admins"]
+    payments-engineers: ["payments-viewers"]
+  # Thousands of users share a few dozen groups, and no RoleBinding names users.
+  shareByGroups: true
+
+oauth2Proxy:
+  enabled: true
+  provider: oidc
+  # Okta custom authorization server with a "groups" claim. Entra ID and
+  # Cognito variants are in docs/deploy-eks.md.
+  issuerURL: https://example.okta.com/oauth2/default
+  clientID: 0oa1example2kubesentry3
+  existingSecret: kubesentry-oauth2
+  scope: openid email profile groups
+  groupsClaim: groups
+  allowedGroups:
+    - platform-team
+    - payments-engineers
+  cookie:
+    name: _kubesentry
+    secure: true
+    expire: 12h
+    refresh: 1h
+  # Users in many groups overflow cookies; keep sessions in ElastiCache (TLS).
+  sessionStore:
+    type: redis
+    redis:
+      connectionURL: rediss://master.kubesentry-sessions.abcdef.use1.cache.amazonaws.com:6379
+      existingSecret: kubesentry-redis
+      passwordKey: redis-password
+
+ingress:
+  enabled: true
+  className: alb
+  host: kubesentry.prod.example.com
+  path: /
+  pathType: Prefix
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/healthcheck-path: /ping
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    # Share one ALB with other internal tools:
+    # alb.ingress.kubernetes.io/group.name: internal-tools
+
+prometheus:
+  amp:
+    enabled: true
+    workspaceURL: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012
+    region: us-east-1
+  # A workspace shared by several clusters: only this cluster's series.
+  selector: cluster="prod-eks"
+
+audit:
+  store: postgres
+  retention: 30d
+  redactExecArgs: true
+  postgres:
+    existingSecret: kubesentry-pg
+    dsnKey: dsn
+    schema: prod_eks
+    sslmode: verify-full
+    sslRootCert:
+      configMap: rds-ca
+      key: global-bundle.pem
+  sources:
+    webhook:
+      enabled: false
+    cloudwatch:
+      enabled: true
+      # Defaults: log group /aws/eks/prod-eks/cluster, streams kube-apiserver-audit*.
+      start: 24h
+
+systemNamespaces:
+  add:
+    - cert-manager
+    - external-secrets
+    - monitoring
+
+pricing:
+  # us-east-1 list prices are the default; set your region's here.
+  ebsPrices:
+    gp3: 0.08
+    gp2: 0.10
+    io2: 0.125
+
+agent:
+  enabled: true
+  # Its own namespace at the "privileged" Pod Security level, so the
+  # "kubesentry" namespace can enforce "restricted".
+  namespace: kubesentry-agent
+  createNamespace: true
+  image:
+    repository: ghcr.io/byrongary/kubesentry-agent
+
+networkPolicy:
+  enabled: true
+  ingress:
+    web:
+      # The ALB's subnets (target-type ip sends traffic from the ALB's ENIs).
+      fromCIDRs:
+        - 10.20.0.0/22
+        - 10.20.4.0/22
+        - 10.20.8.0/22
+    ingest:
+      fromCIDRs: []
+    ops:
+      # Where the AMP collector (ADOT, or Prometheus agent) runs.
+      fromNamespaces:
+        - amazon-cloudwatch
+        - monitoring
+  egress:
+    enabled: true
+    dns: true
+    https:
+      # API server, STS, CloudWatch Logs, AMP and the IdP. Narrow it if all
+      # AWS APIs go through VPC endpoints and the IdP has fixed addresses.
+      toCIDRs: ["0.0.0.0/0"]
+      ports: [443]
+    postgres:
+      # RDS subnets.
+      toCIDRs:
+        - 10.20.32.0/22
+        - 10.20.36.0/22
+      port: 5432
+    redis:
+      # ElastiCache subnets.
+      toCIDRs:
+        - 10.20.40.0/22
+      port: 6379
+
+metrics:
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+
+apf:
+  enabled: true

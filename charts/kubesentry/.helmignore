@@ -1,0 +1,6 @@
+# Kept in the repository, left out of the packaged chart.
+testdata/
+.DS_Store
+*.tmp
+*.orig
+*~

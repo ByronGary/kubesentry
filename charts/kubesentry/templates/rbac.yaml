@@ -1,0 +1,118 @@
+{{- $fullname := include "kubesentry.fullname" . -}}
+{{- if .Values.rbac.create }}
+# Read-only access to everything kubesentry watches. Secrets are deliberately
+# absent: kubesentry never reads them (the cert-manager page uses Certificate
+# status, not the issued Secret).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "persistentvolumes", "services", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  # Optional: without cert-manager the Certificates page reports it as not installed.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
+    verbs: ["get", "list", "watch"]
+  # Per-user scoping asks the API server what each signed-in user may see, and
+  # the startup probe checks kubesentry's own access per resource.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubesentry.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.eks.awsAuth.read }}
+---
+# EKS aws-auth: this one ConfigMap only, to flag system:masters mappings.
+# list and watch with resourceNames work for a field-selected informer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}-aws-auth
+  namespace: kube-system
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["aws-auth"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}-aws-auth
+  namespace: kube-system
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}-aws-auth
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubesentry.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- if .Values.rbac.viewerRoles.create }}
+{{- $roles := list
+    (dict "suffix" "audit-viewer" "cfg" .Values.rbac.viewerRoles.auditViewer "resource" "auditevents" "verbs" (list "list") "what" "audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events")
+    (dict "suffix" "process-viewer" "cfg" .Values.rbac.viewerRoles.processViewer "resource" "processes" "verbs" (list "get") "what" "processes inside pods, per namespace")
+    (dict "suffix" "agents-viewer" "cfg" .Values.rbac.viewerRoles.agentsViewer "resource" "agents" "verbs" (list "list") "what" "node agent health; needs a ClusterRoleBinding") }}
+{{- range $roles }}
+---
+# Virtual resource kubesentry.io/{{ .resource }}: {{ .what }}.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-{{ .suffix }}
+  labels:
+    {{- include "kubesentry.labels" $ | nindent 4 }}
+    {{- range .cfg.aggregateTo }}
+    rbac.authorization.k8s.io/aggregate-to-{{ . }}: "true"
+    {{- end }}
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: [{{ .resource | quote }}]
+    verbs: {{ toJson .verbs }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,57 @@
+{{- if .Values.apf.enabled }}
+{{- $a := .Values.apf -}}
+{{- $api := "flowcontrol.apiserver.k8s.io/v1" -}}
+{{- if not (.Capabilities.APIVersions.Has "flowcontrol.apiserver.k8s.io/v1") -}}
+{{- $api = "flowcontrol.apiserver.k8s.io/v1beta3" -}}
+{{- end -}}
+# API Priority and Fairness: kubesentry's requests (informer LISTs and WATCHes,
+# SubjectAccessReviews) get their own priority level, so a burst from kubesentry
+# queues behind its own share instead of competing with controllers and users.
+apiVersion: {{ $api }}
+kind: PriorityLevelConfiguration
+metadata:
+  name: {{ include "kubesentry.fullname" . }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: {{ $a.nominalConcurrencyShares }}
+    lendablePercent: {{ $a.lendablePercent }}
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: {{ $a.queues }}
+        handSize: {{ $a.handSize }}
+        queueLengthLimit: {{ $a.queueLengthLimit }}
+---
+apiVersion: {{ $api }}
+kind: FlowSchema
+metadata:
+  name: {{ include "kubesentry.fullname" . }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  priorityLevelConfiguration:
+    name: {{ include "kubesentry.fullname" . }}
+  matchingPrecedence: {{ $a.matchingPrecedence }}
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: {{ include "kubesentry.serviceAccountName" . }}
+            namespace: {{ .Release.Namespace }}
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+          clusterScope: true
+          namespaces: ["*"]
+      nonResourceRules:
+        - verbs: ["*"]
+          nonResourceURLs: ["*"]
+{{- end }}
