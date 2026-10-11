@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -16,53 +17,73 @@ import (
 
 const pageSize = 500
 
-// Source lists cluster objects and converts them to model types. For the MVP it
-// does paginated LISTs per request; shared informers are on the roadmap for
-// large clusters.
+// Source lists cluster objects per request and converts them to model types.
+// It backs -cache=false (debugging); the informer Cache is the default.
 type Source struct {
-	cs  kubernetes.Interface
-	dyn dynamic.Interface // for cert-manager custom resources; nil disables them
+	cs   kubernetes.Interface
+	dyn  dynamic.Interface // for cert-manager custom resources; nil disables them
+	opts SourceOptions
+}
+
+// SourceOptions configures the parts of a Source's Inventory that are not
+// read from the API's defaults. The zero value reads no aws-auth, keeps the
+// default node labels and uses time.Now.
+type SourceOptions struct {
+	AWSAuth          bool     // read kube-system/aws-auth
+	NodeLabelKeysAdd []string // extra node label keys to keep ("prefix*" matches by prefix)
+	ClusterName      string
+	Now              func() time.Time
 }
 
 // NewSource wraps a clientset and an optional dynamic client.
 func NewSource(cs kubernetes.Interface, dyn dynamic.Interface) *Source {
-	return &Source{cs: cs, dyn: dyn}
+	return NewSourceWithOptions(cs, dyn, SourceOptions{})
+}
+
+// NewSourceWithOptions is NewSource with options for Inventory and node labels.
+func NewSourceWithOptions(cs kubernetes.Interface, dyn dynamic.Interface, o SourceOptions) *Source {
+	return &Source{cs: cs, dyn: dyn, opts: o}
+}
+
+func (s *Source) nodeLabels() labelFilter { return newNodeLabelFilter(s.opts.NodeLabelKeysAdd) }
+
+// collect pages through a list and converts each item.
+func collect[O, T any](what string, list func(metav1.ListOptions) ([]O, string, error), conv func(*O) T) ([]T, error) {
+	var out []T
+	err := paginate(what, func(o metav1.ListOptions) (string, error) {
+		items, cont, err := list(o)
+		if err != nil {
+			return "", err
+		}
+		for i := range items {
+			out = append(out, conv(&items[i]))
+		}
+		return cont, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Source) ListPVCs(ctx context.Context) ([]model.PVC, error) {
-	var out []model.PVC
-	opts := metav1.ListOptions{Limit: pageSize}
-	for {
-		l, err := s.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).List(ctx, opts)
+	return collect("pvcs", func(o metav1.ListOptions) ([]corev1.PersistentVolumeClaim, string, error) {
+		l, err := s.cs.CoreV1().PersistentVolumeClaims(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
-			return nil, fmt.Errorf("list pvcs: %w", err)
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertPVC(&l.Items[i]))
-		}
-		if l.Continue == "" {
-			return out, nil
-		}
-		opts.Continue = l.Continue
-	}
+		return l.Items, l.Continue, nil
+	}, convertPVC)
 }
 
 func (s *Source) ListPods(ctx context.Context) ([]model.Pod, error) {
-	var out []model.Pod
-	opts := metav1.ListOptions{Limit: pageSize}
-	for {
-		l, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, opts)
+	return collect("pods", func(o metav1.ListOptions) ([]corev1.Pod, string, error) {
+		l, err := s.cs.CoreV1().Pods(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
-			return nil, fmt.Errorf("list pods: %w", err)
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertPod(&l.Items[i]))
-		}
-		if l.Continue == "" {
-			return out, nil
-		}
-		opts.Continue = l.Continue
-	}
+		return l.Items, l.Continue, nil
+	}, convertPod)
 }
 
 // GetPod returns model.ErrNotFound if the pod does not exist.
@@ -111,6 +132,17 @@ func convertPVC(p *corev1.PersistentVolumeClaim) model.PVC {
 	}
 }
 
+func convertOwners(refs []metav1.OwnerReference) []model.OwnerRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]model.OwnerRef, len(refs))
+	for i, r := range refs {
+		out[i] = model.OwnerRef{Kind: r.Kind, Name: r.Name, UID: string(r.UID), Controller: r.Controller != nil && *r.Controller}
+	}
+	return out
+}
+
 func convertPod(p *corev1.Pod) model.Pod {
 	out := model.Pod{
 		UID:            string(p.UID),
@@ -125,6 +157,26 @@ func convertPod(p *corev1.Pod) model.Pod {
 		HostNetwork:    p.Spec.HostNetwork,
 		HostIPC:        p.Spec.HostIPC,
 		AutomountToken: p.Spec.AutomountServiceAccountToken == nil || *p.Spec.AutomountServiceAccountToken,
+		Owners:         convertOwners(p.OwnerReferences),
+		PodIP:          p.Status.PodIP,
+		QOSClass:       string(p.Status.QOSClass),
+	}
+	if t := p.DeletionTimestamp; t != nil {
+		out.DeletedAt = t.Time
+	}
+	for _, c := range p.Status.Conditions {
+		switch c.Type {
+		case corev1.PodReady:
+			out.Ready = c.Status == corev1.ConditionTrue
+			out.ReadyChanged = c.LastTransitionTime.Time
+		case corev1.PodScheduled:
+			if c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable {
+				out.Unschedulable = truncate(c.Message)
+				if out.Unschedulable == "" {
+					out.Unschedulable = c.Reason
+				}
+			}
+		}
 	}
 	for _, v := range p.Spec.Volumes {
 		switch {
@@ -137,38 +189,41 @@ func convertPod(p *corev1.Pod) model.Pod {
 			out.HostPaths = append(out.HostPaths, v.HostPath.Path)
 		}
 	}
-	for _, c := range p.Spec.Containers {
-		out.Specs = append(out.Specs, convertSpec(c, p.Spec.SecurityContext, false))
+	if n := len(p.Spec.Containers) + len(p.Spec.InitContainers); n > 0 {
+		out.Specs = make([]model.ContainerSpec, 0, n)
 	}
-	sidecars := map[string]bool{}
-	for _, c := range p.Spec.InitContainers {
-		out.Specs = append(out.Specs, convertSpec(c, p.Spec.SecurityContext, true))
-		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
-			sidecars[c.Name] = true
-		}
+	for i := range p.Spec.Containers {
+		out.Specs = append(out.Specs, convertSpec(&p.Spec.Containers[i], p.Spec.SecurityContext, false))
+	}
+	for i := range p.Spec.InitContainers {
+		out.Specs = append(out.Specs, convertSpec(&p.Spec.InitContainers[i], p.Spec.SecurityContext, true))
+	}
+	if n := len(p.Status.ContainerStatuses) + len(p.Status.InitContainerStatuses); n > 0 {
+		out.Containers = make([]model.ContainerStatus, 0, n)
 	}
 	for _, cs := range p.Status.ContainerStatuses {
-		out.Containers = append(out.Containers, convertContainer(cs))
+		out.Containers = append(out.Containers, convertContainer(cs, false))
 	}
-	// Native sidecars run for the pod's whole life, so they can be OOMKilled
-	// like any other container. Ordinary init containers are left out.
+	// Init containers follow the app containers, marked Init. Native sidecars
+	// run for the pod's whole life and can be OOMKilled like any container;
+	// ordinary init containers are kept so Init:CrashLoopBackOff and similar
+	// stuck states are visible.
 	for _, cs := range p.Status.InitContainerStatuses {
-		if sidecars[cs.Name] {
-			out.Containers = append(out.Containers, convertContainer(cs))
-		}
+		out.Containers = append(out.Containers, convertContainer(cs, true))
 	}
 	return out
 }
 
 // convertSpec reads one container's security settings and resources, with the
 // pod-level securityContext as the default.
-func convertSpec(c corev1.Container, podSC *corev1.PodSecurityContext, init bool) model.ContainerSpec {
+func convertSpec(c *corev1.Container, podSC *corev1.PodSecurityContext, init bool) model.ContainerSpec {
 	s := model.ContainerSpec{Name: c.Name, Image: c.Image, Init: init}
+	runAsUser := (*int64)(nil)
 	if podSC != nil {
 		if podSC.RunAsNonRoot != nil {
 			s.RunAsNonRoot = *podSC.RunAsNonRoot
 		}
-		s.RunAsUser = copyInt64(podSC.RunAsUser)
+		runAsUser = podSC.RunAsUser
 	}
 	if sc := c.SecurityContext; sc != nil {
 		if sc.Privileged != nil {
@@ -182,7 +237,7 @@ func convertSpec(c corev1.Container, podSC *corev1.PodSecurityContext, init bool
 			s.RunAsNonRoot = *sc.RunAsNonRoot
 		}
 		if sc.RunAsUser != nil {
-			s.RunAsUser = copyInt64(sc.RunAsUser)
+			runAsUser = sc.RunAsUser
 		}
 		if sc.ReadOnlyRootFilesystem != nil {
 			s.ReadOnlyRootFilesystem = *sc.ReadOnlyRootFilesystem
@@ -198,10 +253,20 @@ func convertSpec(c corev1.Container, podSC *corev1.PodSecurityContext, init bool
 			}
 		}
 	}
-	s.CPURequestMilli = c.Resources.Requests.Cpu().MilliValue()
-	s.CPULimitMilli = c.Resources.Limits.Cpu().MilliValue()
-	s.MemoryRequestBytes = c.Resources.Requests.Memory().Value()
-	s.MemoryLimitBytes = c.Resources.Limits.Memory().Value()
+	s.RunAsUser = copyInt64(runAsUser)
+	// Index the lists directly: ResourceList.Cpu() and friends allocate.
+	if q, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+		s.CPURequestMilli = q.MilliValue()
+	}
+	if q, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+		s.CPULimitMilli = q.MilliValue()
+	}
+	if q, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+		s.MemoryRequestBytes = q.Value()
+	}
+	if q, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+		s.MemoryLimitBytes = q.Value()
+	}
 	return s
 }
 
@@ -213,8 +278,19 @@ func copyInt64(p *int64) *int64 {
 	return &v
 }
 
-func convertContainer(cs corev1.ContainerStatus) model.ContainerStatus {
-	c := model.ContainerStatus{Name: cs.Name, ContainerID: trimRuntime(cs.ContainerID), RestartCount: cs.RestartCount}
+func convertContainer(cs corev1.ContainerStatus, init bool) model.ContainerStatus {
+	c := model.ContainerStatus{
+		Name: cs.Name, ContainerID: trimRuntime(cs.ContainerID), RestartCount: cs.RestartCount,
+		Init: init, Ready: cs.Ready, Started: cs.Started != nil && *cs.Started,
+	}
+	switch st := cs.State; {
+	case st.Waiting != nil:
+		c.State, c.Reason, c.Message = "waiting", st.Waiting.Reason, truncate(st.Waiting.Message)
+	case st.Terminated != nil:
+		c.State, c.Reason, c.Message = "terminated", st.Terminated.Reason, truncate(st.Terminated.Message)
+	case st.Running != nil:
+		c.State = "running"
+	}
 	// A container that is terminated right now is more recent than its
 	// LastTerminationState, so check State first.
 	t := cs.State.Terminated
@@ -225,6 +301,11 @@ func convertContainer(cs corev1.ContainerStatus) model.ContainerStatus {
 		c.LastTerminatedReason = t.Reason
 		c.LastTerminatedAt = t.FinishedAt.Time
 		c.LastExitCode = t.ExitCode
+	}
+	if r := cs.Resources; r != nil {
+		if q, ok := r.Limits[corev1.ResourceMemory]; ok {
+			c.MemoryLimitBytes = q.Value()
+		}
 	}
 	return c
 }
