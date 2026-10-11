@@ -122,8 +122,8 @@ func TestStoreBounds(t *testing.T) {
 
 	// Per-node cap keeps the largest processes.
 	st.Update(nodeReport(1, 2, 5)) // 10 processes, RSS 1..5 MiB per pod
-	if a := st.Agents(); a[0].Processes != 4 {
-		t.Fatalf("kept %d processes", a[0].Processes)
+	if a := st.Agents(); a[0].Processes != 4 || a[0].Dropped != 6 {
+		t.Fatalf("kept %d processes, dropped %d", a[0].Processes, a[0].Dropped)
 	}
 	total := 0
 	for p := range 2 {
