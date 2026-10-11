@@ -12,6 +12,7 @@ import (
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/pgstore"
+	"github.com/ByronGary/kubesentry/internal/prom"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
@@ -49,7 +50,16 @@ type config struct {
 	rateLimit                        float64
 	rateBurst, maxInflight           int
 
-	promURL string
+	promURL          string
+	promAutodiscover bool
+	promService      string
+	promSelector     string
+	promSigV4        bool
+	promKSMLimits    bool
+	leakScanInterval time.Duration
+	leakScanWindow   time.Duration
+	leak             detectors.LeakOptions
+	agentInterval    time.Duration
 
 	systemNamespaces, systemNamespacesAdd *listValue
 	systemPrincipalPrefixes               *listValue
@@ -135,7 +145,22 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.IntVar(&c.maxInflight, "max-inflight", 512, "API requests served at once; more get 503 (0 disables)")
 
 	// Data sources.
-	fs.StringVar(&c.promURL, "prometheus-url", "", "Prometheus base URL, e.g. http://prometheus:9090 (enables leak detection); PROMETHEUS_TOKEN for bearer auth")
+	fs.StringVar(&c.promURL, "prometheus-url", "", "Prometheus base URL, e.g. http://prometheus:9090 or an AMP workspace URL (enables leak detection); PROMETHEUS_TOKEN for bearer auth")
+	fs.BoolVar(&c.promAutodiscover, "prometheus-autodiscover", true, "find an in-cluster Prometheus when -prometheus-url is empty")
+	fs.StringVar(&c.promService, "prometheus-service", "", "namespace/name:port of the Prometheus Service to use first in discovery")
+	fs.StringVar(&c.promSelector, "prometheus-selector", "", `extra label matchers for every query, e.g. cluster="prod"`)
+	fs.BoolVar(&c.promSigV4, "prometheus-sigv4", false, "sign queries with AWS SigV4 (automatic for aps-workspaces.*.amazonaws.com)")
+	fs.BoolVar(&c.promKSMLimits, "prometheus-ksm-limits", false, "read memory limits from kube-state-metrics instead of pod specs")
+	dur(&c.leakScanInterval, "leak-scan-interval", 5*time.Minute, "time between background leak scans")
+	dur(&c.leakScanWindow, "leak-scan-window", 24*time.Hour, "look-back of the background leak scan; /oom serves it for this window")
+	c.leak = detectors.DefaultLeakOptions()
+	fs.Float64Var(&th.LeakCritHours, "leak-crit-hours", th.LeakCritHours, "a leak reaching its memory limit sooner than this many hours is critical")
+	minSlope := bytesPerHourValue(c.leak.MinSlopeBytesPerHour)
+	fs.Var(&minSlope, "leak-min-slope", "smallest growth counted as a leak, per hour (e.g. 1MiB, or bytes)")
+	fs.Float64Var(&c.leak.MinR2, "leak-min-r2", c.leak.MinR2, "how linear growth must be to count as a leak (0 to 1)")
+	fs.Float64Var(&c.leak.DropRatio, "leak-drop-ratio", c.leak.DropRatio, "a drop below this fraction of the previous sample is a restart")
+	fs.IntVar(&c.leak.MinSegmentPoints, "leak-min-points", c.leak.MinSegmentPoints, "samples a process lifetime needs to be judged")
+	dur(&c.agentInterval, "agent-interval", 15*time.Second, "how often node agents report (their -interval); process data is stale after 8 of these")
 	fs.StringVar(&c.agentToken, "agent-token", os.Getenv("KUBESENTRY_AGENT_TOKEN"), "bearer token node agents send to POST /agent/report; setting it enables process monitoring (env KUBESENTRY_AGENT_TOKEN)")
 
 	// Policy.
@@ -184,6 +209,7 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 		return nil, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
 	th.RestartWarn, th.RestartCrit = int32(restartWarn), int32(restartCrit)
+	c.leak.MinSlopeBytesPerHour = float64(minSlope)
 	return c, c.validate()
 }
 
@@ -217,6 +243,12 @@ func (c *config) validate() error {
 	if c.kubeQPS <= 0 || c.kubeBurst <= 0 || c.authzQPS <= 0 {
 		return errors.New("-kube-qps, -kube-burst and -authz-qps must be positive")
 	}
+	if c.leak.MinR2 < 0 || c.leak.MinR2 > 1 || c.leak.DropRatio <= 0 || c.leak.DropRatio >= 1 || c.leak.MinSegmentPoints < 3 {
+		return errors.New("-leak-min-r2 must be 0..1, -leak-drop-ratio between 0 and 1, -leak-min-points at least 3")
+	}
+	if _, err := prom.ParseMatchers(c.promSelector); err != nil {
+		return fmt.Errorf("-prometheus-selector: %w", err)
+	}
 	return nil
 }
 
@@ -245,6 +277,7 @@ func (c *config) policy() (detectors.Policy, error) {
 		p.BuiltinRBACPrefixes = []string{}
 	}
 	p.Thresholds = c.thresholds
+	p.Leak = c.leak
 
 	classPrices, err := parsePrices(c.pvcClassPrices)
 	if err != nil {

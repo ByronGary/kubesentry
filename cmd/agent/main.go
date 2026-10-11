@@ -28,6 +28,9 @@ import (
 	"github.com/ByronGary/kubesentry/internal/procmon"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func randFloat() float64 { return rand.Float64() }
 
 func main() {
@@ -45,8 +48,13 @@ func main() {
 		caFile     = flag.String("ca-file", "", "PEM CA bundle to verify the server certificate (default: system roots)")
 		timeout    = flag.Duration("timeout", 10*time.Second, "timeout for one report")
 		maxBackoff = flag.Duration("max-backoff", 2*time.Minute, "longest pause after failures or Retry-After")
+		showVer    = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Parse()
+	if *showVer {
+		fmt.Println("kubesentry-agent", version)
+		return
+	}
 
 	sampler := &procmon.Sampler{Opts: procmon.ScanOptions{Root: *proc, MaxProcesses: *maxProcs}}
 

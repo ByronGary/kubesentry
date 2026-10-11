@@ -144,13 +144,27 @@ func run(cfg *config) error {
 		}
 	}
 
-	if cfg.promURL != "" {
-		c := prom.New(cfg.promURL)
-		c.BearerToken = os.Getenv("PROMETHEUS_TOKEN")
-		srv.Metrics = c
-	} else {
-		slog.Warn("no -prometheus-url set; OOM leak detection disabled (OOMKilled events still work)")
+	sel, _ := prom.ParseMatchers(cfg.promSelector) // validated with the flags
+	metricsSource := &promSource{}
+	err = promSetup{
+		url: cfg.promURL, service: cfg.promService, region: cfg.awsRegion, sigv4: cfg.promSigV4, ksmLimits: cfg.promKSMLimits,
+		autodiscover: cfg.promAutodiscover, selector: sel,
+		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak},
+		pods: func(context.Context) ([]model.Pod, error) {
+			if v := current(); v != nil {
+				return v.Inv.Pods, nil // shared and read-only, which the scanner respects
+			}
+			return nil, errors.New("no cluster view yet")
+		},
+		discover: func(ctx context.Context) ([]string, error) {
+			return kube.DiscoverPrometheus(ctx, clients.CS, cfg.promService)
+		},
+	}.start(ctx, metricsSource)
+	if err != nil {
+		return err
 	}
+	srv.Metrics = metricsSource
+	srv.PrometheusInfo = metricsSource.Info
 
 	closers, err := setupAudit(ctx, cfg, policy, srv)
 	if err != nil {
@@ -159,8 +173,23 @@ func run(cfg *config) error {
 	defer closers.close()
 
 	if cfg.agentToken != "" {
-		srv.Processes = procmon.NewStore()
+		store := procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})
+		srv.Processes = store
 		srv.AgentToken = cfg.agentToken
+		metrics.AgentNodesReporting.SetFunc(func() float64 { return float64(store.Reporting()) })
+		go func() {
+			// Forget silent nodes even when no agent reports at all.
+			t := time.NewTicker(cfg.agentInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					store.Sweep()
+				}
+			}
+		}()
 	}
 
 	srv.Checks = append(srv.Checks, api.HealthCheck{Name: "snapshot", Check: func(context.Context) error {
