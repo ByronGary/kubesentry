@@ -489,7 +489,7 @@ func SummarizeNodesWith(nodes []model.Node, a *Assoc, p Policy, now time.Time) [
 			if !shownPod(pod, t.RecentPod, now) {
 				continue
 			}
-			np := NodePod{Namespace: pod.Namespace, Name: pod.Name, Phase: pod.Phase, Ready: pod.Ready, Reason: PodReason(pod)}
+			np := NodePod{Namespace: pod.Namespace, Name: pod.Name, Phase: pod.Phase, Ready: ReadyOf(pod), Reason: PodReason(pod)}
 			np.Status, _ = podStatus(pod, t, now)
 			np.Workload = a.WorkloadOf(pod)
 			s.Pods = append(s.Pods, np)

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"time"
 
+	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/model"
 )
 
@@ -43,11 +44,17 @@ func NewMetrics(c *Cluster, start time.Time) *Metrics {
 	}
 	m := &Metrics{start: start, profiles: map[model.ContainerKey]profile{}}
 	for _, p := range c.pods {
+		if p.Phase != "Running" {
+			continue // nothing is scraped from a pod that is not running
+		}
 		limits := map[string]float64{}
 		for _, s := range p.Specs {
 			limits[s.Name] = float64(s.MemoryLimitBytes) / mib
 		}
 		for _, ct := range p.Containers {
+			if detectors.IsInitOnly(ct) {
+				continue
+			}
 			key := model.ContainerKey{Namespace: p.Namespace, Pod: p.Name, Container: ct.Name}
 			if sp, ok := special[key]; ok {
 				m.profiles[key] = sp

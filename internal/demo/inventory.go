@@ -36,14 +36,24 @@ func port(p int32, target string) model.ServicePort {
 	return model.ServicePort{Protocol: "TCP", Port: p, TargetPort: target}
 }
 
-func node(name string, created time.Time, conds ...model.Condition) model.Node {
+// node builds a ready EKS node. zone is e.g. us-east-1a; kv are its pool and
+// instance labels on top of the zone, region and OS ones every node carries.
+func node(name, zone, ip string, created time.Time, kv ...string) model.Node {
+	l := labels(kv...)
+	l["topology.kubernetes.io/zone"] = zone
+	l["topology.kubernetes.io/region"] = zone[:len(zone)-1]
+	l["kubernetes.io/os"] = "linux"
+	if l["kubernetes.io/arch"] == "" {
+		l["kubernetes.io/arch"] = "amd64"
+	}
 	return model.Node{
-		Name: name, Ready: true, KubeletVersion: "v1.31.4-eks-aeac579", OSImage: "Amazon Linux 2023.6.20250115",
-		ContainerRuntime: "containerd://1.7.25", CPUAllocatableMilli: 3920, MemoryAllocatableBytes: 15*gib + 400<<20,
-		PodsAllocatable: 58, Created: created, Roles: []string{},
-		Conditions: append([]model.Condition{
+		Name: name, Ready: true, KubeletVersion: "v1.34.2-eks-b3126f4", OSImage: "Amazon Linux 2023.9.20251014",
+		ContainerRuntime: "containerd://2.1.4", CPUAllocatableMilli: 3920, MemoryAllocatableBytes: 15*gib + 400<<20,
+		PodsAllocatable: 58, Created: created, Roles: []string{}, Labels: l, InternalIP: ip,
+		ProviderID: "aws:///" + zone + "/i-0" + hexOf(name)[:16],
+		Conditions: []model.Condition{
 			{Type: "Ready", Status: "True", Reason: "KubeletReady", Message: "kubelet is posting ready status"},
-		}, conds...),
+		},
 	}
 }
 
@@ -79,9 +89,10 @@ func (c *Cluster) addInventory(now time.Time) {
 		"registry.example.com/shop/checkout-api:1.14.2", "envoyproxy/envoy:v1.31.2")
 	checkoutAPI.Conditions = append(checkoutAPI.Conditions,
 		model.Condition{Type: "Available", Status: "False", Reason: "MinimumReplicasUnavailable", Message: "Deployment does not have minimum availability."})
-	coredns := workload("Deployment", "kube-system", "coredns", 2, 2, at(400*day), "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/coredns:v1.11.3-eksbuild.2")
+	coredns := workload("Deployment", "kube-system", "coredns", 2, 2, at(400*day), "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/coredns:v1.12.3-eksbuild.1")
 	coredns.Selector = &model.LabelSelector{MatchLabels: map[string]string{"k8s-app": "kube-dns"}}
-	kubeProxy := workload("DaemonSet", "kube-system", "kube-proxy", 3, 3, at(400*day), "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/kube-proxy:v1.31.3-eksbuild.2")
+	kubeProxy := workload("DaemonSet", "kube-system", "kube-proxy", 3, 3, at(400*day), "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/kube-proxy:v1.34.1-eksbuild.2")
+	recommendations := workload("Deployment", "prod", "recommendations", 1, 0, at(80*day), "registry.example.com/shop/recommendations:4.0.0")
 	kubeProxy.Selector = &model.LabelSelector{MatchLabels: map[string]string{"k8s-app": "kube-proxy"}}
 
 	c.workloads = []model.Workload{
@@ -89,6 +100,7 @@ func (c *Cluster) addInventory(now time.Time) {
 		workload("Deployment", "prod", "payments-worker", 1, 1, at(300*day), "registry.example.com/shop/payments-worker:3.2.0"),
 		workload("Deployment", "prod", "checkout-web", 2, 2, at(210*day), "registry.example.com/shop/checkout-web:2.8.1"),
 		workload("Deployment", "prod", "catalog-api", 1, 1, at(150*day), "registry.example.com/shop/catalog-api:0.9.7"),
+		recommendations,
 		workload("StatefulSet", "prod", "postgres", 1, 1, at(400*day), "postgres:16.4"),
 		workload("StatefulSet", "prod", "redis", 1, 1, at(400*day), "redis:7.4"),
 		{Kind: "CronJob", Namespace: "prod", Name: "inventory-sync", Created: at(90 * day), Schedule: "*/30 * * * *",
@@ -109,6 +121,9 @@ func (c *Cluster) addInventory(now time.Time) {
 		workload("Deployment", "data", "ml-trainer", 1, 1, at(30*day), "registry.example.com/data/ml-trainer:2.3.0", "amazon/aws-cli:2.17.0"),
 		{Kind: "CronJob", Namespace: "data", Name: "warehouse-compact", Created: at(120 * day), Schedule: "0 3 * * 0", Suspended: true,
 			Images: []string{"registry.example.com/data/etl:2026.10.1"}, LastScheduleTime: at(19 * day), LastSuccessTime: at(19 * day)},
+		{Kind: "CronJob", Namespace: "data", Name: "feature-backfill", Created: at(60 * day), Schedule: "50 * * * *",
+			Images: []string{"registry.example.com/data/feature-backfill:1.3.2"}, LastScheduleTime: at(25 * time.Minute), LastSuccessTime: at(85 * time.Minute)},
+		job("data", "feature-backfill-29345690", at(25*time.Minute), "registry.example.com/data/feature-backfill:1.3.2", 1, 0, 0),
 
 		workload("StatefulSet", "monitoring", "prometheus", 1, 1, at(200*day), "quay.io/prometheus/prometheus:v2.54.1", "quay.io/prometheus-operator/prometheus-config-reloader:v0.77.1"),
 		workload("Deployment", "monitoring", "grafana", 1, 1, at(200*day), "grafana/grafana:11.2.2"),
@@ -132,6 +147,7 @@ func (c *Cluster) addInventory(now time.Time) {
 		web,
 		service("prod", "checkout-api", "ClusterIP", labels("app", "checkout-api"), port(8080, "8080")),
 		service("prod", "catalog-api", "ClusterIP", labels("app", "catalog-api"), port(8080, "8080")),
+		service("prod", "recommendations", "ClusterIP", labels("app", "recommendations"), port(8080, "8080")),
 		pg,
 		service("prod", "redis", "ClusterIP", labels("app", "redis"), port(6379, "6379")),
 		// Left behind when legacy-search was retired: it selects nothing.
@@ -163,32 +179,58 @@ func (c *Cluster) addInventory(now time.Time) {
 			Rules: []model.IngressRule{{Host: "search.staging.example.com", Path: "/", Service: "search-indexer", Port: "9200"}}},
 	}
 
-	ml := node(nodeC, at(12*day),
+	ml := node(nodeC, "us-east-1c", "10.0.78.90", at(12*day), "eks.amazonaws.com/nodegroup", "gpu", "eks.amazonaws.com/capacityType", "ON_DEMAND",
+		"node.kubernetes.io/instance-type", "g5.2xlarge")
+	ml.Conditions = append(ml.Conditions,
 		model.Condition{Type: "MemoryPressure", Status: "True", Reason: "KubeletHasInsufficientMemory", Message: "kubelet has insufficient memory available"})
 	ml.Taints = []string{"dedicated=ml:NoSchedule"}
-	c.nodes = []model.Node{node(nodeA, at(47*day)), node(nodeB, at(47*day)), ml}
-
-	c.classes = []model.StorageClass{
-		{Name: "gp3", Provisioner: "ebs.csi.aws.com", ReclaimPolicy: "Delete", BindingMode: "WaitForFirstConsumer", AllowExpansion: true, Default: true, Created: at(400 * day)},
-		{Name: "io2", Provisioner: "ebs.csi.aws.com", ReclaimPolicy: "Retain", BindingMode: "WaitForFirstConsumer", AllowExpansion: true, Created: at(400 * day)},
+	fargate := node(nodeF, "us-east-1b", "10.0.140.21", at(25*time.Minute), "eks.amazonaws.com/compute-type", "fargate",
+		"eks.amazonaws.com/fargate-profile", "data-batch")
+	fargate.KubeletVersion, fargate.OSImage, fargate.ContainerRuntime = "v1.34.2-eks-2d5f260", "Amazon Linux 2", "containerd://1.7.27"
+	fargate.CPUAllocatableMilli, fargate.MemoryAllocatableBytes, fargate.PodsAllocatable = 1000, 2*gib, 1
+	fargate.Taints = []string{"eks.amazonaws.com/compute-type=fargate:NoSchedule"}
+	c.nodes = []model.Node{
+		node(nodeA, "us-east-1a", "10.0.12.34", at(47*day), "eks.amazonaws.com/nodegroup", "general", "eks.amazonaws.com/capacityType", "ON_DEMAND",
+			"node.kubernetes.io/instance-type", "m6i.xlarge"),
+		node(nodeB, "us-east-1b", "10.0.45.67", at(9*day), "karpenter.sh/nodepool", "default", "karpenter.sh/capacity-type", "spot",
+			"node.kubernetes.io/instance-type", "m7g.xlarge", "kubernetes.io/arch", "arm64"),
+		ml,
+		fargate,
 	}
-	policy := map[string]string{"gp3": "Delete", "io2": "Retain"}
+
+	// gp3 is priced from the EBS table, io2 from its annotation (a negotiated
+	// rate), and EFS is billed by usage, so it has no estimate.
+	c.classes = []model.StorageClass{
+		{Name: "gp3", Provisioner: "ebs.csi.aws.com", ReclaimPolicy: "Delete", BindingMode: "WaitForFirstConsumer", AllowExpansion: true, Default: true,
+			Parameters: map[string]string{"type": "gp3", "encrypted": "true"}, Created: at(400 * day)},
+		{Name: "io2", Provisioner: "ebs.csi.aws.com", ReclaimPolicy: "Retain", BindingMode: "WaitForFirstConsumer", AllowExpansion: true,
+			Parameters: map[string]string{"type": "io2", "iopsPerGB": "50"}, PriceAnnotation: "0.14", Created: at(400 * day)},
+		{Name: "efs-sc", Provisioner: "efs.csi.aws.com", ReclaimPolicy: "Delete", BindingMode: "Immediate",
+			Parameters: map[string]string{"provisioningMode": "efs-ap", "fileSystemId": "fs-0a1b2c3d4e5f67890"}, Created: at(200 * day)},
+	}
+	policy := map[string]string{"gp3": "Delete", "io2": "Retain", "efs-sc": "Delete"}
 	c.pvs = nil
 	for _, p := range c.pvcs {
 		if p.Phase != "Bound" {
 			continue
 		}
-		c.pvs = append(c.pvs, model.PV{
+		pv := model.PV{
 			Name: p.VolumeName, StorageClass: p.StorageClass, Phase: "Bound", ReclaimPolicy: policy[p.StorageClass],
 			CapacityBytes: p.CapacityBytes, AccessModes: []string{"ReadWriteOnce"}, ClaimNamespace: p.Namespace, ClaimName: p.Name,
-			Source: "csi:ebs.csi.aws.com", Created: p.Created,
-		})
+			Source: "csi:ebs.csi.aws.com", Driver: "ebs.csi.aws.com", VolumeHandle: "vol-0" + hexOf(p.VolumeName)[:16], Created: p.Created,
+		}
+		if p.StorageClass == "efs-sc" {
+			pv.AccessModes = []string{"ReadWriteMany"}
+			pv.Source, pv.Driver = "csi:efs.csi.aws.com", "efs.csi.aws.com"
+			pv.VolumeHandle = "fs-0a1b2c3d4e5f67890::fsap-0" + hexOf(p.VolumeName)[:16]
+		}
+		c.pvs = append(c.pvs, pv)
 	}
 	// Its claim was deleted months ago; Retain kept the disk, and the bill.
 	c.pvs = append(c.pvs, model.PV{
 		Name: "pvc-prod-reports-archive", StorageClass: "io2", Phase: "Released", ReclaimPolicy: "Retain",
 		CapacityBytes: 300 * gib, AccessModes: []string{"ReadWriteOnce"}, ClaimNamespace: "prod", ClaimName: "reports-archive",
-		Source: "csi:ebs.csi.aws.com", Created: at(310 * day),
+		Source: "csi:ebs.csi.aws.com", Driver: "ebs.csi.aws.com", VolumeHandle: "vol-0" + hexOf("reports-archive")[:16], Created: at(310 * day),
 	})
 
 	c.namespaces = []model.Namespace{

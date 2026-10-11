@@ -1,12 +1,10 @@
 package snapshot
 
 import (
-	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-	"weak"
 
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/model"
@@ -81,82 +79,83 @@ func Build(inv model.Inventory, p detectors.Policy, now time.Time) *View {
 
 	e := &extras{assoc: a, rbac: rb}
 	e.ready.Do(func() {})
-	link(v, e)
+	v.ext.Store(e)
 	v.BuildDuration = time.Since(start)
 	return v
 }
 
 // Assoc returns the view's pod and Service association index.
-func (v *View) Assoc() *detectors.Assoc { return extrasOf(v).get(v).assoc }
+func (v *View) Assoc() *detectors.Assoc { return v.extras().assoc }
 
 // RBAC returns the view's RBAC index, which proposes candidate namespaces for
 // authorization (auth.Candidates).
-func (v *View) RBAC() *detectors.RBACIndex { return extrasOf(v).get(v).rbac }
+func (v *View) RBAC() *detectors.RBACIndex { return v.extras().rbac }
 
 // Topology returns the map of one namespace. It is built on first use and
 // memoised for the life of the view; concurrent callers share one build. The
 // graph is shared: do not modify it.
 func (v *View) Topology(ns string) detectors.Graph {
-	e := extrasOf(v).get(v)
+	e := v.extras()
 	if !e.assoc.HasNamespace(ns) {
 		// Not memoised, so arbitrary names cannot grow the cache.
 		return detectors.BuildTopologyWith(ns, e.assoc, v.Policy, v.Built)
 	}
 	e.mu.Lock()
 	if e.topo == nil {
-		e.topo = map[string]*topoEntry{}
+		e.topo = map[string]*memoEntry{}
 	}
 	t := e.topo[ns]
 	if t == nil {
-		t = &topoEntry{}
+		t = &memoEntry{}
 		e.topo[ns] = t
 	}
 	e.mu.Unlock()
-	t.once.Do(func() { t.g = detectors.BuildTopologyWith(ns, e.assoc, v.Policy, v.Built) })
-	return t.g
+	t.once.Do(func() { t.val = detectors.BuildTopologyWith(ns, e.assoc, v.Policy, v.Built) })
+	return t.val.(detectors.Graph)
 }
 
-// extras holds what a view computes besides its exported fields: the indexes
-// and the memoised topologies. snapshot.go is a shared contract file, so they
-// live in a side table keyed weakly by the view instead of in View itself;
-// an entry goes away with its view.
+// Memo returns the value build computes from this view, computing it on the
+// first call for key and sharing it with every later caller (concurrent
+// callers wait for one build). It lets consumers such as the HTTP API keep
+// derived data (sorted indexes, summaries) exactly as long as the view. Keys
+// must come from a fixed set, never from request input; the value is shared
+// and must not be modified.
+func (v *View) Memo(key string, build func() any) any {
+	e := v.extras()
+	m, _ := e.memo.LoadOrStore(key, &memoEntry{})
+	me := m.(*memoEntry)
+	me.once.Do(func() { me.val = build() })
+	return me.val
+}
+
+// extras holds what a view computes besides its exported fields: the indexes,
+// the memoised topologies and Memo values. Build attaches them; a view
+// assembled by hand (for example in a test, or for Static) gets empty ones on
+// first use, whose indexes are then built from the view's own inventory.
 type extras struct {
 	ready sync.Once
 	assoc *detectors.Assoc
 	rbac  *detectors.RBACIndex
 
 	mu   sync.Mutex
-	topo map[string]*topoEntry
+	topo map[string]*memoEntry // namespace → graph
+
+	memo sync.Map // key → *memoEntry
 }
 
-type topoEntry struct {
+type memoEntry struct {
 	once sync.Once
-	g    detectors.Graph
+	val  any
 }
 
-var side sync.Map // weak.Pointer[View] → *extras
-
-// extrasOf returns v's extras, creating empty ones for a view that was not
-// made by Build (for example one assembled by hand in a test).
-func extrasOf(v *View) *extras {
-	if e, ok := side.Load(weak.Make(v)); ok {
-		return e.(*extras)
+// extras returns v's extras, attaching empty ones on first use; concurrent
+// first callers agree on one set.
+func (v *View) extras() *extras {
+	e := v.ext.Load()
+	if e == nil {
+		v.ext.CompareAndSwap(nil, &extras{})
+		e = v.ext.Load()
 	}
-	return link(v, &extras{})
-}
-
-// link attaches e to v unless v already has extras, and returns v's extras.
-func link(v *View, e *extras) *extras {
-	k := weak.Make(v)
-	actual, loaded := side.LoadOrStore(k, e)
-	if !loaded {
-		runtime.AddCleanup(v, func(k weak.Pointer[View]) { side.Delete(k) }, k)
-	}
-	return actual.(*extras)
-}
-
-// get builds the indexes from the view's own inventory if Build did not.
-func (e *extras) get(v *View) *extras {
 	e.ready.Do(func() {
 		e.assoc = detectors.Associate(v.Inv, v.Policy)
 		e.rbac = detectors.NewRBACIndex(v.Inv.RBAC, v.Policy)
@@ -164,11 +163,33 @@ func (e *extras) get(v *View) *extras {
 	return e
 }
 
-// withStale returns a copy of v marked stale with err, sharing v's indexes.
+// withStale returns a copy of v marked stale with err, sharing v's indexes
+// and memoised values. Fields are copied one by one because a View holds an
+// atomic and must not be copied whole; TestWithStaleCopiesEveryField keeps
+// this list complete.
 func withStale(v *View, err error) *View {
-	nv := *v
-	nv.Stale = true
-	nv.Err = err.Error()
-	link(&nv, extrasOf(v))
-	return &nv
+	nv := &View{
+		Version:            v.Version,
+		Built:              v.Built,
+		BuildDuration:      v.BuildDuration,
+		Stale:              true,
+		Err:                err.Error(),
+		Inv:                v.Inv,
+		Policy:             v.Policy,
+		Workloads:          v.Workloads,
+		Claims:             v.Claims,
+		Unused:             v.Unused,
+		Certs:              v.Certs,
+		Requests:           v.Requests,
+		Findings:           v.Findings,
+		Posture:            v.Posture,
+		Issuers:            v.Issuers,
+		Nodes:              v.Nodes,
+		Volumes:            v.Volumes,
+		Classes:            v.Classes,
+		NamespacesWithPods: v.NamespacesWithPods,
+		LivePods:           v.LivePods,
+	}
+	nv.ext.Store(v.extras())
+	return nv
 }

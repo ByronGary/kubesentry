@@ -1,15 +1,17 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"regexp"
-	"sort"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
+	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/model"
+	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
 // dnsName matches Kubernetes object and namespace names (DNS-1123 subdomains).
@@ -18,61 +20,106 @@ var dnsName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
 
 func validName(s string) bool { return len(s) <= 253 && dnsName.MatchString(s) }
 
-const podActivityWindow = 7 * 24 * time.Hour
-
-type podSummary struct {
-	Namespace  string `json:"namespace"`
-	Name       string `json:"name"`
-	Phase      string `json:"phase"`
-	Containers int    `json:"containers"`
-	Restarts   int32  `json:"restarts"`
-	OOMKilled  bool   `json:"oomKilled"`
-}
-
 type podsResponse struct {
-	Count int          `json:"count"`
-	Items []podSummary `json:"items"`
+	Count    int                    `json:"count"`
+	Items    []detectors.PodSummary `json:"items"`
+	Continue string                 `json:"continue,omitempty"`
 }
 
-// pods lists pods, most troubled first: OOMKilled, then most restarts.
+// podRows is every pod, most troubled first: OOMKilled, then most restarts.
+func podRows(v *snapshot.View) []keyed[detectors.PodSummary] {
+	return memoRows(v, "pods", func() []keyed[detectors.PodSummary] {
+		a := v.Assoc()
+		pods := v.Inv.Pods
+		rows := make([]keyed[detectors.PodSummary], 0, len(pods))
+		for i := range pods {
+			sum := detectors.PodSummaryOf(&pods[i], a)
+			oom := "1"
+			if sum.OOMKilled {
+				oom = "0"
+			}
+			rows = append(rows, keyed[detectors.PodSummary]{
+				key: keyJoin(oom, keyDesc(int64(sum.Restarts)), sum.Namespace, sum.Name), ns: sum.Namespace, v: sum,
+			})
+		}
+		return rows
+	})
+}
+
+// pods lists the pods in the caller's namespaces, most troubled first, a page
+// at a time.
 func (s *Server) pods(w http.ResponseWriter, r *http.Request) {
-	ns := r.URL.Query().Get("namespace")
-	if ns != "" && !validName(ns) {
-		writeError(w, http.StatusBadRequest, "invalid namespace")
+	ns, ok := namespaceParam(w, r)
+	if !ok {
 		return
 	}
-	pods, err := s.Cluster.ListPods(r.Context())
+	pg, ok := pageParams(w, r, "pods")
+	if !ok {
+		return
+	}
+	v, ok := s.view(w, r)
+	if !ok {
+		return
+	}
+	items, last := pageRows(podRows(v), pg.after, pg.limit, inScope[detectors.PodSummary](s.scope(r, auth.ViewNamespace), ns))
+	writeJSON(w, http.StatusOK, podsResponse{Count: len(items), Items: items, Continue: encodeToken("pods", last)})
+}
+
+// getPod looks a pod up in the cluster source (fresh, and cheap from the
+// informer cache) or, without one, in the view.
+func (s *Server) getPod(ctx context.Context, v *snapshot.View, ns, name string) (*model.Pod, error) {
+	if s.Cluster != nil {
+		return s.Cluster.GetPod(ctx, ns, name)
+	}
+	for _, p := range v.Assoc().PodsIn(ns) {
+		if p.Name == name {
+			c := *p
+			return &c, nil
+		}
+	}
+	return nil, model.ErrNotFound
+}
+
+func (s *Server) getPVC(ctx context.Context, v *snapshot.View, ns, name string) (*model.PVC, error) {
+	if s.Cluster != nil {
+		return s.Cluster.GetPVC(ctx, ns, name)
+	}
+	for i := range v.Inv.PVCs {
+		if p := &v.Inv.PVCs[i]; p.Namespace == ns && p.Name == name {
+			c := *p
+			return &c, nil
+		}
+	}
+	return nil, model.ErrNotFound
+}
+
+// visiblePod resolves the pod named by the path for a caller who may see its
+// namespace. It answers 400, 404 (also for a namespace the caller may not
+// see, so existence does not leak) or 502 and returns false otherwise.
+func (s *Server) visiblePod(w http.ResponseWriter, r *http.Request) (*model.Pod, *snapshot.View, bool) {
+	ns, name := r.PathValue("namespace"), r.PathValue("name")
+	if !validName(ns) || !validName(name) {
+		writeError(w, http.StatusBadRequest, "invalid namespace or pod name")
+		return nil, nil, false
+	}
+	v, ok := s.view(w, r)
+	if !ok {
+		return nil, nil, false
+	}
+	if !allowed(r.Context(), s.Authorizer, auth.ViewNamespace, ns) {
+		writeError(w, http.StatusNotFound, "pod not found")
+		return nil, nil, false
+	}
+	pod, err := s.getPod(r.Context(), v, ns, name)
+	if errors.Is(err, model.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "pod not found")
+		return nil, nil, false
+	}
 	if err != nil {
 		upstreamError(w, "kubernetes", err)
-		return
+		return nil, nil, false
 	}
-	items := []podSummary{}
-	for _, p := range pods {
-		if ns != "" && p.Namespace != ns {
-			continue
-		}
-		sum := podSummary{Namespace: p.Namespace, Name: p.Name, Phase: p.Phase, Containers: len(p.Containers)}
-		for _, c := range p.Containers {
-			sum.Restarts += c.RestartCount
-			if c.LastTerminatedReason == "OOMKilled" {
-				sum.OOMKilled = true
-			}
-		}
-		items = append(items, sum)
-	}
-	sort.Slice(items, func(i, j int) bool {
-		a, b := items[i], items[j]
-		switch {
-		case a.OOMKilled != b.OOMKilled:
-			return a.OOMKilled
-		case a.Restarts != b.Restarts:
-			return a.Restarts > b.Restarts
-		case a.Namespace != b.Namespace:
-			return a.Namespace < b.Namespace
-		}
-		return a.Name < b.Name
-	})
-	writeJSON(w, http.StatusOK, podsResponse{Count: len(items), Items: items})
+	return pod, v, true
 }
 
 type containerDiag struct {
@@ -98,6 +145,7 @@ type podDiagnosticsResponse struct {
 	Containers       []containerDiag         `json:"containers"`
 	Volumes          []detectors.VolumeState `json:"volumes"`
 	Activity         []audit.Event           `json:"activity"`
+	ActivityWindow   string                  `json:"activityWindow"` // Go duration of the activity look-back
 	Warnings         []string                `json:"warnings,omitempty"`
 }
 
@@ -105,27 +153,17 @@ type podDiagnosticsResponse struct {
 // per container, mounted volumes and recent user activity against the pod.
 // Missing data sources degrade to "unknown" checks and a warning, not an error.
 func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
-	ns, name := r.PathValue("namespace"), r.PathValue("name")
-	if !validName(ns) || !validName(name) {
-		writeError(w, http.StatusBadRequest, "invalid namespace or pod name")
-		return
-	}
 	window, err := durationParam(r, "window", 6*time.Hour, 10*time.Minute, 7*24*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
+	pod, v, ok := s.visiblePod(w, r)
+	if !ok {
+		return
+	}
 	ctx := r.Context()
-	pod, err := s.Cluster.GetPod(ctx, ns, name)
-	if errors.Is(err, model.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "pod not found")
-		return
-	}
-	if err != nil {
-		upstreamError(w, "kubernetes", err)
-		return
-	}
+	ns, name := pod.Namespace, pod.Name
 
 	resp := podDiagnosticsResponse{
 		Namespace: ns, Name: name, Phase: pod.Phase, Window: window.String(),
@@ -138,7 +176,7 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		seen[claim] = true
-		pvc, err := s.Cluster.GetPVC(ctx, ns, claim)
+		pvc, err := s.getPVC(ctx, v, ns, claim)
 		if errors.Is(err, model.ErrNotFound) {
 			resp.Volumes = append(resp.Volumes, detectors.VolumeState{Claim: claim})
 			continue
@@ -153,22 +191,27 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var series []model.ContainerSeries
-	var limits map[model.ContainerKey]float64
-	if s.Metrics != nil {
+	limits := podLimits([]model.Pod{*pod}, nil)
+	if m := s.metrics(); m != nil {
 		step := window / 120
 		if step < 30*time.Second {
 			step = 30 * time.Second
 		}
-		series, limits, err = s.Metrics.PodMemory(ctx, ns, name, window, step.Round(time.Second))
+		var ksm map[model.ContainerKey]float64
+		series, ksm, err = m.PodMemory(ctx, ns, name, window, step.Round(time.Second))
 		if err != nil {
 			resp.Warnings = append(resp.Warnings, "Memory history is unavailable: could not query Prometheus.")
 		} else {
 			resp.MetricsAvailable = true
+			limits = podLimits([]model.Pod{*pod}, ksm)
 		}
 	}
 
 	var leaks []detectors.LeakFinding
 	for _, c := range pod.Containers {
+		if detectors.IsInitOnly(c) {
+			continue // ordinary init containers ran to completion; the containers check covers a stuck one
+		}
 		key := model.ContainerKey{Namespace: ns, Pod: name, Container: c.Name}
 		cd := containerDiag{
 			Name: c.Name, RestartCount: c.RestartCount, LastTerminatedReason: c.LastTerminatedReason,
@@ -196,18 +239,29 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 		resp.Containers = append(resp.Containers, cd)
 	}
 
+	policy := v.Policy
+	resp.ActivityWindow = policy.Thresholds.ActivityWindow.String()
 	var execCount, deniedCount int
 	if s.Audit != nil {
-		resp.AuditAvailable = true
-		resp.Activity = s.Audit.Query(audit.Query{
-			Since:        s.now().Add(-podActivityWindow),
-			Namespace:    ns,
-			Resource:     "pods",
-			Name:         name,
-			Actors:       allActors,
-			IncludeReads: true,
-			Limit:        50,
-		})
+		if allowed(ctx, s.Authorizer, auth.ViewAudit, ns) {
+			events, err := s.auditStore().Query(ctx, audit.Query{
+				Since:        s.now().Add(-policy.Thresholds.ActivityWindow),
+				Namespace:    ns,
+				Resource:     "pods",
+				Name:         name,
+				Actors:       allActors,
+				IncludeReads: true,
+				Limit:        50,
+			})
+			if err != nil {
+				resp.Warnings = append(resp.Warnings, "Activity is unavailable: could not query the audit store.")
+			} else {
+				resp.AuditAvailable = true
+				resp.Activity = events
+			}
+		} else {
+			resp.Warnings = append(resp.Warnings, "Activity is hidden: you may not read audit events in this namespace.")
+		}
 		for _, e := range resp.Activity {
 			for _, t := range e.Tags {
 				switch t {
@@ -220,10 +274,10 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp.Checks = detectors.DiagnosePod(detectors.PodInput{
+	resp.Checks = detectors.DiagnosePodWith(detectors.PodInput{
 		Pod: *pod, Volumes: resp.Volumes, Leaks: leaks,
 		MetricsAvailable: resp.MetricsAvailable, AuditAvailable: resp.AuditAvailable,
 		ExecCount: execCount, DeniedCount: deniedCount, Now: s.now(),
-	})
+	}, policy)
 	writeJSON(w, http.StatusOK, resp)
 }

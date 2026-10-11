@@ -454,8 +454,8 @@ func TestLeakScanCandidateCap(t *testing.T) {
 	if rep.Candidates != 5 {
 		t.Fatalf("candidates = %d", rep.Candidates)
 	}
-	if len(rep.Errors) != 1 || !strings.Contains(rep.Errors[0], "more than 5 candidates") {
-		t.Fatalf("cap not reported: %v", rep.Errors)
+	if len(rep.Errors) != 0 || len(rep.Warnings) != 1 || !strings.Contains(rep.Warnings[0], "more than 5 candidates") {
+		t.Fatalf("cap not reported as a warning: errors %v warnings %v", rep.Errors, rep.Warnings)
 	}
 	queries, _, _ := f.stats()
 	if !strings.HasPrefix(queries[0], "topk(6, ") {
@@ -485,6 +485,9 @@ func TestLeakScanKeepsLastGoodFindings(t *testing.T) {
 	rep := s.Scan(context.Background())
 	if len(rep.Findings) != 20 || !rep.GeneratedAt.Equal(first.GeneratedAt) || len(rep.Errors) != 1 || !strings.Contains(rep.Errors[0], "candidate query") {
 		t.Fatalf("after a failed scan: %d findings at %v, errors %v", len(rep.Findings), rep.GeneratedAt, rep.Errors)
+	}
+	if !first.LastAttempt.Equal(first.GeneratedAt) || !rep.LastAttempt.Equal(now.Add(5*time.Minute)) {
+		t.Errorf("last attempt: first %v, after the failure %v", first.LastAttempt, rep.LastAttempt)
 	}
 	if got := s.Latest(); len(got.Findings) != 20 || len(got.Errors) != 1 {
 		t.Fatalf("Latest: %+v", got)

@@ -57,6 +57,7 @@ type Store struct {
 type nodeEntry struct {
 	received  time.Time
 	processes int   // kept, after the per-node cap
+	dropped   int   // cut by the per-node cap
 	bytes     int64 // size of the report as received
 	pods      []string
 }
@@ -74,6 +75,9 @@ type AgentStatus struct {
 	Processes  int       `json:"processes"`
 	Bytes      int64     `json:"bytes"`
 	Stale      bool      `json:"stale"`
+	// Dropped counts the smallest processes the per-node cap cut from the
+	// last report.
+	Dropped int `json:"dropped,omitempty"`
 }
 
 // NewStore returns an empty store with the default bounds.
@@ -115,7 +119,7 @@ func (s *Store) Update(r Report) {
 		sort.SliceStable(ps, func(i, j int) bool { return ps[i].RSSBytes > ps[j].RSSBytes })
 		uids = append(uids, uid)
 	}
-	entry := &nodeEntry{received: now, processes: len(procs), bytes: r.Bytes, pods: uids}
+	entry := &nodeEntry{received: now, processes: len(procs), dropped: len(r.Processes) - len(procs), bytes: r.Bytes, pods: uids}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,7 +227,7 @@ func (s *Store) Agents() []AgentStatus {
 			continue
 		}
 		out = append(out, AgentStatus{
-			Node: name, LastReport: e.received, Processes: e.processes, Bytes: e.bytes, Stale: age > s.opts.StaleAfter,
+			Node: name, LastReport: e.received, Processes: e.processes, Dropped: e.dropped, Bytes: e.bytes, Stale: age > s.opts.StaleAfter,
 		})
 	}
 	s.mu.RUnlock()

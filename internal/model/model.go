@@ -55,6 +55,11 @@ type Pod struct {
 	DeletedAt     time.Time // deletionTimestamp; zero unless the pod is terminating
 	PodIP         string
 	QOSClass      string // Guaranteed, Burstable or BestEffort
+	// Reason and Message are the pod's own status.reason and status.message,
+	// set when the kubelet or a controller gave up on the whole pod: Evicted,
+	// NodeLost, UnexpectedAdmissionError, ... Empty for an ordinary pod.
+	Reason  string
+	Message string
 }
 
 // ContainerSpec is the security- and resource-relevant part of one container's

@@ -9,6 +9,7 @@ package snapshot
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/detectors"
@@ -62,4 +63,10 @@ type View struct {
 	NamespacesWithPods []string
 	// LivePods counts live pods per namespace (for choosing a default namespace).
 	LivePods map[string]int
+
+	// ext holds what the view computes besides the fields above: the
+	// association and RBAC indexes, memoised topologies and Memo values. Build
+	// sets it; a view assembled by hand gets it on first use (see build.go).
+	// Being atomic, a View must not be copied: withStale shows how.
+	ext atomic.Pointer[extras]
 }

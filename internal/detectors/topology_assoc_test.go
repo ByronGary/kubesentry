@@ -206,7 +206,7 @@ func TestSummarizeNodesPlacementAndPods(t *testing.T) {
 	if n1.PodCount != 1 || len(n1.Pods) != 2 {
 		t.Errorf("ip-1 pod count %d, listed %d", n1.PodCount, len(n1.Pods))
 	}
-	if cp := n1.Pods[0]; cp.Name != "crash" || cp.Ready || cp.Reason != "ImagePullBackOff" || cp.Status != StatusCrit || cp.Workload != "Deployment/web" {
+	if cp := n1.Pods[0]; cp.Name != "crash" || cp.Ready == nil || *cp.Ready || cp.Reason != "ImagePullBackOff" || cp.Status != StatusCrit || cp.Workload != "Deployment/web" {
 		t.Errorf("crash pod row = %+v", cp)
 	}
 	if n2 := by["ip-2"]; n2.Placement.PoolKind != PoolKarpenter || n2.Placement.CapacityType != "on-demand" || strings.Join(n2.Roles, ",") != "nodepool:burst" || n2.Placement.Zone != "eu-west-1a" {

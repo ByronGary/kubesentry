@@ -70,8 +70,9 @@ func TestDemoExercisesEveryFeature(t *testing.T) {
 		Total float64 `json:"totalEstMonthlyCostUSD"`
 	}
 	getJSON(t, h, "/api/v1/pvcs/unused", &pvcs)
-	// old-es-data-0, backup-scratch, ml-cache and test-claim-3; new-claim is under the minimum age.
-	if pvcs.Count != 4 || pvcs.Total < 70 {
+	// old-es-data-0, backup-scratch, ml-cache, test-claim-3 and the EFS
+	// shared-models (no estimate); new-claim is under the minimum age.
+	if pvcs.Count != 5 || pvcs.Total < 70 {
 		t.Errorf("unused PVCs = %+v", pvcs)
 	}
 
@@ -155,10 +156,43 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 	}
 	h := srv.Handler()
 
-	var info struct{ Inventory, Certs bool }
+	var info struct {
+		Inventory, Certs bool
+		Cluster          struct{ Name, Version, Platform, Region string }
+		Namespaces       int
+		Snapshot         *struct{ Version int }
+	}
 	getJSON(t, h, "/api/v1/info", &info)
-	if !info.Inventory || !info.Certs {
+	if !info.Inventory || !info.Certs || info.Snapshot == nil || info.Namespaces != 6 {
 		t.Errorf("info = %+v", info)
+	}
+	if c := info.Cluster; c.Name != "shop-prod" || c.Platform != "eks" || c.Region != "us-east-1" || !strings.Contains(c.Version, "-eks-") {
+		t.Errorf("cluster = %+v", c)
+	}
+
+	// Readiness shows for pods that report it.
+	var pods struct{ Items []detectors.PodSummary }
+	getJSON(t, h, "/api/v1/pods?namespace=prod&limit=1000", &pods)
+	ready := map[string]string{}
+	for _, p := range pods.Items {
+		switch {
+		case p.Ready == nil:
+			ready[p.Name] = "unknown"
+		case *p.Ready:
+			ready[p.Name] = "ready"
+		default:
+			ready[p.Name] = "not ready"
+		}
+	}
+	if ready["redis-0"] != "ready" || ready["recommendations-6d5f7c8b9-zt4qx"] != "not ready" {
+		t.Errorf("readiness = %v", ready)
+	}
+
+	// The agents page lists every node that runs an agent: not Fargate.
+	var agents []struct{ Node string }
+	getJSON(t, h, "/api/v1/agents", &agents)
+	if len(agents) != 3 {
+		t.Errorf("agents = %+v", agents)
 	}
 
 	var wl struct {
@@ -190,11 +224,43 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 		Items []detectors.NodeSummary
 	}
 	getJSON(t, h, "/api/v1/nodes", &nodes)
-	if nodes.Count != 3 || nodes.Items[0].Name != "ip-10-0-12-34.ec2.internal" || len(nodes.Items[0].Pods) == 0 {
+	byNode := map[string]detectors.NodeSummary{}
+	for _, n := range nodes.Items {
+		byNode[n.Name] = n
+	}
+	if nodes.Count != 4 || len(byNode["ip-10-0-12-34.ec2.internal"].Pods) == 0 {
 		t.Fatalf("nodes = %+v", nodes)
 	}
-	if ml := nodes.Items[2]; ml.Status != detectors.StatusWarn || len(ml.Pressure) != 1 || len(ml.Taints) != 1 {
+	if ml := byNode["ip-10-0-78-90.ec2.internal"]; ml.Status != detectors.StatusWarn || len(ml.Pressure) != 1 || len(ml.Taints) != 1 {
 		t.Errorf("the ML node should be under memory pressure: %+v", ml)
+	}
+	// Placement across pools and zones, as on EKS.
+	for name, want := range map[string]string{
+		"ip-10-0-12-34.ec2.internal":          "us-east-1a nodegroup/general on-demand m6i.xlarge amd64",
+		"ip-10-0-45-67.ec2.internal":          "us-east-1b karpenter/default spot m7g.xlarge arm64",
+		"ip-10-0-78-90.ec2.internal":          "us-east-1c nodegroup/gpu on-demand g5.2xlarge amd64",
+		"fargate-ip-10-0-140-21.ec2.internal": "us-east-1b fargate/data-batch   amd64",
+	} {
+		pl := byNode[name].Placement
+		if got := pl.Zone + " " + pl.PoolKind + "/" + pl.Pool + " " + pl.CapacityType + " " + pl.InstanceType + " " + pl.Arch; got != want {
+			t.Errorf("%s placement = %q, want %q", name, got, want)
+		}
+	}
+	reasons := map[string]string{}
+	for _, n := range nodes.Items {
+		for _, p := range n.Pods {
+			reasons[p.Name] = p.Status + " " + p.Reason + " " + p.Workload
+		}
+	}
+	for pod, want := range map[string]string{
+		"recommendations-6d5f7c8b9-zt4qx": "crit CrashLoopBackOff Deployment/recommendations",
+		"ml-trainer-6f8c9d7b5-9xq2w":      "crit Evicted Deployment/ml-trainer",
+		"checkout-web-5f9c7d6b4-8kq3z":    "ok Terminating Deployment/checkout-web",
+		"feature-backfill-29345690-q9d2m": "ok  Job/feature-backfill-29345690",
+	} {
+		if reasons[pod] != want {
+			t.Errorf("%s on its node = %q, want %q", pod, reasons[pod], want)
+		}
 	}
 
 	// Processes come from the agent on the pod's own node.
@@ -217,9 +283,22 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 	if v := storage.Volumes[0]; v.Name != "pvc-prod-reports-archive" || v.Status != detectors.StatusWarn || v.ReclaimPolicy != "Retain" {
 		t.Errorf("the released volume should come first: %+v", v)
 	}
-	// Same four as /api/v1/pvcs/unused: the pending feature-store claim is not unused.
-	if len(storage.Unused) != 4 || len(storage.Classes) != 2 || !storage.Classes[0].Default {
+	// Same five as /api/v1/pvcs/unused: the pending feature-store claim is not unused.
+	if len(storage.Unused) != 5 || len(storage.Classes) != 3 || !storage.Classes[0].Default {
 		t.Errorf("unused = %d classes = %+v", len(storage.Unused), storage.Classes)
+	}
+	// Priced from the EBS table, from a StorageClass annotation, and billed by usage.
+	sources := map[string]string{}
+	for _, c := range storage.Classes {
+		sources[c.Name] = c.PriceSource
+	}
+	if sources["gp3"] != detectors.PriceFromEBSTable || sources["io2"] != detectors.PriceFromAnnotation || sources["efs-sc"] != detectors.PriceUsageBilled {
+		t.Errorf("class price sources = %v", sources)
+	}
+	for _, u := range storage.Unused {
+		if u.Name == "shared-models" && (u.CostKnown || u.PriceSource != detectors.PriceUsageBilled) {
+			t.Errorf("EFS claim = %+v", u)
+		}
 	}
 	claims := map[string]string{}
 	for _, c := range storage.Claims {
@@ -298,7 +377,8 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 		Graph      detectors.Graph
 	}
 	getJSON(t, h, "/api/v1/map", &m)
-	if m.Namespace != "data" || len(m.Namespaces) != 5 {
+	// The busiest non-system namespace.
+	if m.Namespace != "prod" || len(m.Namespaces) != 5 {
 		t.Errorf("default map = %s of %v", m.Namespace, m.Namespaces)
 	}
 	getJSON(t, h, "/api/v1/map?namespace=prod", &m)
@@ -316,6 +396,25 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 		if !edges[want] {
 			t.Errorf("prod map lacks %s", want)
 		}
+	}
+	// Service links come from EndpointSlices, with their endpoint states.
+	checked := 0
+	for _, e := range m.Graph.Edges {
+		switch e.From + " -> " + e.To {
+		case "Service/prod/checkout-web -> Deployment/prod/checkout-web":
+			checked++
+			if e.How != detectors.HowEndpoints || e.Ready != 2 || e.Terminating != 1 {
+				t.Errorf("checkout-web endpoints = %+v", e)
+			}
+		case "Service/prod/recommendations -> Deployment/prod/recommendations":
+			checked++
+			if e.How != detectors.HowEndpoints || e.Ready != 0 || e.NotReady != 1 {
+				t.Errorf("recommendations endpoints = %+v", e)
+			}
+		}
+	}
+	if checked != 2 {
+		t.Errorf("found %d of the 2 Service links to check", checked)
 	}
 	status := map[string]string{}
 	for _, n := range m.Graph.Nodes {

@@ -193,13 +193,15 @@ func (s *LeakScanner) scan(ctx context.Context, prev detectors.LeakReport, prevG
 	if err != nil {
 		rep := prev
 		rep.Errors = append(errs, "candidate query: "+err.Error())
+		rep.LastAttempt = now.UTC()
 		if !prevGood {
 			rep.Findings = []detectors.LeakFinding{}
 		}
 		return rep, false
 	}
+	var warns []string
 	if total > len(cands) {
-		errs = append(errs, fmt.Sprintf("more than %d candidates: analysed the %d fastest-growing", s.opts.MaxCandidates, len(cands)))
+		warns = append(warns, fmt.Sprintf("more than %d candidates: analysed the %d fastest-growing", s.opts.MaxCandidates, len(cands)))
 	}
 
 	limits := LimitsFromPods(pods)
@@ -222,10 +224,12 @@ func (s *LeakScanner) scan(ctx context.Context, prev detectors.LeakReport, prevG
 	sortLeaks(findings)
 	return detectors.LeakReport{
 		GeneratedAt: now.UTC(),
+		LastAttempt: now.UTC(),
 		Window:      s.opts.Window.String(),
 		Findings:    findings,
 		Candidates:  len(cands),
 		Errors:      errs,
+		Warnings:    warns,
 	}, true
 }
 

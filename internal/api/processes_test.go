@@ -127,9 +127,9 @@ func TestProcessRoutesAbsentWhenDisabled(t *testing.T) {
 	if rec := post(s, "/agent/report", "x", `{}`); rec.Code == 204 || rec.Code == 200 {
 		t.Errorf("agent endpoint should not exist, got %d", rec.Code)
 	}
-	var info map[string]bool
+	var info infoResponse
 	get(t, s, "/api/v1/info", &info)
-	if info["processes"] {
+	if info.Processes {
 		t.Error("info.processes should be false")
 	}
 }

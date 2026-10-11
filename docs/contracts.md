@@ -25,24 +25,28 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 ### Listeners
 - `-addr` (default `127.0.0.1:8080`): UI and `/api/`. Behind the oauth2-proxy sidecar in proxy mode.
 - `-ingest-addr` (e.g. `:8081`): `POST /agent/report`, `POST /audit/webhook`, token-authenticated. Empty: served on `-addr`.
-- `-ops-addr` (e.g. `:9090`): `/healthz`, `/readyz`, `/metrics`, and `/debug/pprof/` when `-pprof`. Empty: `/healthz` and `/readyz` on `-addr`, no metrics.
-- `/readyz` is 503 until caches have synced and the first view exists; afterwards it stays ready and reports degraded sources in its body.
+- `-ops-addr` (e.g. `:9090`): `/healthz`, `/readyz`, `/metrics`, and `/debug/pprof/` when `-pprof`. Empty: `/healthz` and `/readyz` on `-addr`, no metrics. Set: the probes are only there.
+- `/readyz` is 503 until caches have synced and the first view exists; afterwards it stays ready and reports degraded sources in its body: `{status: "ready"|"starting", degraded?: {name: reason}, unavailable?: {source: reason}}`. `degraded` names failing dependencies (`postgres` ping, `cloudwatch` reader errors, a `snapshot` serving its last good view after failed rebuilds). On SIGTERM it turns 503 for `-shutdown-drain` before the listeners stop.
+- The UI's static files and `/healthz` are unauthenticated. Ingest routes keep their token guards and body limits and are not rate limited per user; `/api/` gets authentication, the per-identity rate limit and the in-flight cap.
 
 ### Routes (new and changed)
 | Route | Change |
 |---|---|
-| `GET /api/v1/info` | adds `identity`, `capabilities`, `cluster`, `snapshot`, `auditStore`, `prometheus`, `unavailable` (see `web/src/types.ts` `Info`) |
+| `GET /api/v1/info` | adds `identity`, `capabilities`, `cluster`, `snapshot`, `auditStore`, `prometheus`, `unavailable` (see `web/src/types.ts` `Info`). `unavailable` leaves out sources this server was not given ("not configured") |
 | `GET /api/v1/pods` | `?namespace=&limit=&continue=`; items gain `ready`, `reason`, `node`, `workload`; response gains `continue` |
 | `GET /api/v1/workloads` | `?limit=&continue=`; items gain `notReady`, `waiting` |
-| `GET /api/v1/nodes` | `?summary=true` omits `pods` (keeps `podCount`); items gain `placement` |
-| `GET /api/v1/nodes/{name}` | one node with its pods |
-| `GET /api/v1/storage` | claims, classes gain cost/price fields; `?limit=&continue=` pages claims |
-| `GET /api/v1/security` | `?view=summary` returns counts + the 200 most severe; `?limit=&continue=` pages findings. Counts cover only what the caller can see |
-| `GET /api/v1/map` | edges gain `how`, endpoint counts; kinds gain `ReplicaSet`, `Controller`; response gains `namespaceStats` (live pods per visible namespace, with `system`) |
-| `GET /api/v1/pods/{ns}/{name}/diagnostics` | gains `activityWindow` (Go duration) |
-| `GET /api/v1/oom` | leaks come from the background `LeakReport` when the window matches its window |
-| `GET /api/v1/audit/events` | `?continue=` (opaque cursor); scope-filtered |
-| `GET /api/v1/agents` | new: `[{node, lastReport, processes, bytes, stale}]` |
+| `GET /api/v1/nodes` | `?summary=true` omits `pods` (keeps `podCount`); items gain `placement`. `pods` and `podCount` cover the caller's namespaces |
+| `GET /api/v1/nodes/{name}` | one node with its pods; 404 when the caller may not see it |
+| `GET /api/v1/storage` | claims, classes gain cost/price fields; `?limit=&continue=` pages claims; `volumes`, `classes` and `unused` are complete on every page |
+| `GET /api/v1/security` | `?view=summary` returns counts + the 200 most severe non-system findings (no `continue`); `?limit=&continue=` pages findings. Counts cover only what the caller can see |
+| `GET /api/v1/map` | edges gain `how`, endpoint counts; kinds gain `ReplicaSet`, `Controller`; response gains `namespaceStats` (live pods per visible namespace, with `system`). Without `?namespace=` the server picks the caller's busiest non-system namespace; a namespace they cannot see is 404 |
+| `GET /api/v1/pods/{ns}/{name}/diagnostics` | gains `activityWindow` (Go duration). 404 when the caller cannot see the namespace; activity is left out, with a warning, without `ViewAudit` there. Memory limits come from the pod unless kube-state-metrics reports them |
+| `GET /api/v1/pods/{ns}/{name}/processes` | 404 when the caller cannot see the namespace, 403 without `ViewProcesses` there |
+| `GET /api/v1/oom` | leaks come from the background `LeakReport` when the window matches its window (scan warnings are passed on in `warnings`); any other window queries Prometheus now |
+| `GET /api/v1/audit/events` | `?continue=` (opaque cursor); scope-filtered; `limit` defaults to 200 |
+| `GET /api/v1/agents` | new: `[{node, lastReport, processes, bytes, stale, dropped?}]` (a bare array); 403 without `ViewAgents`; absent (404) when process monitoring is off |
+| `POST /agent/report` | plain or gzip JSON (`Content-Encoding: gzip`): 413 when the body or the decompressed report exceeds 8 MiB, 415 for another encoding, 400 when invalid |
+| `POST /audit/webhook` | 503 with `Retry-After` when the audit store's write queue is full |
 | `POST /api/v1/auth/recheck` | new: forgets the caller's cached authorization decisions and returns `{capabilities}`; at most once a minute per identity (429 otherwise) |
 
 ### Authentication rules
@@ -53,16 +57,16 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 
 Pod readiness: `ready` on pods and node pods is omitted when the pod has not reported a Ready condition (Go `*bool` with `omitempty`), so "unknown" is never shown as "not ready". `/info` `namespaces` is the number of namespaces the caller can see.
 
-Pagination: `limit` (default 200, max 1000) and an opaque `continue` token; the response carries `continue` when there is more.
+Pagination: `limit` (default 200, max 1000) and an opaque `continue` token; the response carries `continue` when there is more. A larger `limit` is clamped to 1000; a limit below 1 or not a number, and a `continue` token that is malformed or from another route, is 400. Tokens are keyset positions in the route's sort order (most troubled first), so a rebuilt view between pages neither repeats nor skips items whose sort key did not change; they are not signed, and editing one only moves the start. Responses of the view-backed list routes may come from a cache keyed by path, query, the caller's scope over every capability the route depends on, and the view version (`X-Kubesentry-Cache: hit|miss`).
 
 ### Scope per route
-Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in its namespace. Further gates: processes `ViewProcesses`; audit `ViewAudit` per namespace and `ViewClusterAudit` for events without a namespace; nodes, PVs, storage classes, ClusterRole/ClusterRoleBinding findings, ClusterIssuers need their cluster-wide capability. Without one, the page degrades (names only, status `unknown`) instead of failing. `/info` returns the caller's capabilities so the UI hides what it cannot use. The break-glass token and `-auth-mode=none` are unrestricted.
+Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in its namespace. Further gates: processes `ViewProcesses`; audit `ViewAudit` per namespace and `ViewClusterAudit` for events without a namespace; nodes, PVs, storage classes, ClusterRole/ClusterRoleBinding findings, ClusterIssuers need their cluster-wide capability; `/agents` needs `ViewAgents`. Without one, the page degrades (names only, status `unknown`) instead of failing: nodes that run the caller's pods, volumes and classes their claims use, ClusterIssuers their certificates use; cluster-scoped security findings are left out. Class claim counts and issuer certificate counts then cover only the caller's namespaces. A caller with no grants gets empty lists, not errors. `/info` returns the caller's capabilities so the UI hides what it cannot use. The break-glass token and `-auth-mode=none` are unrestricted, and so is every caller of an `api.Server` with neither an authenticator nor an API token (tests, the demo).
 
 ## Server flags (new)
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `-auth-mode` | `token` | `proxy`, `token` or `none` (`none` only on loopback) |
+| `-auth-mode` | `token` | `proxy`, `token` or `none` (`none` only on loopback). Token mode without `-api-token` refuses a non-loopback `-addr` (on loopback it acts as `none`). Proxy mode still accepts the API token as the break-glass identity |
 | `-auth-user-header` / `-auth-groups-header` | `X-Forwarded-Email` / `X-Forwarded-Groups` | identity headers from the proxy |
 | `-auth-username-prefix` / `-auth-groups-prefix` | `""` | match the API server's (or EKS OIDC provider's) prefixes |
 | `-auth-group-map-file` | | JSON `{ "idp-group": ["k8s-group", ...] }` |
@@ -95,8 +99,13 @@ Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in 
 | `-aws-auth` | `false` | read kube-system/aws-auth (needs the chart's scoped Role) |
 | `-rate-limit` / `-rate-burst` / `-max-inflight` | `20` / `40` / `512` | per identity / total |
 | `-tls-cert` / `-tls-key` | | TLS for the web and ingest listeners; the ops listener stays plain HTTP (probes, scraping) |
+| `-shutdown-drain` / `-shutdown-timeout` | `5s` / `20s` | on SIGTERM: how long `/readyz` fails before the listeners stop, then how long requests in flight may take |
+| `-agent-interval` | `15s` | the agents' `-interval`; process data is stale after 8 and forgotten after 40 of these |
+| `-version` | | print the version and exit |
 
-Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare host, e.g. the headless ingest Service: the agent resolves it and posts to every address with the scheme and port of `-server`, verifying TLS against the `-server` host; if resolution fails it posts to `-server` alone), `-ca-file`. Both binaries take `-X main.version=...` at build time.
+Every duration flag also takes days (`30d`, `1d12h`). `-leak-min-slope` is a growth per hour in bytes, with an optional unit (`1MiB`, `512KiB`). `GOMEMLIMIT`, when unset, defaults to 90% of the cgroup memory limit. Kept from before: `-addr`, `-kubeconfig`, `-api-token`, `-agent-token`, `-audit-token`, `-prometheus-url` (with `PROMETHEUS_TOKEN`), `-pvc-min-age`, `-pvc-class-prices`, `-audit-log-file`, `-audit-from-start`, `-audit-journal` (memory store only) and `-audit-max-events` (memory store).
+
+Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare host, e.g. the headless ingest Service: the agent resolves it and posts to every address with the scheme and port of `-server`, verifying TLS against the `-server` host; if resolution fails it posts to `-server` alone), `-ca-file`, `-version`. Both binaries take `-X main.version=...` at build time; the server's Kubernetes user agent is `kubesentry/<version>`, the agent's `kubesentry-agent/<version>`.
 
 ## Cluster-sourced configuration
 - Namespace label `kubesentry.io/system: "true" | "false"`.
@@ -111,6 +120,8 @@ Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare hos
 
 ## Metrics (`/metrics` on the ops listener)
 `kubesentry_http_requests_total{route,code}`, `kubesentry_http_request_duration_seconds{route}`, `kubesentry_http_inflight`, `kubesentry_http_cache_total{result}`, `kubesentry_snapshot_build_seconds`, `kubesentry_snapshot_age_seconds`, `kubesentry_snapshot_version`, `kubesentry_informer_objects{resource}`, `kubesentry_kube_requests_total{verb,resource,code}`, `kubesentry_authz_reviews_total{result}`, `kubesentry_authz_cache_total{result}`, `kubesentry_prometheus_query_seconds{kind}`, `kubesentry_prometheus_cache_total{result}`, `kubesentry_audit_ingested_total{source}`, `kubesentry_audit_queue_depth`, `kubesentry_audit_store_errors_total`, `kubesentry_cloudwatch_lag_seconds`, `kubesentry_agent_reports_total{code}`, `kubesentry_agent_nodes_reporting`, plus Go runtime metrics.
+
+Label values: `route` is one of `info`, `auth_recheck`, `pods`, `pod_diagnostics`, `pod_processes`, `pvcs_unused`, `oom`, `workloads`, `nodes`, `node`, `storage`, `security`, `map`, `certificates`, `audit_events`, `audit_summary`, `agents`, `ingest_agent_report`, `ingest_audit_webhook`. `kubesentry_kube_requests_total` uses the Kubernetes verb (`list`, `watch`, `get`, `create`, ...), the resource (with `/subresource`; `discovery` for non-resource paths) and the status code or `error`. `kubesentry_audit_ingested_total{source}` is `webhook`, `file` (lines read) or `cloudwatch`.
 
 ## Postgres schema (`internal/pgstore/migrations/0001_audit.sql`)
 ```sql

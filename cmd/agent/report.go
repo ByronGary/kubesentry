@@ -210,6 +210,7 @@ func (r *reporter) post(ctx context.Context, endpoint string, body []byte, compr
 	req.Host = r.server.Host
 	req.Header.Set("Authorization", "Bearer "+r.token)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "kubesentry-agent/"+version)
 	if compressed {
 		req.Header.Set("Content-Encoding", "gzip")
 	}

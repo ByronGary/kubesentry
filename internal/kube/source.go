@@ -160,6 +160,8 @@ func convertPod(p *corev1.Pod) model.Pod {
 		Owners:         convertOwners(p.OwnerReferences),
 		PodIP:          p.Status.PodIP,
 		QOSClass:       string(p.Status.QOSClass),
+		Reason:         p.Status.Reason,
+		Message:        truncate(p.Status.Message),
 	}
 	if t := p.DeletionTimestamp; t != nil {
 		out.DeletedAt = t.Time

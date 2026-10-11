@@ -6,14 +6,13 @@ import "time"
 // pages. Their JSON shapes are mirrored in web/src/types.ts; change both
 // together. Status fields use the Status* constants from pod.go.
 
-// SystemNamespaces are treated as cluster plumbing: findings in them are
-// marked System and hidden by default in the UI.
-var SystemNamespaces = map[string]bool{
-	"kube-system":        true,
-	"kube-public":        true,
-	"kube-node-lease":    true,
-	"local-path-storage": true,
-}
+// SystemNamespaces are treated as cluster plumbing by the entry points that
+// predate Policy: findings in them are marked System and hidden by default in
+// the UI. It starts as the default policy's set.
+//
+// Deprecated: use Policy.SystemNamespaces (and SystemNamespaceSet, which also
+// applies the namespace label override).
+var SystemNamespaces = DefaultPolicy().SystemNamespaces
 
 // WorkloadSummary is one row on the Workloads page.
 type WorkloadSummary struct {
@@ -273,8 +272,9 @@ type NodePod struct {
 	Phase     string `json:"phase"`
 	Status    string `json:"status"`
 	Workload  string `json:"workload,omitempty"` // "Kind/name" of the owning workload
-	Ready     bool   `json:"ready"`
-	Reason    string `json:"reason,omitempty"` // worst container waiting reason, e.g. CrashLoopBackOff
+	// Ready is the pod's Ready condition; nil (omitted) until it reports one.
+	Ready  *bool  `json:"ready,omitempty"`
+	Reason string `json:"reason,omitempty"` // worst container waiting reason, e.g. CrashLoopBackOff
 }
 
 // LeakReport is the background leak scan: candidates are found with one cheap

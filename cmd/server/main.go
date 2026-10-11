@@ -7,172 +7,374 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/api"
-	"github.com/ByronGary/kubesentry/internal/audit"
+	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/kube"
+	"github.com/ByronGary/kubesentry/internal/metrics"
+	"github.com/ByronGary/kubesentry/internal/model"
 	"github.com/ByronGary/kubesentry/internal/procmon"
 	"github.com/ByronGary/kubesentry/internal/prom"
+	"github.com/ByronGary/kubesentry/internal/snapshot"
 	"github.com/ByronGary/kubesentry/internal/web"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
-	var (
-		addr       = flag.String("addr", "127.0.0.1:8080", "HTTP listen address (use :8080 to listen on all interfaces, together with -api-token)")
-		kubeconfig = flag.String("kubeconfig", "", "path to kubeconfig (default: in-cluster, then KUBECONFIG / ~/.kube/config)")
-		apiToken   = flag.String("api-token", os.Getenv("KUBESENTRY_API_TOKEN"), "bearer token required on /api/ routes (env KUBESENTRY_API_TOKEN)")
-		tlsCert    = flag.String("tls-cert", "", "TLS certificate file (enables HTTPS together with -tls-key)")
-		tlsKey     = flag.String("tls-key", "", "TLS private key file")
-
-		promURL    = flag.String("prometheus-url", "", "Prometheus base URL, e.g. http://prometheus:9090 (enables OOM leak detection)")
-		minAge     = flag.Duration("pvc-min-age", 24*time.Hour, "ignore unused PVCs younger than this")
-		defPrice   = flag.Float64("pvc-default-price", 0.10, "fallback storage price in USD per GiB-month (a rough estimate; override per class)")
-		classPrice = flag.String("pvc-class-prices", "", "per storage class prices, e.g. gp3=0.08,io2=0.125")
-
-		auditToken   = flag.String("audit-token", os.Getenv("KUBESENTRY_AUDIT_TOKEN"), "bearer token the POST /audit/webhook endpoint requires; the endpoint is disabled without it (env KUBESENTRY_AUDIT_TOKEN)")
-		auditLog     = flag.String("audit-log-file", "", "follow this kube-apiserver audit log file (--audit-log-path)")
-		auditStart   = flag.Bool("audit-from-start", false, "with -audit-log-file, read existing content instead of starting at the end")
-		auditJournal = flag.String("audit-journal", "", "JSONL file that keeps audit history across restarts (not rotated)")
-		auditMax     = flag.Int("audit-max-events", 50000, "number of audit events kept in memory")
-
-		agentToken = flag.String("agent-token", os.Getenv("KUBESENTRY_AGENT_TOKEN"), "bearer token node agents send to POST /agent/report; setting it enables process monitoring (env KUBESENTRY_AGENT_TOKEN)")
-	)
-	flag.Parse()
-
-	if (*tlsCert == "") != (*tlsKey == "") {
-		fatal("tls", errors.New("-tls-cert and -tls-key must be set together"))
+	cfg, err := parseFlags(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
 	}
-	prices, err := parsePrices(*classPrice)
 	if err != nil {
-		fatal("invalid -pvc-class-prices", err)
+		fmt.Fprintln(os.Stderr, "kubesentry:", err)
+		os.Exit(2)
+	}
+	if cfg.showVersion {
+		fmt.Println("kubesentry", version)
+		return
+	}
+	if err := run(cfg); err != nil {
+		slog.Error("kubesentry stopped", "err", err)
+		os.Exit(1)
+	}
+}
+
+// run wires everything up and serves until SIGTERM or SIGINT, then drains.
+func run(cfg *config) error {
+	if soft := setMemoryLimit(); soft > 0 {
+		slog.Info("memory limit from cgroup", "goMemLimitBytes", soft)
+	}
+	policy, err := cfg.policy()
+	if err != nil {
+		return err
+	}
+	authn, err := cfg.authenticator()
+	if err != nil {
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cluster, err := kube.Connect(*kubeconfig)
+	clients, err := kube.ConnectWith(cfg.kubeconfig, kube.ClientOptions{
+		QPS: float32(cfg.kubeQPS), Burst: cfg.kubeBurst, UserAgent: "kubesentry/" + version,
+		Observe: func(verb, resource, code string) { metrics.KubeRequests.With(verb, resource, code).Inc() },
+	})
 	if err != nil {
-		fatal("kubernetes client", err)
+		return fmt.Errorf("kubernetes client: %w", err)
 	}
 
 	srv := &api.Server{
-		Cluster:   cluster,
-		Inventory: cluster,
-		Certs:     cluster,
-		PVCOptions: detectors.PVCOptions{
-			MinAge:                  *minAge,
-			PricePerGiBMonth:        prices,
-			DefaultPricePerGiBMonth: *defPrice,
-		},
-		LeakOptions: detectors.DefaultLeakOptions(),
-		APIToken:    *apiToken,
+		Policy:      policy,
+		PVCOptions:  detectors.PVCOptions{MinAge: cfg.pvcMinAge},
+		LeakOptions: policy.Leak,
+		APIToken:    cfg.apiToken,
 		UI:          web.Handler(),
-	}
-	if *promURL != "" {
-		c := prom.New(*promURL)
-		c.BearerToken = os.Getenv("PROMETHEUS_TOKEN")
-		srv.Metrics = c
-	} else {
-		slog.Warn("no -prometheus-url set; OOM leak detection disabled (OOMKilled events still work)")
+		SignOutURL:  cfg.signOutURL,
+		ClusterInfo: model.ClusterInfo{Name: cfg.clusterName},
+		RateLimit:   cfg.rateLimit, RateBurst: cfg.rateBurst, MaxInflight: cfg.maxInflight,
+		AccessLog:     slog.Default(),
+		Authenticator: authn,
 	}
 
-	if *auditLog != "" || *auditToken != "" || *auditJournal != "" {
-		ing := &audit.Ingester{Store: audit.NewMemoryStore(*auditMax)}
-		if *auditJournal != "" {
-			n, err := audit.LoadJournal(*auditJournal, ing.Store)
-			if err != nil {
-				fatal("load audit journal", err)
-			}
-			slog.Info("replayed audit journal", "events", n)
-			j, err := audit.OpenJournal(*auditJournal)
-			if err != nil {
-				fatal("open audit journal", err)
-			}
-			defer j.Close()
-			ing.Journal = j
+	// Views: the informer cache feeding a debounced snapshot manager, or a
+	// per-request LIST for debugging.
+	var current func() *snapshot.View
+	var ready atomic.Bool
+	if cfg.cache {
+		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, ClusterName: cfg.clusterName})
+		if err := cache.Start(ctx); err != nil {
+			return fmt.Errorf("start informer cache: %w", err)
 		}
-		srv.Audit = ing
-		srv.AuditToken = *auditToken
-		if *auditToken == "" {
-			slog.Warn("no -audit-token set; the POST /audit/webhook endpoint is disabled")
+		mgr := &snapshot.Manager{Source: cache, Policy: policy, MinInterval: cfg.snapshotMinInterval, MaxDelay: cfg.snapshotMaxDelay, OnBuild: onBuild}
+		go func() {
+			start := time.Now()
+			if err := cache.WaitSynced(ctx); err != nil {
+				return
+			}
+			slog.Info("informer cache synced", "took", time.Since(start).Round(time.Millisecond), "unavailable", cache.Unavailable())
+			_ = mgr.Run(ctx)
+		}()
+		srv.Cluster, srv.Inventory, srv.Certs = cache, cache, cache
+		srv.Views = mgr
+		srv.Unavailable = cache.Unavailable
+		srv.ResponseCache = &api.ResponseCache{MaxBytes: 64 << 20}
+		current = mgr.Current
+		srv.Ready = func() bool {
+			if !ready.Load() && cache.Ready() && mgr.Current() != nil {
+				ready.Store(true)
+			}
+			return ready.Load()
 		}
-		if *auditLog != "" {
-			go func() {
-				slog.Info("following audit log", "path", *auditLog)
-				err := audit.TailFile(ctx, *auditLog, *auditStart, time.Second, ing.IngestLine)
-				if err != nil && !errors.Is(err, context.Canceled) {
-					slog.Error("audit log tailer stopped", "err", err)
+		registerCacheMetrics(cache)
+	} else {
+		src := kube.NewSourceWithOptions(clients.CS, clients.Dyn, kube.SourceOptions{
+			AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, ClusterName: cfg.clusterName})
+		views := &recordingViews{inner: snapshot.OnDemand{Source: src, Policy: policy}}
+		srv.Cluster, srv.Inventory, srv.Certs = src, src, src
+		srv.Views = views
+		current = views.latest
+		slog.Warn("-cache=false: every request lists the cluster; use only for debugging")
+	}
+	registerSnapshotMetrics(current)
+
+	if cfg.authMode == "proxy" {
+		reviewer, err := kube.NewReviewer(clients, float32(cfg.authzQPS), 2*int(cfg.authzQPS))
+		if err != nil {
+			return fmt.Errorf("subjectaccessreview client: %w", err)
+		}
+		srv.Authorizer = &auth.SARAuthorizer{
+			Reviewer:      reviewer,
+			Candidates:    viewCandidates{current},
+			TTL:           cfg.authzCacheTTL,
+			DenyTTL:       cfg.authzDenyTTL,
+			ShareByGroups: cfg.authzShareByGroups,
+			Metrics:       metrics.AuthzObserver,
+		}
+	}
+
+	sel, _ := prom.ParseMatchers(cfg.promSelector) // validated with the flags
+	metricsSource := &promSource{}
+	err = promSetup{
+		url: cfg.promURL, service: cfg.promService, region: cfg.awsRegion, sigv4: cfg.promSigV4, ksmLimits: cfg.promKSMLimits,
+		autodiscover: cfg.promAutodiscover, selector: sel,
+		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak},
+		pods: func(context.Context) ([]model.Pod, error) {
+			if v := current(); v != nil {
+				return v.Inv.Pods, nil // shared and read-only, which the scanner respects
+			}
+			return nil, errors.New("no cluster view yet")
+		},
+		discover: func(ctx context.Context) ([]string, error) {
+			return kube.DiscoverPrometheus(ctx, clients.CS, cfg.promService)
+		},
+	}.start(ctx, metricsSource)
+	if err != nil {
+		return err
+	}
+	srv.Metrics = metricsSource
+	srv.PrometheusInfo = metricsSource.Info
+
+	closers, err := setupAudit(ctx, cfg, policy, srv)
+	if err != nil {
+		return err
+	}
+	defer closers.close()
+
+	if cfg.agentToken != "" {
+		store := procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})
+		srv.Processes = store
+		srv.AgentToken = cfg.agentToken
+		metrics.AgentNodesReporting.SetFunc(func() float64 { return float64(store.Reporting()) })
+		go func() {
+			// Forget silent nodes even when no agent reports at all.
+			t := time.NewTicker(cfg.agentInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					store.Sweep()
 				}
-			}()
-		}
-		if *apiToken == "" && !isLoopback(*addr) {
-			slog.Warn("audit data is exposed without authentication; set -api-token or listen on loopback")
-		}
+			}
+		}()
 	}
 
-	if *agentToken != "" {
-		srv.Processes = procmon.NewStore()
-		srv.AgentToken = *agentToken
-		if *apiToken == "" && !isLoopback(*addr) {
-			slog.Warn("process data is exposed without authentication; set -api-token or listen on loopback")
+	srv.Checks = append(srv.Checks, api.HealthCheck{Name: "snapshot", Check: func(context.Context) error {
+		if v := current(); v != nil && v.Stale {
+			return fmt.Errorf("serving the last good view: %s", v.Err)
 		}
-	}
+		return nil
+	}})
 
-	httpSrv := &http.Server{
-		Addr:              *addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = httpSrv.Shutdown(shutdownCtx)
-	}()
+	return serve(ctx, stop, cfg, srv)
+}
 
-	slog.Info("kubesentry listening", "addr", *addr, "tls", *tlsCert != "")
-	if *tlsCert != "" {
-		err = httpSrv.ListenAndServeTLS(*tlsCert, *tlsKey)
+// serve runs the listeners. On a signal it fails readiness, waits the drain
+// delay so load balancers stop sending traffic, then shuts the listeners
+// down, letting requests in flight finish.
+func serve(ctx context.Context, stop context.CancelFunc, cfg *config, srv *api.Server) error {
+	var draining atomic.Bool
+	if r := srv.Ready; r != nil {
+		srv.Ready = func() bool { return !draining.Load() && r() }
 	} else {
-		err = httpSrv.ListenAndServe()
+		srv.Ready = func() bool { return !draining.Load() }
 	}
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fatal("http server", err)
+
+	type listener struct {
+		name, addr string
+		parts      api.Parts
+		tls        bool
+		readTO     time.Duration
+	}
+	web := listener{name: "web", addr: cfg.addr, parts: api.Parts{Web: true}, tls: cfg.tlsCert != "", readTO: 30 * time.Second}
+	ls := []*listener{&web}
+	if cfg.ingestAddr == "" {
+		web.parts.Ingest = true
+		web.readTO = 2 * time.Minute
+	} else {
+		ls = append(ls, &listener{name: "ingest", addr: cfg.ingestAddr, parts: api.Parts{Ingest: true}, tls: cfg.tlsCert != "", readTO: 2 * time.Minute})
+	}
+	if cfg.opsAddr == "" {
+		web.parts.Probes = true
+	} else {
+		ls = append(ls, &listener{name: "ops", addr: cfg.opsAddr, parts: api.Parts{Probes: true, Metrics: true, Pprof: cfg.pprof}, readTO: 30 * time.Second})
+	}
+
+	servers := make([]*http.Server, len(ls))
+	errc := make(chan error, len(ls))
+	for i, l := range ls {
+		hs := &http.Server{
+			Addr: l.addr, Handler: srv.Serve(l.parts),
+			ReadHeaderTimeout: 10 * time.Second, ReadTimeout: l.readTO, IdleTimeout: 2 * time.Minute,
+			MaxHeaderBytes: 256 << 10,
+		}
+		servers[i] = hs
+		ln, err := net.Listen("tcp", l.addr)
+		if err != nil {
+			return fmt.Errorf("%s listener: %w", l.name, err)
+		}
+		slog.Info("kubesentry listening", "listener", l.name, "addr", ln.Addr().String(), "tls", l.tls, "version", version)
+		go func() {
+			var err error
+			if l.tls {
+				err = hs.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
+			} else {
+				err = hs.Serve(ln)
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("%s listener: %w", l.name, err)
+			}
+		}()
+	}
+
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	stop() // a second signal kills at once
+	draining.Store(true)
+	slog.Info("shutting down", "drain", cfg.shutdownDrain, "timeout", cfg.shutdownTimeout)
+	time.Sleep(cfg.shutdownDrain)
+	sctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
+	defer cancel()
+	for _, hs := range servers {
+		if err := hs.Shutdown(sctx); err != nil {
+			slog.Warn("shutdown", "addr", hs.Addr, "err", err)
+		}
+	}
+	return nil
+}
+
+// viewCandidates proposes namespaces from the RBAC index of whatever view is
+// current, so the authorizer follows RBAC changes as views are rebuilt.
+type viewCandidates struct{ current func() *snapshot.View }
+
+func (c viewCandidates) Namespaces(user string, groups []string, cp auth.Capability) []string {
+	if v := c.current(); v != nil {
+		return v.RBAC().Namespaces(user, groups, cp)
+	}
+	return nil
+}
+
+// recordingViews remembers the last view an OnDemand provider built, for the
+// authorizer's candidates and metrics in -cache=false mode.
+type recordingViews struct {
+	inner snapshot.ViewProvider
+	last  atomic.Pointer[snapshot.View]
+}
+
+func (r *recordingViews) View(ctx context.Context) (*snapshot.View, error) {
+	v, err := r.inner.View(ctx)
+	if err == nil {
+		r.last.Store(v)
+	}
+	return v, err
+}
+
+func (r *recordingViews) latest() *snapshot.View { return r.last.Load() }
+
+// onBuild feeds the snapshot metrics after every build attempt.
+func onBuild(v *snapshot.View, took time.Duration, err error) {
+	if err != nil {
+		slog.Warn("snapshot rebuild failed; serving the last good view", "err", err)
+		return
+	}
+	metrics.SnapshotBuild.Observe(took.Seconds())
+	metrics.SnapshotVersion.Set(float64(v.Version))
+}
+
+func registerSnapshotMetrics(current func() *snapshot.View) {
+	metrics.SnapshotAge.SetFunc(func() float64 {
+		if v := current(); v != nil {
+			return time.Since(v.Built).Seconds()
+		}
+		return 0
+	})
+}
+
+// registerCacheMetrics exposes how many objects each informer holds. Counts
+// are read at most every 5s, however many gauges a scrape reads.
+func registerCacheMetrics(c *kube.Cache) {
+	var (
+		at     atomic.Int64
+		counts atomic.Pointer[map[string]int]
+	)
+	get := func() map[string]int {
+		if p := counts.Load(); p != nil && time.Since(time.Unix(0, at.Load())) < 5*time.Second {
+			return *p
+		}
+		m := c.ObjectCounts()
+		counts.Store(&m)
+		at.Store(time.Now().UnixNano())
+		return m
+	}
+	for res := range c.ObjectCounts() {
+		metrics.InformerObjects.With(res).SetFunc(func() float64 { return float64(get()[res]) })
 	}
 }
 
+// isLoopback reports whether addr ("host:port") listens on loopback only.
 func isLoopback(addr string) bool {
-	return strings.HasPrefix(addr, "127.0.0.1:") || strings.HasPrefix(addr, "localhost:") || strings.HasPrefix(addr, "[::1]:")
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
-func parsePrices(s string) (map[string]float64, error) {
-	out := map[string]float64{}
-	if strings.TrimSpace(s) == "" {
-		return out, nil
+// closers runs cleanups in reverse order.
+type closers []func()
+
+func (c closers) close() {
+	for i := len(c) - 1; i >= 0; i-- {
+		c[i]()
 	}
-	for _, part := range strings.Split(s, ",") {
-		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
-		if !ok {
-			return nil, fmt.Errorf("entry %q: want class=price", part)
-		}
-		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
-		if err != nil || f < 0 {
-			return nil, fmt.Errorf("entry %q: invalid price", part)
-		}
-		out[strings.TrimSpace(k)] = f
-	}
-	return out, nil
 }
 
-func fatal(msg string, err error) {
-	slog.Error(msg, "err", err)
-	os.Exit(1)
+// hostname names this replica in Postgres checkpoints: the pod name when the
+// chart sets POD_NAME.
+func hostname() string {
+	if p := os.Getenv("POD_NAME"); p != "" {
+		return p
+	}
+	h, _ := os.Hostname()
+	return strings.TrimSpace(h)
 }
