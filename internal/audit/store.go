@@ -1,11 +1,8 @@
 package audit
 
 import (
-	"container/list"
 	"context"
 	"errors"
-	"sort"
-	"sync"
 	"time"
 )
 
@@ -76,6 +73,12 @@ type Coverage struct {
 // ErrBackpressure means the store's write queue is full.
 var ErrBackpressure = errors.New("audit store is busy; retry later")
 
+// Matches reports whether e matches q, exactly as every Store evaluates it.
+func (q Query) Matches(e *Event) bool {
+	c := q.Canonical()
+	return c.matches(e)
+}
+
 func (q Query) matches(e *Event) bool {
 	if !q.Since.IsZero() && e.Time.Before(q.Since) {
 		return false
@@ -108,7 +111,30 @@ func (q Query) matches(e *Event) bool {
 	if !q.IncludeReads && q.Verb == "" && isRead(e.Verb) && len(e.Tags) == 0 {
 		return false
 	}
+	if q.Namespaces != nil {
+		if e.Namespace == "" {
+			if !q.ClusterScoped {
+				return false
+			}
+		} else if !q.Namespaces[e.Namespace] {
+			return false
+		}
+	}
+	if !q.Before.Time.IsZero() {
+		if e.Time.After(q.Before.Time) || (e.Time.Equal(q.Before.Time) && e.AuditID >= q.Before.AuditID) {
+			return false
+		}
+	}
 	return true
+}
+
+// newer reports whether a sorts before b in newest-first order: later time,
+// then larger AuditID (byte order, as Postgres compares with COLLATE "C").
+func newer(a, b *Event) bool {
+	if !a.Time.Equal(b.Time) {
+		return a.Time.After(b.Time)
+	}
+	return a.AuditID > b.AuditID
 }
 
 func hasTag(tags []string, t string) bool {
@@ -132,73 +158,4 @@ func stageRank(stage string) int {
 		return 3
 	}
 	return 0
-}
-
-// MemoryStore keeps the most recent events in memory. Events are keyed by
-// auditID: ResponseStarted followed by ResponseComplete for the same request
-// (exec sessions, watches) collapse into one record.
-type MemoryStore struct {
-	mu    sync.RWMutex
-	cap   int
-	order *list.List // front = oldest
-	byID  map[string]*list.Element
-}
-
-func NewMemoryStore(capacity int) *MemoryStore {
-	if capacity < 1 {
-		capacity = 1
-	}
-	return &MemoryStore{cap: capacity, order: list.New(), byID: make(map[string]*list.Element)}
-}
-
-func (s *MemoryStore) Add(events ...Event) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, e := range events {
-		if e.AuditID != "" {
-			if el, ok := s.byID[e.AuditID]; ok {
-				if stageRank(e.Stage) >= stageRank(el.Value.(Event).Stage) {
-					el.Value = e
-				}
-				continue
-			}
-		}
-		el := s.order.PushBack(e)
-		if e.AuditID != "" {
-			s.byID[e.AuditID] = el
-		}
-		for s.order.Len() > s.cap {
-			oldest := s.order.Front()
-			old := oldest.Value.(Event)
-			if old.AuditID != "" {
-				delete(s.byID, old.AuditID)
-			}
-			s.order.Remove(oldest)
-		}
-	}
-}
-
-// Query returns matching events, newest first.
-func (s *MemoryStore) Query(q Query) []Event {
-	s.mu.RLock()
-	out := []Event{}
-	for el := s.order.Back(); el != nil; el = el.Prev() {
-		e := el.Value.(Event)
-		if q.matches(&e) {
-			out = append(out, e)
-		}
-	}
-	s.mu.RUnlock()
-
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	if q.Limit > 0 && len(out) > q.Limit {
-		out = out[:q.Limit]
-	}
-	return out
-}
-
-func (s *MemoryStore) Len() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.order.Len()
 }

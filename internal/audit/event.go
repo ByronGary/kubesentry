@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 )
 
@@ -148,13 +147,8 @@ func normalize(w wireEvent) (Event, bool) {
 	return e, true
 }
 
+// actorKind classifies with the default prefixes; Ingester.Prepare applies
+// configured ones.
 func actorKind(username string) string {
-	switch {
-	case strings.HasPrefix(username, "system:serviceaccount:"):
-		return "serviceaccount"
-	case strings.HasPrefix(username, "system:"):
-		return "system"
-	default:
-		return "user"
-	}
+	return ClassifyActor(username, DefaultSystemPrefixes)
 }
