@@ -1,6 +1,6 @@
 # Proposal: alerts, automations and monitoring for kubesentry
 
-Status: draft for decision · 2026-10-11 · builds on the enterprise hardening work and on the stress run notes in `docs/stress-notes.md`.
+Status: decided 2026-10-11 (see Decisions) · builds on the enterprise hardening work and on the stress run notes in `docs/stress-notes.md`.
 
 ## Summary
 
@@ -113,6 +113,8 @@ Alerts follow the same RBAC as the dashboard.
 
 ## Layer 3: automations (product, off by default)
 
+> **Decided 2026-10-11: notify only.** kubesentry never writes to the cluster, so tiers 1 and 2 below are deferred. They are kept for reference only. See Decisions.
+
 ### Safety model
 
 | Tier | What it does | Approval | Examples |
@@ -145,6 +147,8 @@ Alerts follow the same RBAC as the dashboard.
 
 ## Delivery plan
 
+> **Superseded** by the revised plan under Decisions (phases A–C; D and E deferred).
+
 | Phase | Scope | Size | Depends on |
 |---|---|---|---|
 | A | Layer 1 values profile and rules; extended kubesentry self-monitoring rules; dashboards | S (about 1 week) | nothing; can start now |
@@ -161,14 +165,26 @@ Alerts follow the same RBAC as the dashboard.
 - **Actions:** approval checks, including an approver without RBAC being refused.
 - **Golden tests** for every alert's labels and annotations.
 
-## Decisions needed
+## Decisions (2026-10-11)
 
-1. **Where alerts go by default:** through your existing Alertmanager or AMP alert manager (recommended), or straight to Slack and PagerDuty?
-2. **Ticketing system,** if any, for tier 0: Jira, ServiceNow, GitHub Issues, or none at first?
-3. **Owner mapping source:** namespace annotations, an owner map ConfigMap, or an existing source of truth (team labels already on namespaces, AWS tags, a service catalog)?
-4. **Which automations are allowed at all** in your environment. Recommendation: start with tiers 0–1 only, and add tier 2 per action after review.
-5. **Production marker:** which namespace label or annotation identifies production, for audit-activity alerts such as exec into production?
-6. **Scope of Layer 1:** should kubesentry's chart ship the platform monitoring profile, or should it be handed to the team that runs your Prometheus or AMP?
+| # | Question | Decision | Effect on the build |
+|---|---|---|---|
+| 1 | Default alert destination | **Existing Alertmanager or the AMP alert manager** | The Alertmanager v2 sink is the only sink in the first release. Routing, grouping, silences and paging stay in Alertmanager. The direct Slack, PagerDuty and webhook sinks are deferred |
+| 2 | Ticketing | **None at first** | No ticket integration. Low-urgency findings go out as per-owner digests through Alertmanager, with a `kubesentry_digest="true"` label so they can be routed to a quiet receiver |
+| 3 | Owner mapping | **Namespace annotations** | `kubesentry.io/owner` on the namespace, overridable on the object. Routing hints come from the same annotations (for example `kubesentry.io/slack-channel`) and are passed on as Alertmanager labels. Findings with no owner go to the default receiver |
+| 4 | Automation tiers | **Notify only** | kubesentry **never writes to the cluster**. There is no actions ServiceAccount, no annotate tier and no remediation tier. "Automations" means declarative notification rules: which checks, severities and namespaces raise alerts, with what labels and cooldowns |
+| 5 | Production marker | **Namespace label `environment=production`** | The key and value are Helm values (`alerts.production.labelKey` / `labelValue`). They are used for audit-activity alerts (exec, port-forward, debug or secret reads in production) and to raise severity |
+| 6 | Owner of Layer 1 (platform monitoring baseline) | **An example profile and docs for your monitoring team** | Shipped as `examples/monitoring-eks.yaml` plus a guide. kubesentry's chart keeps only its own self-monitoring rules |
+
+**Revised delivery plan:**
+
+| Phase | Scope | Size |
+|---|---|---|
+| A | Layer 1 example profile and guide; extended kubesentry self-monitoring rules; dashboards | S (about 1 week) |
+| B | Findings store, evaluator on the lock-holding replica, owner attribution from namespace annotations, Alertmanager sink, the first 6 catalog alerts, `kubesentry_findings` metrics | M (2–3 weeks) |
+| C | The rest of the catalog (including the production-aware audit alerts), digests, storm protection, notification rules, the Alerts page, acknowledge and silence with RBAC | M (2–3 weeks) |
+
+Deferred: direct sinks, ticketing, and every tier that writes to the cluster. Revisit after phase C has run in production.
 
 ## Out of scope for this build
 - Anomaly detection or ML baselines (thresholds and diffs first).
