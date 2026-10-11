@@ -12,13 +12,20 @@ import (
 // SecurityInput is everything AuditSecurity looks at. Pure data, so it is
 // testable without a cluster.
 type SecurityInput struct {
-	Pods       []model.Pod
-	Workloads  []model.Workload
-	Namespaces []model.Namespace
-	RBAC       model.RBAC
-	Services   []model.Service
-	Ingresses  []model.Ingress
+	Pods        []model.Pod
+	Workloads   []model.Workload
+	ReplicaSets []model.ReplicaSet // optional: resolves pods to Deployments
+	Namespaces  []model.Namespace
+	RBAC        model.RBAC
+	Services    []model.Service
+	Ingresses   []model.Ingress
+	AWSAuth     *model.AWSAuth // nil when not read
 }
+
+// CheckAWSAuthMasters is crit: the EKS aws-auth ConfigMap maps an IAM role or
+// user to system:masters, which bypasses RBAC and cannot be revoked by
+// editing bindings.
+const CheckAWSAuthMasters = "aws-auth-masters"
 
 const (
 	sevCrit = "crit"
@@ -26,16 +33,35 @@ const (
 	sevInfo = "info"
 )
 
-// AuditSecurity checks pod specs, RBAC, Pod Security labels and network
-// exposure. Findings come most severe first, non-system before system, then by
-// category and subject. Every namespace gets a posture row, sorted by name.
+// reservedPrefix names Kubernetes' own bootstrap RBAC. Its bindings (for
+// example the public-info grant to system:unauthenticated) are by design, so
+// they are not judged at all; other built-in prefixes keep their findings,
+// marked System.
+const reservedPrefix = "system:"
+
+// AuditSecurity runs the security checks with the default policy.
 func AuditSecurity(in SecurityInput) ([]SecurityFinding, []NamespacePosture) {
+	p := compatPolicy()
+	inv := listInventory(model.Inventory{
+		Pods: in.Pods, Workloads: in.Workloads, ReplicaSets: in.ReplicaSets, Namespaces: in.Namespaces,
+		RBAC: in.RBAC, Services: in.Services, Ingresses: in.Ingresses, AWSAuth: in.AWSAuth,
+	})
+	return AuditSecurityWith(Associate(inv, p), p)
+}
+
+// AuditSecurityWith checks pod specs, RBAC (and the EKS aws-auth mappings),
+// Pod Security labels and network exposure in a's inventory. Findings come
+// most severe first, non-system before system, then by category and subject.
+// Every namespace gets a posture row, sorted by name.
+func AuditSecurityWith(a *Assoc, p Policy) ([]SecurityFinding, []NamespacePosture) {
+	inv := a.Inventory()
 	out := []SecurityFinding{}
-	out = append(out, podFindings(in.Pods, in.Workloads)...)
-	out = append(out, rbacFindings(in.RBAC)...)
-	nsFindings, posture := namespaceFindings(in.Namespaces)
+	out = append(out, podFindings(a)...)
+	out = append(out, rbacFindings(inv.RBAC, p, a.IsSystem)...)
+	out = append(out, awsAuthFindings(inv.AWSAuth)...)
+	nsFindings, posture := namespaceFindings(inv.Namespaces, a.IsSystem)
 	out = append(out, nsFindings...)
-	out = append(out, exposureFindings(in.Services, in.Ingresses)...)
+	out = append(out, exposureFindings(inv.Services, inv.Ingresses, a.IsSystem)...)
 
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
@@ -74,38 +100,38 @@ func finding(category, check, sev, title, subjectKind, subject, ns, detail strin
 // podGroup is the pods of one workload, or a single pod nothing owns.
 type podGroup struct {
 	kind, ns, name string
-	pods           []model.Pod
+	pods           []*model.Pod
 }
 
-// podFindings reports risky pod specs once per workload rather than per pod.
-// Jobs that a CronJob created are reported under the CronJob.
-func podFindings(pods []model.Pod, ws []model.Workload) []SecurityFinding {
-	groups := map[string]*podGroup{}
-	for _, p := range pods {
-		kind, name, ok := OwnerOf(p, ws)
-		switch {
-		case !ok:
-			kind, name = "Pod", p.Name
-		case kind == "Job":
-			if cj, ok := cronJobOf(p.Namespace, name, ws); ok {
-				kind, name = "CronJob", cj
-			}
+// podFindings reports risky pod specs once per owner rather than per pod.
+// Jobs that a CronJob created are reported under the CronJob; static and bare
+// pods on their own.
+func podFindings(a *Assoc) []SecurityFinding {
+	pods := a.Inventory().Pods
+	groups := map[refKey]*podGroup{}
+	var order []refKey
+	for i := range pods {
+		p := &pods[i]
+		kind, name := a.rootOf(p)
+		key := refKey{kind, p.Namespace, name}
+		g := groups[key]
+		if g == nil {
+			g = &podGroup{kind: kind, ns: p.Namespace, name: name}
+			groups[key] = g
+			order = append(order, key)
 		}
-		key := kind + "/" + p.Namespace + "/" + name
-		if groups[key] == nil {
-			groups[key] = &podGroup{kind: kind, ns: p.Namespace, name: name}
-		}
-		groups[key].pods = append(groups[key].pods, p)
+		g.pods = append(g.pods, p)
 	}
 
 	var out []SecurityFinding
-	for _, g := range groups {
-		out = append(out, groupFindings(g)...)
+	for _, k := range order {
+		g := groups[k]
+		out = append(out, groupFindings(g, a.IsSystem(g.ns))...)
 	}
 	return out
 }
 
-func groupFindings(g *podGroup) []SecurityFinding {
+func groupFindings(g *podGroup, system bool) []SecurityFinding {
 	var privileged, rootish, escalation, noLimit, hostNS, hostPaths, accounts []string
 	var capsCrit, capsWarn []string
 	for _, p := range g.pods {
@@ -168,7 +194,6 @@ func groupFindings(g *podGroup) []SecurityFinding {
 	}
 
 	subject := g.ns + "/" + g.name
-	system := SystemNamespaces[g.ns]
 	var out []SecurityFinding
 	add := func(check, sev, title, detail string) {
 		out = append(out, finding("pod", check, sev, title, g.kind, subject, g.ns, detail, system))
@@ -213,25 +238,25 @@ func appendNew(s []string, v string) []string {
 
 func list(s []string) string { return strings.Join(s, ", ") }
 
-// systemSubject reports whether a binding subject is cluster plumbing: a
-// "system:" user or group, or a service account in a system namespace. The
-// groups that stand for everyone, or every service account, are never plumbing.
-func systemSubject(s model.Subject) bool {
+// systemSubject reports whether a binding subject is cluster plumbing: a user
+// or group with a system principal prefix (system:, eks:), or a service
+// account in a system namespace. The groups that stand for everyone, or every
+// service account, are never plumbing.
+func systemSubject(s model.Subject, p Policy, isSystem func(string) bool) bool {
 	if s.Kind == "ServiceAccount" {
-		return SystemNamespaces[s.Namespace]
+		return isSystem(s.Namespace)
 	}
-	switch s.Name {
-	case "system:anonymous", "system:unauthenticated", "system:authenticated", "system:serviceaccounts":
+	if everyone[s.Name] {
 		return false
 	}
 	if rest, ok := strings.CutPrefix(s.Name, "system:serviceaccount:"); ok {
 		ns, _, _ := strings.Cut(rest, ":")
-		return SystemNamespaces[ns]
+		return isSystem(ns)
 	}
 	if ns, ok := strings.CutPrefix(s.Name, "system:serviceaccounts:"); ok {
-		return SystemNamespaces[ns]
+		return isSystem(ns)
 	}
-	return strings.HasPrefix(s.Name, "system:")
+	return p.IsSystemPrincipal(s.Name)
 }
 
 func subjectLabel(s model.Subject) string {
@@ -251,25 +276,29 @@ func scopedName(ns, name string) string {
 func roleKey(kind, ns, name string) string { return kind + "/" + ns + "/" + name }
 
 // rbacFindings flags cluster-admin and anonymous bindings, wildcard roles and
-// who can read secrets. Bindings named "system:..." are Kubernetes' own.
-func rbacFindings(r model.RBAC) []SecurityFinding {
-	roles := map[string]model.Role{}
-	for _, ro := range r.Roles {
+// who can read secrets. Bindings and roles named "system:..." are Kubernetes'
+// own bootstrap policy and are not judged; those with another built-in prefix
+// (eks:, kubeadm:) are judged but marked System.
+func rbacFindings(r model.RBAC, pol Policy, isSystem func(string) bool) []SecurityFinding {
+	roles := make(map[string]*model.Role, len(r.Roles))
+	for i := range r.Roles {
+		ro := &r.Roles[i]
 		roles[roleKey(ro.Kind, ro.Namespace, ro.Name)] = ro
 	}
 	boundTo := map[string][]string{} // role key -> non-system subjects bound to it
+	secrets := map[string]bool{}     // role key -> it can read secrets
 
 	var out []SecurityFinding
 	for _, b := range r.Bindings {
 		subject := scopedName(b.Namespace, b.Name)
-		builtin := strings.HasPrefix(b.Name, "system:")
-		// kubeadm creates its own bindings, such as kubeadm:cluster-admins for
-		// the admin kubeconfig. Their findings are kept but marked as plumbing.
-		kubeadm := strings.HasPrefix(b.Name, "kubeadm:")
+		reserved := strings.HasPrefix(b.Name, reservedPrefix)
+		// Platform bindings such as kubeadm:cluster-admins (the admin
+		// kubeconfig) or eks:... are real but expected: kept, marked plumbing.
+		builtin := pol.IsBuiltinRBAC(b.Name)
 		var people []string
 		humans := false // a non-system User or Group, as opposed to only service accounts
 		for _, s := range b.Subjects {
-			if !systemSubject(s) {
+			if !systemSubject(s, pol, isSystem) {
 				people = appendNew(people, subjectLabel(s))
 				humans = humans || s.Kind != "ServiceAccount"
 			}
@@ -287,10 +316,10 @@ func rbacFindings(r model.RBAC) []SecurityFinding {
 				sev = sevWarn
 			}
 			out = append(out, finding("rbac", CheckClusterAdmin, sev, "cluster-admin granted", b.Kind, subject, b.Namespace,
-				"Grants cluster-admin "+scope+" to "+list(people)+".", kubeadm))
+				"Grants cluster-admin "+scope+" to "+list(people)+".", builtin))
 		}
 
-		if !builtin {
+		if !reserved {
 			var anon []string
 			for _, s := range b.Subjects {
 				if (s.Kind == "User" && s.Name == "system:anonymous") || (s.Kind == "Group" && s.Name == "system:unauthenticated") {
@@ -300,7 +329,7 @@ func rbacFindings(r model.RBAC) []SecurityFinding {
 			if len(anon) > 0 {
 				// kubeadm's own cluster-info binding lives in kube-public; such
 				// bindings are plumbing, kept but hidden by default.
-				system := kubeadm || SystemNamespaces[b.Namespace]
+				system := builtin || isSystem(b.Namespace)
 				out = append(out, finding("rbac", CheckAnonymous, sevCrit, "Anonymous access", b.Kind, subject, b.Namespace,
 					fmt.Sprintf("Grants %s %s %s to %s, which includes requests with no credentials at all.", b.RoleKind, b.RoleName, scope, list(anon)), system))
 			}
@@ -317,7 +346,12 @@ func rbacFindings(r model.RBAC) []SecurityFinding {
 		for _, p := range people {
 			boundTo[key] = appendNew(boundTo[key], p)
 		}
-		if !admin && !builtin && readsSecrets(role.Rules) {
+		reads, known := secrets[key]
+		if !known {
+			reads = readsSecrets(role.Rules)
+			secrets[key] = reads
+		}
+		if !admin && !reserved && reads {
 			// Controllers such as cert-manager or an operator need secrets to do
 			// their job; people and groups reading them is the bigger risk.
 			sev := sevInfo
@@ -325,21 +359,51 @@ func rbacFindings(r model.RBAC) []SecurityFinding {
 				sev = sevWarn
 			}
 			out = append(out, finding("rbac", CheckSecretReaders, sev, "Can read secrets", b.Kind, subject, b.Namespace,
-				fmt.Sprintf("%s can read secrets %s through %s %s.", list(people), scope, b.RoleKind, b.RoleName), kubeadm))
+				fmt.Sprintf("%s can read secrets %s through %s %s.", list(people), scope, b.RoleKind, b.RoleName), builtin))
 		}
 	}
 
 	for _, ro := range r.Roles {
-		if strings.HasPrefix(ro.Name, "system:") || (ro.Kind == "ClusterRole" && (ro.Name == "cluster-admin" || ro.Name == "admin" || ro.Name == "edit")) {
+		if strings.HasPrefix(ro.Name, reservedPrefix) || (ro.Kind == "ClusterRole" && (ro.Name == "cluster-admin" || ro.Name == "admin" || ro.Name == "edit")) {
 			continue
 		}
 		people := boundTo[roleKey(ro.Kind, ro.Namespace, ro.Name)]
+		if len(people) == 0 {
+			continue
+		}
 		where := wildcards(ro.Rules)
-		if len(people) == 0 || where == "" {
+		if where == "" {
 			continue
 		}
 		out = append(out, finding("rbac", CheckWildcard, sevWarn, "Wildcard permissions", ro.Kind, scopedName(ro.Namespace, ro.Name), ro.Namespace,
-			fmt.Sprintf("Uses \"*\" in %s, so it also grants anything added later; bound to %s.", where, list(people)), false))
+			fmt.Sprintf("Uses \"*\" in %s, so it also grants anything added later; bound to %s.", where, list(people)), pol.IsBuiltinRBAC(ro.Name)))
+	}
+	return out
+}
+
+// awsAuthFindings flags aws-auth mappings into system:masters. Membership of
+// that group bypasses RBAC, so no binding shows it.
+func awsAuthFindings(aa *model.AWSAuth) []SecurityFinding {
+	if aa == nil {
+		return nil
+	}
+	var out []SecurityFinding
+	add := func(kind, what string, m model.AWSAuthMapping) {
+		if !slices.Contains(m.Groups, "system:masters") {
+			return
+		}
+		user := m.Username
+		if user == "" {
+			user = "(none)"
+		}
+		out = append(out, finding("rbac", CheckAWSAuthMasters, sevCrit, "aws-auth maps to system:masters", kind, m.ARN, "",
+			fmt.Sprintf("kube-system/aws-auth maps %s %s (username %s) to system:masters, which bypasses RBAC entirely; prefer an access entry or a bound ClusterRole.", what, m.ARN, user), false))
+	}
+	for _, m := range aa.MapRoles {
+		add("IAMRole", "IAM role", m)
+	}
+	for _, m := range aa.MapUsers {
+		add("IAMUser", "IAM user", m)
 	}
 	return out
 }
@@ -378,13 +442,13 @@ func readsSecrets(rules []model.PolicyRule) bool {
 const psaPrefix = "pod-security.kubernetes.io/"
 
 // namespaceFindings reads each namespace's Pod Security Admission labels.
-func namespaceFindings(nss []model.Namespace) ([]SecurityFinding, []NamespacePosture) {
+func namespaceFindings(nss []model.Namespace, isSystem func(string) bool) ([]SecurityFinding, []NamespacePosture) {
 	var out []SecurityFinding
 	posture := make([]NamespacePosture, 0, len(nss))
 	for _, ns := range nss {
 		p := NamespacePosture{
 			Name: ns.Name, Enforce: ns.Labels[psaPrefix+"enforce"], Audit: ns.Labels[psaPrefix+"audit"],
-			Warn: ns.Labels[psaPrefix+"warn"], System: SystemNamespaces[ns.Name], Status: StatusWarn,
+			Warn: ns.Labels[psaPrefix+"warn"], System: isSystem(ns.Name), Status: StatusWarn,
 		}
 		switch p.Enforce {
 		case "baseline", "restricted":
@@ -402,14 +466,75 @@ func namespaceFindings(nss []model.Namespace) ([]SecurityFinding, []NamespacePos
 	return out, posture
 }
 
-// exposureFindings lists services and ingresses reachable from outside the cluster.
-func exposureFindings(svcs []model.Service, ings []model.Ingress) []SecurityFinding {
+// AWS load balancer annotations kubesentry reads.
+const (
+	annLBScheme   = "service.beta.kubernetes.io/aws-load-balancer-scheme"
+	annLBInternal = "service.beta.kubernetes.io/aws-load-balancer-internal"
+	annLBType     = "service.beta.kubernetes.io/aws-load-balancer-type"
+	annALBScheme  = "alb.ingress.kubernetes.io/scheme"
+	annALBCert    = "alb.ingress.kubernetes.io/certificate-arn"
+	annALBPorts   = "alb.ingress.kubernetes.io/listen-ports"
+	annIngClass   = "kubernetes.io/ingress.class"
+	albAnnPrefix  = "alb.ingress.kubernetes.io/"
+	lbcNLBClass   = "service.k8s.aws/nlb"
+)
+
+// internalLB reports whether a LoadBalancer Service gets an internal load
+// balancer. known is false when nothing says, and the in-tree default
+// (internet-facing) applies.
+func internalLB(s model.Service) (internal, known bool) {
+	ann := s.Annotations
+	if v := strings.TrimSpace(ann[annLBScheme]); v != "" {
+		return strings.EqualFold(v, "internal"), true
+	}
+	if v, ok := ann[annLBInternal]; ok {
+		// The legacy annotation made an internal ELB with any value but
+		// "false"; old manifests often say "0.0.0.0/0".
+		v = strings.TrimSpace(v)
+		return v != "" && !strings.EqualFold(v, "false"), true
+	}
+	// The AWS Load Balancer Controller provisions internal NLBs unless the
+	// scheme says otherwise.
+	if s.LoadBalancerClass == lbcNLBClass {
+		return true, true
+	}
+	switch strings.ToLower(ann[annLBType]) {
+	case "external", "nlb-ip":
+		return true, true
+	}
+	return false, false
+}
+
+// ingressTLS reports whether an Ingress terminates TLS: spec.tls, or an ALB
+// certificate (certificate-arn, or an HTTPS listener).
+func ingressTLS(ing model.Ingress) bool {
+	return len(ing.TLS) > 0 ||
+		strings.TrimSpace(ing.Annotations[annALBCert]) != "" ||
+		strings.Contains(strings.ToUpper(ing.Annotations[annALBPorts]), "HTTPS")
+}
+
+// isALB reports whether the AWS Load Balancer Controller serves an Ingress.
+func isALB(ing model.Ingress) bool {
+	if ing.Class == "alb" || ing.Annotations[annIngClass] == "alb" {
+		return true
+	}
+	for k := range ing.Annotations {
+		if strings.HasPrefix(k, albAnnPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// exposureFindings lists services and ingresses reachable from outside the
+// cluster. Internal AWS load balancers and internal ALBs are reported as info.
+func exposureFindings(svcs []model.Service, ings []model.Ingress, isSystem func(string) bool) []SecurityFinding {
 	var out []SecurityFinding
 	for _, s := range svcs {
 		subject := s.Namespace + "/" + s.Name
-		system := SystemNamespaces[s.Namespace]
-		add := func(check, title, detail string) {
-			out = append(out, finding("exposure", check, sevWarn, title, "Service", subject, s.Namespace, detail, system))
+		system := isSystem(s.Namespace)
+		add := func(check, sev, title, detail string) {
+			out = append(out, finding("exposure", check, sev, title, "Service", subject, s.Namespace, detail, system))
 		}
 		switch s.Type {
 		case "NodePort":
@@ -423,20 +548,34 @@ func exposureFindings(svcs []model.Service, ings []model.Ingress) []SecurityFind
 			if len(ports) > 0 {
 				detail = "Opens " + plural(len(ports), "port ", "ports ") + list(ports) + " on every node."
 			}
-			add(CheckNodePort, "NodePort service", detail)
+			add(CheckNodePort, sevWarn, "NodePort service", detail)
 		case "LoadBalancer":
-			detail := "Asks for an external load balancer; no address is assigned yet."
+			internal, known := internalLB(s)
+			at := "no address is assigned yet"
 			if len(s.LoadBalancerIngress) > 0 {
-				detail = "Reachable through a load balancer at " + list(s.LoadBalancerIngress) + "."
+				at = "at " + list(s.LoadBalancerIngress)
 			}
-			add(CheckLoadBalancer, "Load balancer", detail)
+			ranges := ""
+			if len(s.SourceRanges) > 0 {
+				ranges = " Source ranges: " + list(s.SourceRanges) + "."
+			}
+			switch {
+			case internal:
+				add(CheckLoadBalancer, sevInfo, "Internal load balancer", "Internal load balancer "+at+", reachable from inside the VPC only."+ranges)
+			case known:
+				add(CheckLoadBalancer, sevWarn, "Load balancer", "Internet-facing load balancer "+at+"."+ranges)
+			case len(s.LoadBalancerIngress) > 0:
+				add(CheckLoadBalancer, sevWarn, "Load balancer", "Reachable through a load balancer at "+list(s.LoadBalancerIngress)+"."+ranges)
+			default:
+				add(CheckLoadBalancer, sevWarn, "Load balancer", "Asks for an external load balancer; no address is assigned yet."+ranges)
+			}
 		}
 		if len(s.ExternalIPs) > 0 {
-			add(CheckExternalIP, "External IPs", "Accepts traffic sent to "+list(s.ExternalIPs)+" on any node.")
+			add(CheckExternalIP, sevWarn, "External IPs", "Accepts traffic sent to "+list(s.ExternalIPs)+" on any node.")
 		}
 	}
 	for _, ing := range ings {
-		if len(ing.Rules) == 0 || len(ing.TLS) > 0 {
+		if len(ing.Rules) == 0 || ingressTLS(ing) {
 			continue
 		}
 		var hosts []string
@@ -447,8 +586,21 @@ func exposureFindings(svcs []model.Service, ings []model.Ingress) []SecurityFind
 			}
 			hosts = appendNew(hosts, h)
 		}
-		out = append(out, finding("exposure", CheckIngressNoTLS, sevWarn, "Ingress without TLS", "Ingress", ing.Namespace+"/"+ing.Name, ing.Namespace,
-			"Serves "+list(hosts)+" over plain HTTP.", SystemNamespaces[ing.Namespace]))
+		subject := ing.Namespace + "/" + ing.Name
+		system := isSystem(ing.Namespace)
+		if !isALB(ing) {
+			out = append(out, finding("exposure", CheckIngressNoTLS, sevWarn, "Ingress without TLS", "Ingress", subject, ing.Namespace,
+				"Serves "+list(hosts)+" over plain HTTP.", system))
+			continue
+		}
+		// The AWS Load Balancer Controller makes internal ALBs unless told otherwise.
+		if strings.EqualFold(strings.TrimSpace(ing.Annotations[annALBScheme]), "internet-facing") {
+			out = append(out, finding("exposure", CheckIngressNoTLS, sevWarn, "Ingress without TLS", "Ingress", subject, ing.Namespace,
+				"Serves "+list(hosts)+" over plain HTTP from an internet-facing ALB.", system))
+			continue
+		}
+		out = append(out, finding("exposure", CheckIngressNoTLS, sevInfo, "Internal ingress without TLS", "Ingress", subject, ing.Namespace,
+			"Serves "+list(hosts)+" over plain HTTP from an internal ALB, reachable from inside the VPC only.", system))
 	}
 	return out
 }

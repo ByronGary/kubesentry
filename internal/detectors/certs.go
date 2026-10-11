@@ -9,16 +9,48 @@ import (
 	"github.com/ByronGary/kubesentry/internal/model"
 )
 
-// Certificates expiring sooner than these are flagged, even when cert-manager
-// still reports them Ready.
-const (
-	certCritBefore = 7 * 24 * time.Hour
-	certWarnBefore = 30 * 24 * time.Hour
-)
+// certDefaultDuration is cert-manager's default certificate lifetime, used
+// when neither spec.duration nor the issued certificate's dates are known.
+const certDefaultDuration = 90 * 24 * time.Hour
 
-// SummarizeCerts judges cert-manager Certificates, their issuers and any
-// CertificateRequests that are stuck. Each list is sorted most troubled first.
+// SummarizeCerts judges cert-manager objects with the default policy.
 func SummarizeCerts(cm model.CertManager, now time.Time) ([]CertSummary, []IssuerSummary, []RequestSummary) {
+	return SummarizeCertsWith(cm, compatPolicy(), now)
+}
+
+// certLifetime is the span expiry is judged against: the issued
+// certificate's own validity when both dates are known (a CA may cap what was
+// asked for), else spec.duration, else cert-manager's 90-day default.
+func certLifetime(c model.Certificate) time.Duration {
+	if !c.NotBefore.IsZero() && c.NotAfter.After(c.NotBefore) {
+		return c.NotAfter.Sub(c.NotBefore)
+	}
+	if c.Duration > 0 {
+		return c.Duration
+	}
+	return certDefaultDuration
+}
+
+// certThresholds returns the time-left cut-offs for crit and warn:
+// min(cap, fraction × lifetime) each.
+func certThresholds(life time.Duration, t Thresholds) (crit, warn time.Duration) {
+	crit = time.Duration(float64(life) * t.CertCritFraction)
+	if t.CertCritCap > 0 && (crit <= 0 || t.CertCritCap < crit) {
+		crit = t.CertCritCap
+	}
+	warn = time.Duration(float64(life) * t.CertWarnFraction)
+	if t.CertWarnCap > 0 && (warn <= 0 || t.CertWarnCap < warn) {
+		warn = t.CertWarnCap
+	}
+	return crit, warn
+}
+
+// SummarizeCertsWith judges cert-manager Certificates, their issuers and any
+// CertificateRequests that are stuck. Expiry is judged against each
+// certificate's lifetime (see Thresholds), so short-lived certificates are not
+// always critical. Each list is sorted most troubled first.
+func SummarizeCertsWith(cm model.CertManager, p Policy, now time.Time) ([]CertSummary, []IssuerSummary, []RequestSummary) {
+	t := p.Thresholds
 	issuers := map[string]model.Issuer{}
 	for _, is := range cm.Issuers {
 		issuers[roleKey(is.Kind, is.Namespace, is.Name)] = is
@@ -57,6 +89,8 @@ func SummarizeCerts(cm model.CertManager, now time.Time) ([]CertSummary, []Issue
 		}
 
 		left := c.NotAfter.Sub(now)
+		critBelow, warnBelow := certThresholds(certLifetime(c), t)
+		overdue := !c.RenewalTime.IsZero() && now.Sub(c.RenewalTime) > t.CertRenewalGrace
 		switch {
 		case known && !found:
 			s.Status, s.Detail = StatusCrit, fmt.Sprintf("%s %s not found.", kind, c.IssuerName)
@@ -66,14 +100,18 @@ func SummarizeCerts(cm model.CertManager, now time.Time) ([]CertSummary, []Issue
 			s.Status, s.Detail = StatusCrit, sentence(c.Message, "Not ready: "+c.Reason)
 		case !c.NotAfter.IsZero() && left <= 0:
 			s.Status, s.Detail = StatusCrit, "Expired "+ago(-left)+"."
-		case !c.NotAfter.IsZero() && left < certCritBefore:
+		case !c.NotAfter.IsZero() && left < critBelow:
 			s.Status, s.Detail = StatusCrit, "Expires in "+daysOrHours(left)+"."
-		case !c.NotAfter.IsZero() && left < certWarnBefore:
+		case !c.NotAfter.IsZero() && overdue:
+			s.Status, s.Detail = StatusWarn, "Renewal is overdue by "+daysOrHours(now.Sub(c.RenewalTime))+"; expires in "+daysOrHours(left)+"."
+		case !c.NotAfter.IsZero() && left < warnBelow:
 			s.Status, s.Detail = StatusWarn, "Expires in "+daysOrHours(left)+"."
 		case c.NotAfter.IsZero() && c.Ready != "True":
 			s.Status, s.Detail = StatusWarn, "Not issued yet."
 		case c.NotAfter.IsZero():
 			s.Status, s.Detail = StatusOK, "Ready."
+		case left < 48*time.Hour:
+			s.Status, s.Detail = StatusOK, "Valid for "+hours(left.Hours())+" more."
 		default:
 			s.Status, s.Detail = StatusOK, fmt.Sprintf("Valid for %d more days.", days(left))
 		}
@@ -126,7 +164,7 @@ func SummarizeCerts(cm model.CertManager, now time.Time) ([]CertSummary, []Issue
 		switch {
 		case r.Denied || (r.Ready == "False" && r.Reason == "Failed"):
 			status = StatusCrit
-		case now.Sub(r.Created) > pendingGrace:
+		case now.Sub(r.Created) > t.PendingGrace:
 			status = StatusWarn
 		default:
 			continue // just created; give it a moment

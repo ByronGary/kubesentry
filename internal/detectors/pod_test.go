@@ -18,8 +18,8 @@ func byID(t *testing.T, checks []Check) map[string]Check {
 	for _, c := range checks {
 		m[c.ID] = c
 	}
-	if len(checks) != 6 || len(m) != 6 {
-		t.Fatalf("want 6 distinct checks, got %d (%d distinct)", len(checks), len(m))
+	if len(checks) != 7 || len(m) != 7 {
+		t.Fatalf("want 7 distinct checks, got %d (%d distinct)", len(checks), len(m))
 	}
 	return m
 }

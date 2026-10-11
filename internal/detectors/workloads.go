@@ -9,20 +9,42 @@ import (
 	"github.com/ByronGary/kubesentry/internal/model"
 )
 
-// SummarizeWorkloads judges each workload from its status and the pods its
-// selector matches. Most troubled first, then by namespace and name.
+// SummarizeWorkloads judges each workload from its status and the pods it
+// owns, with the default policy. Pods without ownerReferences are matched by
+// selector.
 func SummarizeWorkloads(ws []model.Workload, pods []model.Pod, now time.Time) []WorkloadSummary {
-	running := map[string]bool{} // CronJobs with a Job running now, by "namespace/name"
-	for _, w := range ws {
-		if w.Kind == "Job" && w.Active > 0 {
-			if cj, ok := cronJobOf(w.Namespace, w.Name, ws); ok {
-				running[w.Namespace+"/"+cj] = true
+	p := compatPolicy()
+	return SummarizeWorkloadsWith(ws, Associate(listInventory(model.Inventory{Workloads: ws, Pods: pods}), p), p, now)
+}
+
+// listInventory marks the sources the older list-based entry points never
+// have, so the association treats them as unknown rather than empty.
+func listInventory(inv model.Inventory) model.Inventory {
+	inv.Unavailable = map[string]string{}
+	if inv.EndpointSlices == nil {
+		inv.Unavailable[SourceEndpointSlices] = "not listed"
+	}
+	if inv.ReplicaSets == nil {
+		inv.Unavailable[SourceReplicaSets] = "not listed"
+	}
+	return inv
+}
+
+// SummarizeWorkloadsWith judges each workload in ws from its status and the
+// pods a associates with it. Most troubled first, then by namespace and name.
+func SummarizeWorkloadsWith(ws []model.Workload, a *Assoc, p Policy, now time.Time) []WorkloadSummary {
+	running := map[nsName]bool{} // CronJobs with a Job running now
+	for i := range ws {
+		if w := &ws[i]; w.Kind == "Job" && w.Active > 0 {
+			if cj, _, ok := a.JobParent(w.Namespace, w.Name); ok {
+				running[nsName{cj.Namespace, cj.Name}] = true
 			}
 		}
 	}
 
 	out := make([]WorkloadSummary, 0, len(ws))
-	for _, w := range ws {
+	for i := range ws {
+		w := &ws[i]
 		s := WorkloadSummary{
 			Kind: w.Kind, Namespace: w.Namespace, Name: w.Name,
 			Desired: w.Desired, Ready: w.Ready, Updated: w.Updated, Available: w.Available,
@@ -31,31 +53,52 @@ func SummarizeWorkloads(ws []model.Workload, pods []model.Pod, now time.Time) []
 			LastScheduleTime: timePtr(w.LastScheduleTime), LastSuccessTime: timePtr(w.LastSuccessTime),
 		}
 		pending := 0
-		for _, p := range PodsFor(w, pods) {
-			// A terminated pod's OOM kill still explains a failed Job, so it counts.
-			for _, c := range p.Containers {
-				if c.LastTerminatedReason == "OOMKilled" {
-					s.OOMKilled = true
+		stuck := map[string]int{}
+		if w.Kind != "CronJob" {
+			for _, pod := range a.PodsOf(Ref{Kind: w.Kind, Namespace: w.Namespace, Name: w.Name}) {
+				// A terminated pod's OOM kill still explains a failed Job, so it counts.
+				for _, c := range pod.Containers {
+					if c.LastTerminatedReason == "OOMKilled" && !IsInitOnly(c) {
+						s.OOMKilled = true
+					}
 				}
-			}
-			if !live(p) {
-				continue
-			}
-			s.Pods++
-			if p.Phase == "Pending" {
-				pending++
-			}
-			for _, c := range p.Containers {
-				s.Restarts += c.RestartCount
+				if !isLive(pod) {
+					continue
+				}
+				s.Pods++
+				if pod.Phase == "Pending" {
+					pending++
+				}
+				restarts, _ := appContainers(pod)
+				s.Restarts += restarts
+				if readinessKnown(pod) && !pod.Ready {
+					s.NotReady++
+				}
+				if r := WaitingReason(pod); r != "" {
+					if s.Waiting == nil {
+						s.Waiting = map[string]int{}
+					}
+					s.Waiting[r]++
+					if stuckReasons[r] {
+						stuck[r]++
+					}
+				}
 			}
 		}
 		switch w.Kind {
 		case "Job":
-			s.Status, s.Detail = judgeJob(w, s.Pods, pending)
+			s.Status, s.Detail = judgeJob(*w, s.Pods, pending)
 		case "CronJob":
-			s.Status, s.Detail = judgeCronJob(w, running[w.Namespace+"/"+w.Name], now)
+			s.Status, s.Detail = judgeCronJob(*w, running[nsName{w.Namespace, w.Name}], now)
 		default:
-			s.Status, s.Detail = judgeReplicas(w)
+			s.Status, s.Detail = judgeReplicas(*w)
+		}
+		if len(stuck) > 0 {
+			// Status counters can look healthy while a surge pod crash-loops.
+			if s.Status == StatusOK {
+				s.Status = StatusWarn
+			}
+			s.Detail += " " + stuckDetail(stuck)
 		}
 		out = append(out, s)
 	}
@@ -73,6 +116,30 @@ func SummarizeWorkloads(ws []model.Workload, pods []model.Pod, now time.Time) []
 		return a.Kind < b.Kind
 	})
 	return out
+}
+
+// stuckDetail says "2 pods in CrashLoopBackOff, 1 in ImagePullBackOff."
+func stuckDetail(stuck map[string]int) string {
+	reasons := make([]string, 0, len(stuck))
+	for r := range stuck {
+		reasons = append(reasons, r)
+	}
+	sort.Slice(reasons, func(i, j int) bool {
+		if waitingRank(reasons[i]) != waitingRank(reasons[j]) {
+			return waitingRank(reasons[i]) < waitingRank(reasons[j])
+		}
+		return reasons[i] < reasons[j]
+	})
+	parts := make([]string, len(reasons))
+	for i, r := range reasons {
+		n := stuck[r]
+		if i == 0 {
+			parts[i] = fmt.Sprintf("%d %s in %s", n, plural(n, "pod", "pods"), r)
+		} else {
+			parts[i] = fmt.Sprintf("%d in %s", n, r)
+		}
+	}
+	return list(parts) + "."
 }
 
 // judgeReplicas covers Deployments, StatefulSets and DaemonSets.
@@ -132,7 +199,8 @@ func judgeCronJob(w model.Workload, running bool, now time.Time) (string, string
 }
 
 // cronJobOf returns the CronJob that created the Job named job, going by the
-// controller's naming scheme: <cronjob>-<scheduled time in minutes>.
+// controller's naming scheme: <cronjob>-<scheduled time in minutes>. The
+// association uses it only for Jobs without ownerReferences.
 func cronJobOf(ns, job string, ws []model.Workload) (string, bool) {
 	i := strings.LastIndexByte(job, '-')
 	if i <= 0 || i == len(job)-1 || strings.Trim(job[i+1:], "0123456789") != "" {
