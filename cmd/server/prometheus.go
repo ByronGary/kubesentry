@@ -164,10 +164,7 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 	if err != nil {
 		return nil, err
 	}
-	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}, rawURL: url}
-	if tr != nil {
-		st.probe = &http.Client{Transport: tr, Timeout: 10 * time.Second}
-	}
+	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}, rawURL: url, probe: probeClient(tr)}
 	if c.HasURLCredentials() {
 		slog.Warn("-prometheus-url carries credentials (user:password@); they are sent as basic auth but kept out of logs and /info. "+
 			"Prefer PROMETHEUS_TOKEN (chart: prometheus.bearerTokenSecret), which stays out of the process arguments", "url", c.BaseURL())
@@ -220,7 +217,7 @@ func (s promSetup) discoverOnce(ctx context.Context) (*promState, error) {
 	if err != nil && len(urls) == 0 {
 		return nil, fmt.Errorf("discover: %w", err)
 	}
-	bi, rejected, err := prom.Choose(ctx, urls, nil)
+	bi, rejected, err := prom.Choose(ctx, urls, probeClient(nil))
 	for _, r := range rejected {
 		slog.Info("prometheus candidate rejected", "url", r.URL, "reason", r.Reason)
 	}
@@ -233,6 +230,31 @@ func (s promSetup) discoverOnce(ctx context.Context) (*promState, error) {
 	}
 	st.info.Flavor, st.info.Version, st.info.RetentionHours = bi.Flavor, bi.Version, bi.RetentionHours
 	return st, nil
+}
+
+// probeClient is the HTTP client for buildinfo probes and discovery. It
+// authenticates the way queries do: SigV4 when tr signs (Amazon Managed
+// Prometheus), otherwise PROMETHEUS_TOKEN as a bearer token when set, so a
+// Prometheus behind auth is not rejected during discovery.
+func probeClient(tr http.RoundTripper) *http.Client {
+	if tr == nil {
+		tr = http.DefaultTransport
+		if tok := os.Getenv("PROMETHEUS_TOKEN"); tok != "" {
+			tr = bearerTransport{token: tok, base: tr}
+		}
+	}
+	return &http.Client{Transport: tr, Timeout: 10 * time.Second}
+}
+
+type bearerTransport struct {
+	token string
+	base  http.RoundTripper
+}
+
+func (b bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+b.token)
+	return b.base.RoundTrip(r)
 }
 
 // parseBytesPerHour reads a growth rate such as "1MiB", "512KiB/h" or

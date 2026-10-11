@@ -86,6 +86,43 @@ func TestDiscoveryChoosesTheFirstGoodCandidate(t *testing.T) {
 	}
 }
 
+func TestDiscoverySendsTheBearerToken(t *testing.T) {
+	inner := fakeProm(t)
+	locked := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer s3cret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		r.URL.Host, r.URL.Scheme, r.RequestURI = strings.TrimPrefix(inner.URL, "http://"), "http", ""
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(locked.Close)
+	t.Setenv("PROMETHEUS_TOKEN", "s3cret")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	setup := promSetup{
+		autodiscover: true,
+		scan:         prom.LeakScanOptions{Interval: time.Hour, StartJitter: -1},
+		pods:         func(context.Context) ([]model.Pod, error) { return nil, nil },
+		discover:     func(context.Context) ([]string, error) { return []string{locked.URL}, nil },
+	}
+	st, err := setup.discoverOnce(ctx)
+	if err != nil {
+		t.Fatalf("a Prometheus behind a bearer token was rejected: %v", err)
+	}
+	if st.info.Version != "3.5.0" {
+		t.Errorf("probe through the token: %+v", st.info)
+	}
+}
+
 func TestConfiguredPrometheus(t *testing.T) {
 	srv := fakeProm(t)
 	ctx, cancel := context.WithCancel(context.Background())
