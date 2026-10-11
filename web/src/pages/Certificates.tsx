@@ -1,3 +1,5 @@
+import { can, hiddenNote } from '../access'
+import { useInfo } from '../components/Access'
 import { Async, Empty, PageHead, slashBreaks, StatusGlyph } from '../components/ui'
 import { ago, formatDateTime, formatExpiry, formatHours, hoursUntil, plural } from '../format'
 import { matches } from '../inventory'
@@ -39,6 +41,8 @@ function requestState(r: RequestSummary): string {
 export function Certificates({ route }: { route: Route }) {
   const q = route.query.get('q') ?? ''
   const state = useApi<CertificatesResponse>('/api/v1/certificates', 60_000)
+  // ClusterIssuers need cluster-wide access; without it the server sends names only, which this page hides.
+  const clusterIssuersOK = can(useInfo(), 'clusterIssuers')
 
   return (
     <>
@@ -53,7 +57,9 @@ export function Certificates({ route }: { route: Route }) {
             )
           }
           const certs = (d.certificates ?? []).filter((c) => matches(q, `${c.namespace}/${c.name}`, c.secretName, `${c.issuerKind}/${c.issuerName}`, ...(c.dnsNames ?? [])))
-          const issuers = (d.issuers ?? []).filter((i) => matches(q, i.namespace ? `${i.namespace}/${i.name}` : i.name, i.kind, i.type, i.server))
+          const issuers = (d.issuers ?? []).filter(
+            (i) => (clusterIssuersOK || i.kind !== 'ClusterIssuer') && matches(q, i.namespace ? `${i.namespace}/${i.name}` : i.name, i.kind, i.type, i.server),
+          )
           const requests = (d.requests ?? []).filter((r) => matches(q, `${r.namespace}/${r.name}`, r.certificate, r.issuerName))
           const none = q ? 'Nothing matches the search' : undefined
           return (
@@ -109,6 +115,7 @@ export function Certificates({ route }: { route: Route }) {
 
               <section aria-labelledby="h-issuers">
                 <h2 id="h-issuers">Issuers</h2>
+                {!clusterIssuersOK && <p className="notice">{hiddenNote('clusterIssuers')}</p>}
                 {issuers.length === 0 ? (
                   <Empty title={none ?? 'No issuers'}>{none ? undefined : 'Certificates need an Issuer or ClusterIssuer before cert-manager can sign them.'}</Empty>
                 ) : (

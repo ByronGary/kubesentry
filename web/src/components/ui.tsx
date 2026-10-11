@@ -1,8 +1,11 @@
-import { Fragment, type ReactNode } from 'react'
+import { Fragment, useState, type ReactNode } from 'react'
 import { ApiError, setToken } from '../api'
-import { bumpAuth, type ApiState } from '../useApi'
+import { loadedText } from '../paging'
+import type { WindowChoice } from '../retention'
 import type { Status } from '../types'
-import { useState } from 'react'
+import type { PagedState } from '../usePaged'
+import { bumpAuth, type ApiState } from '../useApi'
+import { SignInStuck } from './Access'
 
 /** Status plus a neutral "info" level used for security findings. UI-only. */
 export type GlyphKind = Status | 'info'
@@ -114,7 +117,7 @@ export function Async<T>({
   children: (data: T) => ReactNode
 }) {
   const { data, error, loading, reload } = state
-  if (error instanceof ApiError && error.status === 401) return <TokenForm />
+  if (error instanceof ApiError && error.status === 401) return <Unauthorized error={error} />
   if (!data) {
     if (error) {
       return (
@@ -167,16 +170,92 @@ export function Segmented<T extends string>({
 }: {
   label: string
   value: T
-  options: { value: T; label: string }[]
+  options: { value: T; label: string; disabled?: boolean; reason?: string }[]
   onChange: (v: T) => void
 }) {
   return (
     <div className="segmented" role="group" aria-label={label}>
       {options.map((o) => (
-        <button key={o.value} type="button" aria-pressed={o.value === value} onClick={() => onChange(o.value)}>
+        // aria-disabled rather than disabled, so the tooltip saying why still shows.
+        <button
+          key={o.value}
+          type="button"
+          aria-pressed={o.value === value}
+          aria-disabled={o.disabled || undefined}
+          title={o.disabled ? o.reason : undefined}
+          onClick={() => {
+            if (!o.disabled) onChange(o.value)
+          }}
+        >
           {o.label}
         </button>
       ))}
+    </div>
+  )
+}
+
+/** A 401: the token prompt, a note while single sign-on renews, or help when renewing failed. */
+export function Unauthorized({ error }: { error: ApiError }) {
+  if (error.reauth === 'reload') return <p className="muted" aria-live="polite">Your sign-in expired. Signing you in again…</p>
+  if (error.reauth === 'stuck') return <SignInStuck message={error.message} />
+  return <TokenForm />
+}
+
+/** A period picker whose options with no data behind them are disabled, with the reason underneath. */
+export function WindowSelect<V extends string>({
+  label,
+  value,
+  choices,
+  onChange,
+}: {
+  label: string
+  value: V
+  choices: WindowChoice<V>[]
+  onChange: (v: V) => void
+}) {
+  const off = choices.find((c) => c.disabled)
+  return (
+    <label>
+      {label}
+      <select value={value} onChange={(e) => onChange(e.target.value as V)} aria-describedby={off ? 'window-why' : undefined}>
+        {choices.map((c) => (
+          <option key={c.value} value={c.value} disabled={c.disabled} title={c.reason}>
+            {c.label}
+            {c.disabled ? ' (no data)' : ''}
+          </option>
+        ))}
+      </select>
+      {off && <span id="window-why" className="field-hint">{off.reason}</span>}
+    </label>
+  )
+}
+
+/**
+ * The line above a paged list: progress while pages arrive (with Stop), how
+ * many rows match, and Refresh when the list is too big to refresh on its own.
+ */
+export function ListStatus({ state, noun, shown }: { state: PagedState<unknown>; noun: [string, string]; shown?: number }) {
+  const { loaded, following, truncated, stopped, pages, loading, data } = state
+  const filtered = shown !== undefined && shown !== loaded && !following
+  let text: string
+  if (stopped) text = `Stopped after ${loaded.toLocaleString('en-US')} ${loaded === 1 ? noun[0] : noun[1]}`
+  else if (filtered) text = `${shown.toLocaleString('en-US')} of ${loaded.toLocaleString('en-US')} ${loaded === 1 ? noun[0] : noun[1]}`
+  else text = loadedText(loaded, noun, { following, truncated, complete: true })
+  return (
+    <div className="list-status">
+      <span aria-live="polite">{text}</span>
+      {following && (
+        <button type="button" className="linklike" onClick={state.stop}>Stop loading</button>
+      )}
+      {stopped && (
+        <button type="button" className="linklike" onClick={state.reload}>Load all</button>
+      )}
+      {truncated && <span className="muted">Narrow the list with a namespace to see the rest.</span>}
+      {!following && !stopped && pages > 1 && data !== undefined && (
+        <button type="button" className="linklike" onClick={state.reload} disabled={loading}>
+          {loading ? 'Refreshing…' : 'Refresh'}
+        </button>
+      )}
     </div>
   )
 }
