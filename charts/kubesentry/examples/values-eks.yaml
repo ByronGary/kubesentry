@@ -55,7 +55,9 @@ serviceAccount:
     # association for kubesentry/kubesentry instead.
     eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/kubesentry-prod-eks
 
-# Break-glass API token, usable only through kubectl port-forward to a pod.
+# Break-glass API token. With the oauth2-proxy sidecar kubesentry listens only
+# on a Unix socket inside the pod; to use the token while SSO is down, upgrade
+# with oauth2Proxy.enabled=false (token mode) and kubectl port-forward 8080.
 tokens:
   api:
     enabled: true

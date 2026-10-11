@@ -103,6 +103,21 @@ type Candidates interface {
 	Namespaces(user string, groups []string, c Capability) []string
 }
 
+// CandidatesReadiness is implemented by Candidates that may not be able to
+// propose anything yet (no RBAC index before the first snapshot view).
+// While Ready is false, SARAuthorizer uses the scopes it computes but does
+// not cache them: they would be too narrow for the whole TTL.
+type CandidatesReadiness interface {
+	Ready() bool
+}
+
+// UserBindings is implemented by Candidates that know whether any binding
+// names a user as a subject. With ShareByGroups, SARAuthorizer caches such a
+// user's answers per user, never under their group set.
+type UserBindings interface {
+	HasUserBindings(user string) bool
+}
+
 type ctxKey struct{}
 
 // WithIdentity stores the caller's identity in a context.

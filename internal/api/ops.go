@@ -26,10 +26,25 @@ type readyResponse struct {
 // readyz answers 503 until Ready reports true, then 200; the body names the
 // dependencies that are degraded (Checks) and the sources that cannot be read.
 func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
+	s.readiness(w, r, true)
+}
+
+// readyzStatus is readyz for the web listener (no -ops-addr), which anyone
+// reaching the UI can call: the status only, without dependency errors
+// (hosts, users, SQL states) that the ops listener reports.
+func (s *Server) readyzStatus(w http.ResponseWriter, r *http.Request) {
+	s.readiness(w, r, false)
+}
+
+func (s *Server) readiness(w http.ResponseWriter, r *http.Request, detail bool) {
 	resp := readyResponse{Status: "ready"}
 	code := http.StatusOK
 	if s.Ready != nil && !s.Ready() {
 		resp.Status, code = "starting", http.StatusServiceUnavailable
+	}
+	if !detail {
+		writeJSON(w, code, resp)
+		return
 	}
 	resp.Degraded = s.runChecks(r.Context())
 	if s.Unavailable != nil {

@@ -391,6 +391,47 @@ func WithMaxInflight(n int) func(http.Handler) http.Handler {
 	}
 }
 
+// identityInflight counts each identity's requests in flight.
+type identityInflight struct {
+	mu   sync.Mutex
+	max  int
+	busy map[string]int
+}
+
+// WithIdentityInflight lets each caller (the authenticated user, else the
+// remote address) have at most n requests in flight through the handlers it
+// wraps, together, and answers 429 with Retry-After to the rest instead of
+// queueing them. Use one instance around the expensive routes, so a single
+// user cannot hold many slow queries at once. n <= 0 disables it.
+func WithIdentityInflight(n int) func(http.Handler) http.Handler {
+	if n <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	l := &identityInflight{max: n, busy: map[string]int{}}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := rateKey(r)
+			l.mu.Lock()
+			if l.busy[key] >= l.max {
+				l.mu.Unlock()
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusTooManyRequests, "too many expensive requests in flight; retry when one finishes")
+				return
+			}
+			l.busy[key]++
+			l.mu.Unlock()
+			defer func() {
+				l.mu.Lock()
+				if l.busy[key]--; l.busy[key] <= 0 {
+					delete(l.busy, key) // the map holds only callers with requests in flight
+				}
+				l.mu.Unlock()
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // timeoutWriter buffers a handler's response so WithTimeout can replace it
 // with a 503 if the deadline passes first.
 type timeoutWriter struct {
@@ -1126,7 +1167,10 @@ func (c *ResponseCache) serve(w http.ResponseWriter, r *http.Request, next http.
 		rec.status = http.StatusOK
 	}
 	body := rec.buf.Bytes()
-	if storable(rec.status, rec.h) {
+	// A response built while an authorization lookup failed shows the
+	// caller less than they may see (lookups fail closed): serve it, but
+	// never keep it for others.
+	if storable(rec.status, rec.h) && !authzFailed(r.Context()) {
 		if rec.h.Get("ETag") == "" {
 			rec.h.Set("ETag", bodyETag(body))
 		}

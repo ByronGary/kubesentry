@@ -139,6 +139,32 @@ func (m *Metrics) ContainerMemoryLimits(context.Context) (map[model.ContainerKey
 	return m.limits(func(model.ContainerKey) bool { return true }), nil
 }
 
+// ContainerMemoryIn is ContainerMemory for the given namespaces only.
+func (m *Metrics) ContainerMemoryIn(_ context.Context, namespaces []string, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	in := set(namespaces)
+	var out []model.ContainerSeries
+	for k, p := range m.profiles {
+		if in[k.Namespace] {
+			out = append(out, m.series(k, p, lookback, step))
+		}
+	}
+	return out, nil
+}
+
+// ContainerMemoryLimitsIn is ContainerMemoryLimits for the given namespaces only.
+func (m *Metrics) ContainerMemoryLimitsIn(_ context.Context, namespaces []string) (map[model.ContainerKey]float64, error) {
+	in := set(namespaces)
+	return m.limits(func(k model.ContainerKey) bool { return in[k.Namespace] }), nil
+}
+
+func set(xs []string) map[string]bool {
+	out := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		out[x] = true
+	}
+	return out
+}
+
 func (m *Metrics) PodMemory(_ context.Context, ns, pod string, lookback, step time.Duration) ([]model.ContainerSeries, map[model.ContainerKey]float64, error) {
 	var out []model.ContainerSeries
 	for k, p := range m.profiles {

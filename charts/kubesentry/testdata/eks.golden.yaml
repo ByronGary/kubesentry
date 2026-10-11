@@ -732,14 +732,13 @@ spec:
           image: ghcr.io/byrongary/kubesentry:0.1.0
           imagePullPolicy: IfNotPresent
           args:
-            - -addr=127.0.0.1:8080
+            - -addr=unix:///var/run/kubesentry/web.sock
             - -ingest-addr=:8081
             - -ops-addr=:9090
             - -cluster-name=prod-eks
             - -auth-mode=proxy
             - -auth-user-header=X-Forwarded-Email
             - -auth-groups-header=X-Forwarded-Groups
-            - -auth-trusted-proxy-cidrs=127.0.0.1/32,::1/128
             - -auth-group-map-file=/etc/kubesentry/auth/group-map.json
             - -authz-qps=200
             - -authz-cache-ttl=5m
@@ -833,6 +832,8 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: web-socket
+              mountPath: /var/run/kubesentry
             - name: auth-group-map
               mountPath: /etc/kubesentry/auth
               readOnly: true
@@ -844,7 +845,9 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --http-address=0.0.0.0:4180
-            - --upstream=http://127.0.0.1:8080
+            # kubesentry listens only on this socket, in a volume only these two
+            # containers mount; it trusts identity headers on it and nowhere else.
+            - --upstream=unix:///var/run/kubesentry/web.sock
             - --provider=oidc
             - --oidc-issuer-url=https://example.okta.com/oauth2/default
             - --client-id=0oa1example2kubesentry3
@@ -856,7 +859,7 @@ spec:
             - --email-domain=*
             - --allowed-group=platform-team
             - --allowed-group=payments-engineers
-            # Identity reaches kubesentry only in these headers, and only from loopback.
+            # Identity reaches kubesentry only in these headers, and only over the socket.
             - --pass-user-headers=true
             - --set-xauthrequest=true
             - --skip-auth-strip-headers=true
@@ -922,10 +925,19 @@ spec:
             requests:
               cpu: 20m
               memory: 32Mi
+          volumeMounts:
+            - name: web-socket
+              mountPath: /var/run/kubesentry
       volumes:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        # The web socket between oauth2-proxy and kubesentry (mode 0660; both
+        # run with the pod's fsGroup).
+        - name: web-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
         - name: auth-group-map
           configMap:
             name: kubesentry-auth

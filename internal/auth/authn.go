@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -20,13 +21,24 @@ const TokenUser = "kubesentry:api-token"
 // AnonymousUser is the user name of the -auth-mode=none identity.
 const AnonymousUser = "kubesentry:anonymous"
 
+// DefaultReservedPrefixes are the user and group name prefixes of platform
+// identities (Kubernetes' own and EKS's), as -system-principal-prefixes
+// defaults them.
+var DefaultReservedPrefixes = []string{"system:", "eks:"}
+
 // HeaderAuthenticator reads the identity an SSO proxy (oauth2-proxy) passes in
 // request headers. Headers are trusted only when the request comes straight
-// from a trusted proxy address; from anywhere else they are ignored, so a
-// client cannot claim an identity by setting them itself.
+// from the proxy: over a connection the proxy alone can open (a Unix socket
+// shared with the sidecar, TrustProxyConn), or else from a trusted proxy
+// address. From anywhere else they are ignored, so a client cannot claim an
+// identity by setting them itself.
 type HeaderAuthenticator struct {
-	UserHeader   string // e.g. X-Forwarded-Email
-	GroupsHeader string // e.g. X-Forwarded-Groups; comma-separated and/or repeated
+	UserHeader string // e.g. X-Forwarded-Email; must appear exactly once
+	// GroupsHeader carries the groups, e.g. X-Forwarded-Groups. Values are
+	// comma-separated (oauth2-proxy joins a user's groups with commas), and
+	// repeated headers add up, so group names containing commas are not
+	// supported.
+	GroupsHeader string
 	// UsernamePrefix and GroupsPrefix are prepended like the API server's
 	// --oidc-username-prefix and --oidc-groups-prefix, so the identity matches
 	// the subjects RBAC bindings name. A UsernamePrefix of "-" means none.
@@ -36,27 +48,47 @@ type HeaderAuthenticator struct {
 	// matched against the raw header values (before GroupsPrefix); the mapped
 	// groups are added as written. The original (prefixed) groups are kept.
 	GroupMap map[string][]string
-	// TrustedProxies are the addresses allowed to send identity headers.
-	// Empty trusts nobody.
+	// ReservedPrefixes are platform principal prefixes (the policy's system
+	// principal prefixes, -system-principal-prefixes). A user name starting
+	// with one is refused and such identity-provider groups are dropped, so
+	// no IdP claim can become system:masters or an eks: identity. "system:"
+	// is always reserved; nil means DefaultReservedPrefixes. GroupMap output
+	// is kept as the admin wrote it.
+	ReservedPrefixes []string
+	// TrustProxyConn trusts the headers on connections marked by
+	// WithProxyConn (accepted on a Unix socket only the SSO proxy can
+	// reach), and nowhere else: TrustedProxies is then ignored, so a TCP
+	// connection from loopback, as kubectl port-forward makes, is not the
+	// proxy.
+	TrustProxyConn bool
+	// TrustedProxies are the addresses allowed to send identity headers over
+	// TCP. Empty trusts nobody.
 	TrustedProxies []netip.Prefix
 }
 
 // Authenticate implements Authenticator.
 func (h HeaderAuthenticator) Authenticate(r *http.Request) (Identity, bool) {
-	if h.UserHeader == "" || !h.trusted(r.RemoteAddr) {
+	if h.UserHeader == "" || !h.trusted(r) {
 		return Identity{}, false
 	}
-	user := strings.TrimSpace(r.Header.Get(h.UserHeader))
+	// A repeated user header is ambiguous: a proxy sets it once, so a second
+	// value means something else added one. Refuse rather than pick.
+	vals := r.Header.Values(h.UserHeader)
+	if len(vals) != 1 {
+		return Identity{}, false
+	}
+	user := strings.TrimSpace(vals[0])
 	if user == "" {
 		return Identity{}, false
 	}
 	if p := h.UsernamePrefix; p != "" && p != "-" {
 		user = p + user
 	}
-	// Identity providers do not get to claim Kubernetes system identities:
-	// those would make the SubjectAccessReviews answer for a control-plane
-	// component or system:masters. Admin-written GroupMap entries may.
-	if strings.HasPrefix(user, "system:") {
+	// Identity providers do not get to claim platform identities: those
+	// would make the SubjectAccessReviews answer for a control-plane
+	// component, system:masters or an EKS internal role. Admin-written
+	// GroupMap entries may.
+	if h.reserved(user) {
 		return Identity{}, false
 	}
 
@@ -75,7 +107,7 @@ func (h HeaderAuthenticator) Authenticate(r *http.Request) (Identity, bool) {
 				if raw == "" {
 					continue
 				}
-				if g := h.GroupsPrefix + raw; !strings.HasPrefix(g, "system:") {
+				if g := h.GroupsPrefix + raw; !h.reserved(g) {
 					add(g)
 				}
 				for _, mapped := range h.GroupMap[raw] {
@@ -88,8 +120,28 @@ func (h HeaderAuthenticator) Authenticate(r *http.Request) (Identity, bool) {
 	return Identity{User: user, Groups: groups, Source: "proxy"}, true
 }
 
-func (h HeaderAuthenticator) trusted(remoteAddr string) bool {
-	addr, ok := remoteIP(remoteAddr)
+// reserved reports whether name starts with a platform principal prefix.
+func (h HeaderAuthenticator) reserved(name string) bool {
+	if strings.HasPrefix(name, "system:") {
+		return true
+	}
+	prefixes := h.ReservedPrefixes
+	if prefixes == nil {
+		prefixes = DefaultReservedPrefixes
+	}
+	for _, p := range prefixes {
+		if p != "" && strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h HeaderAuthenticator) trusted(r *http.Request) bool {
+	if h.TrustProxyConn {
+		return FromProxyConn(r.Context())
+	}
+	addr, ok := remoteIP(r.RemoteAddr)
 	if !ok {
 		return false
 	}
@@ -99,6 +151,29 @@ func (h HeaderAuthenticator) trusted(remoteAddr string) bool {
 		}
 	}
 	return false
+}
+
+type proxyConnKey struct{}
+
+// WithProxyConn marks ctx as belonging to a connection accepted on a
+// listener only the SSO proxy can reach: a Unix socket in a volume shared
+// with the oauth2-proxy sidecar. Set it from http.Server.ConnContext.
+func WithProxyConn(ctx context.Context) context.Context {
+	return context.WithValue(ctx, proxyConnKey{}, true)
+}
+
+// FromProxyConn reports whether WithProxyConn marked ctx.
+func FromProxyConn(ctx context.Context) bool {
+	v, _ := ctx.Value(proxyConnKey{}).(bool)
+	return v
+}
+
+// AnyAddress reports whether p admits every address (0.0.0.0/0 or ::/0).
+func AnyAddress(p netip.Prefix) bool { return p.IsValid() && p.Bits() == 0 }
+
+// HasLoopback reports whether p contains a loopback address.
+func HasLoopback(p netip.Prefix) bool {
+	return p.Addr().IsLoopback() || p.Contains(netip.AddrFrom4([4]byte{127, 0, 0, 1})) || p.Contains(netip.IPv6Loopback())
 }
 
 // remoteIP parses http.Request.RemoteAddr ("ip:port", or a bare ip).

@@ -30,8 +30,10 @@ func oomEvents(v *snapshot.View) []detectors.OOMEvent {
 
 // oom lists OOM kills within the window and containers whose memory climbs
 // steadily, in the caller's namespaces. Leaks come from the background scan
-// when the window is the scan's own; any other window queries Prometheus for
-// every container now, which is costly on large clusters.
+// when the window is the scan's own. Any other window queries Prometheus
+// now: for every container when the caller sees every namespace, otherwise
+// only in their namespaces (and not at all when they see none), so a
+// restricted caller can never make the server query the whole cluster.
 func (s *Server) oom(w http.ResponseWriter, r *http.Request) {
 	window, err := durationParam(r, "window", 24*time.Hour, 10*time.Minute, 7*24*time.Hour)
 	if err != nil {
@@ -70,23 +72,56 @@ func (s *Server) oom(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if m != nil {
-		leaks, err := s.findLeaks(r.Context(), m, v, window, resp.Events, sc)
-		if err != nil {
-			slog.Error("leak detection failed", "err", err)
-			resp.Warnings = append(resp.Warnings, "leak detection unavailable: could not query Prometheus")
-		} else {
-			resp.MetricsAvailable = true
-			resp.Leaks = leaks
+	if m == nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	var namespaces []string
+	if !sc.All {
+		for ns, held := range sc.Namespaces {
+			if held && ns != "" {
+				namespaces = append(namespaces, ns)
+			}
 		}
+		sort.Strings(namespaces)
+		if len(namespaces) == 0 {
+			resp.MetricsAvailable = true // nothing of theirs to query
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		if _, ok := m.(namespacedMetrics); !ok {
+			resp.Warnings = append(resp.Warnings, fmt.Sprintf("leak detection for this window needs access to every namespace; use the default window (%s)", s.leakWindowHint(m)))
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+	leaks, err := s.findLeaks(r.Context(), m, v, window, resp.Events, sc, namespaces)
+	if err != nil {
+		slog.Error("leak detection failed", "err", err)
+		resp.Warnings = append(resp.Warnings, "leak detection unavailable: could not query Prometheus")
+	} else {
+		resp.MetricsAvailable = true
+		resp.Leaks = leaks
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// findLeaks queries every container's memory over the window and analyses
-// the series in the caller's namespaces. Limits come from the pod specs
-// unless the source reports them (kube-state-metrics).
-func (s *Server) findLeaks(ctx context.Context, m MetricsSource, v *snapshot.View, window time.Duration, events []detectors.OOMEvent, sc auth.Scope) ([]detectors.LeakFinding, error) {
+// leakWindowHint names the background scan's window for a warning.
+func (s *Server) leakWindowHint(m MetricsSource) string {
+	if lr, ok := m.(leakReporter); ok {
+		if _, win, ok := lr.LeakReport(); ok && win > 0 {
+			return win.String()
+		}
+	}
+	return "of the leak scan"
+}
+
+// findLeaks queries memory over the window, of every container when
+// namespaces is nil, else of those namespaces only (m must then implement
+// namespacedMetrics), and analyses the series in the caller's scope.
+// Limits come from the pod specs unless the source reports them
+// (kube-state-metrics).
+func (s *Server) findLeaks(ctx context.Context, m MetricsSource, v *snapshot.View, window time.Duration, events []detectors.OOMEvent, sc auth.Scope, namespaces []string) ([]detectors.LeakFinding, error) {
 	// ~240 points per series keeps queries cheap and well under Prometheus'
 	// 11,000-point limit, while still giving slow leaks enough samples.
 	step := window / 240
@@ -95,11 +130,22 @@ func (s *Server) findLeaks(ctx context.Context, m MetricsSource, v *snapshot.Vie
 	}
 	step = step.Round(time.Second)
 
-	series, err := m.ContainerMemory(ctx, window, step)
+	var series []model.ContainerSeries
+	var ksm map[model.ContainerKey]float64
+	var err error
+	if namespaces == nil {
+		series, err = m.ContainerMemory(ctx, window, step)
+	} else {
+		series, err = m.(namespacedMetrics).ContainerMemoryIn(ctx, namespaces, window, step)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("memory series: %w", err)
 	}
-	ksm, err := m.ContainerMemoryLimits(ctx)
+	if namespaces == nil {
+		ksm, err = m.ContainerMemoryLimits(ctx)
+	} else {
+		ksm, err = m.(namespacedMetrics).ContainerMemoryLimitsIn(ctx, namespaces)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("memory limits: %w", err)
 	}

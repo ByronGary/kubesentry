@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"time"
 
+	"github.com/ByronGary/kubesentry/internal/api"
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/pgstore"
@@ -43,12 +45,16 @@ type config struct {
 	authGroupsPrefix                 string
 	authGroupMapFile                 string
 	authTrustedProxyCIDRs            string
+	authAllowAnyProxy                bool
+	allowedHosts                     string
 	signOutURL                       string
 	authzQPS                         float64
 	authzCacheTTL, authzDenyTTL      time.Duration
 	authzShareByGroups               bool
 	rateLimit                        float64
 	rateBurst, maxInflight           int
+	maxInflightPerIdentity           int
+	setFlags                         map[string]bool // flags given on the command line
 
 	promURL          string
 	promAutodiscover bool
@@ -106,7 +112,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.BoolVar(&c.showVersion, "version", false, "print the version and exit")
 
 	// Listeners.
-	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "UI and API listen address (use :8080 to listen on all interfaces)")
+	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "UI and API listen address (use :8080 to listen on all interfaces), or unix:///path for a Unix socket shared with the SSO proxy sidecar (proxy mode)")
+	fs.StringVar(&c.allowedHosts, "allowed-hosts", "", "Host header patterns the web listener answers, comma-separated host[:port], *.domain or *; others get 403. Default: localhost,127.0.0.1,[::1] when every local caller is trusted (-auth-mode=none, or token mode without -api-token), else any")
 	fs.StringVar(&c.ingestAddr, "ingest-addr", "", "listen address for POST /agent/report and POST /audit/webhook; empty serves them on -addr")
 	fs.StringVar(&c.opsAddr, "ops-addr", "", "listen address for /healthz, /readyz, /metrics (and /debug/pprof/ with -pprof); empty serves the probes on -addr and no metrics")
 	fs.BoolVar(&c.pprof, "pprof", false, "serve /debug/pprof/ on -ops-addr")
@@ -134,7 +141,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.StringVar(&c.authUsernamePrefix, "auth-username-prefix", "", "prefix for user names, as the API server's --oidc-username-prefix")
 	fs.StringVar(&c.authGroupsPrefix, "auth-groups-prefix", "", "prefix for group names, as the API server's --oidc-groups-prefix")
 	fs.StringVar(&c.authGroupMapFile, "auth-group-map-file", "", "JSON {\"idp-group\": [\"k8s-group\", ...]} adding Kubernetes groups")
-	fs.StringVar(&c.authTrustedProxyCIDRs, "auth-trusted-proxy-cidrs", "127.0.0.1/32,::1/128", "only these addresses may send identity headers")
+	fs.StringVar(&c.authTrustedProxyCIDRs, "auth-trusted-proxy-cidrs", "127.0.0.1/32,::1/128", "proxy mode over TCP: only these addresses may send identity headers (ignored when -addr is a Unix socket, which trusts only the socket)")
+	fs.BoolVar(&c.authAllowAnyProxy, "auth-allow-any-proxy", false, "allow -auth-trusted-proxy-cidrs to contain 0.0.0.0/0 or ::/0 (anyone could claim any identity unless the network allows only the proxy)")
 	fs.StringVar(&c.signOutURL, "auth-sign-out-url", "", "where the UI's Sign out goes (e.g. /oauth2/sign_out)")
 	fs.Float64Var(&c.authzQPS, "authz-qps", 200, "SubjectAccessReviews per second (burst twice that)")
 	dur(&c.authzCacheTTL, "authz-cache-ttl", auth.DefaultAuthzTTL, "how long an allowed access decision is cached")
@@ -143,6 +151,7 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.Float64Var(&c.rateLimit, "rate-limit", 20, "API requests per second per identity (0 disables)")
 	fs.IntVar(&c.rateBurst, "rate-burst", 40, "API request burst per identity")
 	fs.IntVar(&c.maxInflight, "max-inflight", 512, "API requests served at once; more get 503 (0 disables)")
+	fs.IntVar(&c.maxInflightPerIdentity, "max-inflight-per-identity", 4, "requests one identity may have in flight on the expensive routes (/oom, pod diagnostics, audit summary); more get 429 (0 disables)")
 
 	// Data sources.
 	fs.StringVar(&c.promURL, "prometheus-url", "", "Prometheus base URL, e.g. http://prometheus:9090 or an AMP workspace URL (enables leak detection); PROMETHEUS_TOKEN for bearer auth")
@@ -208,6 +217,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
+	c.setFlags = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { c.setFlags[f.Name] = true })
 	th.RestartWarn, th.RestartCrit = int32(restartWarn), int32(restartCrit)
 	c.leak.MinSlopeBytesPerHour = float64(minSlope)
 	return c, c.validate()
@@ -222,11 +233,30 @@ func (c *config) validate() error {
 	default:
 		return fmt.Errorf("-auth-mode %q: use token, proxy or none", c.authMode)
 	}
+	if path, unix := unixSocketPath(c.addr); unix {
+		if err := validSocketPath(path); err != nil {
+			return fmt.Errorf("-addr: %w", err)
+		}
+		if c.ingestAddr == "" {
+			return errors.New("-addr is a Unix socket, which agents and the audit webhook cannot reach: set -ingest-addr")
+		}
+	}
 	if c.authMode == "none" && !isLoopback(c.addr) {
-		return fmt.Errorf("-auth-mode=none serves everything to anyone, so -addr must be a loopback address, not %q", c.addr)
+		return fmt.Errorf("-auth-mode=none serves everything to anyone, so -addr must be a loopback TCP address, not %q", c.addr)
 	}
 	if c.authMode == "token" && c.apiToken == "" && !isLoopback(c.addr) {
 		return fmt.Errorf("-auth-mode=token needs -api-token (or KUBESENTRY_API_TOKEN) when -addr %q is not loopback", c.addr)
+	}
+	if _, err := api.ParseAllowedHosts(c.allowedHosts); err != nil {
+		return fmt.Errorf("-allowed-hosts: %w", err)
+	}
+	if c.authMode == "proxy" {
+		if _, err := c.trustedProxies(); err != nil {
+			return err
+		}
+	}
+	if c.maxInflightPerIdentity < 0 {
+		return errors.New("-max-inflight-per-identity must not be negative")
 	}
 	switch c.auditStore {
 	case "memory":
@@ -295,6 +325,36 @@ func (c *config) policy() (detectors.Policy, error) {
 	return p, nil
 }
 
+// trustedProxies parses -auth-trusted-proxy-cidrs, refusing a CIDR that
+// admits every address unless -auth-allow-any-proxy says so.
+func (c *config) trustedProxies() ([]netip.Prefix, error) {
+	cidrs, err := auth.ParseCIDRs(c.authTrustedProxyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("-auth-trusted-proxy-cidrs: %w", err)
+	}
+	for _, p := range cidrs {
+		if auth.AnyAddress(p) && !c.authAllowAnyProxy {
+			return nil, fmt.Errorf("-auth-trusted-proxy-cidrs contains %s, which lets anyone who reaches -addr claim any identity; "+
+				"name the SSO proxy's addresses, or set -auth-allow-any-proxy if only the proxy can reach the listener", p)
+		}
+	}
+	return cidrs, nil
+}
+
+// webAllowedHosts is the Host allowlist for the web listener: -allowed-hosts,
+// or the loopback names when every local caller is trusted (DNS rebinding
+// would otherwise reach the listener from any web page), else none.
+func (c *config) webAllowedHosts() []string {
+	hosts, _ := api.ParseAllowedHosts(c.allowedHosts) // validated with the flags
+	if hosts != nil {
+		return hosts
+	}
+	if c.authMode == "none" || (c.authMode == "token" && c.apiToken == "") {
+		return api.LoopbackHosts
+	}
+	return nil
+}
+
 // authenticator builds the -auth-mode authenticator. In proxy mode the API
 // token stays available as the break-glass identity (reachable only from
 // inside the pod network when oauth2-proxy fronts the listener).
@@ -311,18 +371,47 @@ func (c *config) authenticator() (auth.Authenticator, error) {
 		}
 		return token, nil
 	}
-	cidrs, err := auth.ParseCIDRs(c.authTrustedProxyCIDRs)
-	if err != nil {
-		return nil, fmt.Errorf("-auth-trusted-proxy-cidrs: %w", err)
-	}
 	h := auth.HeaderAuthenticator{
 		UserHeader: c.authUserHeader, GroupsHeader: c.authGroupsHeader,
-		UsernamePrefix: c.authUsernamePrefix, GroupsPrefix: c.authGroupsPrefix, TrustedProxies: cidrs,
+		UsernamePrefix: c.authUsernamePrefix, GroupsPrefix: c.authGroupsPrefix,
+		// The policy's platform principals ("system:" is always reserved).
+		ReservedPrefixes: append([]string{}, c.systemPrincipalPrefixes.items...),
 	}
-	if c.authGroupMapFile != "" {
-		if h.GroupMap, err = auth.LoadGroupMap(c.authGroupMapFile); err != nil {
+	if _, unix := unixSocketPath(c.addr); unix {
+		// Only the sidecar sharing the socket's volume connects: trust the
+		// socket and nothing else.
+		h.TrustProxyConn = true
+		if c.setFlags["auth-trusted-proxy-cidrs"] {
+			slog.Warn("-auth-trusted-proxy-cidrs is ignored: -addr is a Unix socket, and identity headers are trusted only on it")
+		}
+	} else {
+		cidrs, err := c.trustedProxies()
+		if err != nil {
 			return nil, err
 		}
+		h.TrustedProxies = cidrs
+		for _, p := range cidrs {
+			if auth.HasLoopback(p) {
+				slog.Warn("proxy mode trusts identity headers from loopback over TCP: anyone allowed to port-forward to this pod "+
+					"(pods/portforward in its namespace) arrives from loopback and can claim any identity. Serve the web listener "+
+					"on a Unix socket shared with the SSO proxy instead (-addr unix:///var/run/kubesentry/web.sock; the Helm chart does this)",
+					"cidr", p.String())
+				break
+			}
+		}
+		for _, p := range cidrs {
+			if auth.AnyAddress(p) {
+				slog.Warn("-auth-allow-any-proxy: identity headers are trusted from every address; only the network keeps clients from claiming any identity", "cidr", p.String())
+				break
+			}
+		}
+	}
+	if c.authGroupMapFile != "" {
+		gm, err := auth.LoadGroupMap(c.authGroupMapFile)
+		if err != nil {
+			return nil, err
+		}
+		h.GroupMap = gm
 	}
 	if c.apiToken == "" {
 		return h, nil

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
 
 	"github.com/ByronGary/kubesentry/internal/auth"
 )
@@ -22,8 +23,67 @@ var (
 	errNoAuthorizer = errors.New("no authorizer configured")
 )
 
+// authzMemo is one request's authorization answers. Every lookup of a
+// request goes through it, so the response cache's key and the handler's
+// filter see the same scope even when the authorizer's own cache changes
+// in between (an entry expires, a recheck forgets it, a grant lands). It
+// also records whether any lookup failed: such a response is degraded
+// (fail closed) and must not be cached.
+type authzMemo struct {
+	mu      sync.Mutex
+	scopes  map[auth.Capability]scopeAnswer
+	allowed map[allowedKey]allowedAnswer
+	failed  bool
+}
+
+type scopeAnswer struct {
+	s   auth.Scope
+	err error
+}
+
+type allowedKey struct {
+	c  auth.Capability
+	ns string
+}
+
+type allowedAnswer struct {
+	ok  bool
+	err error
+}
+
+type authzMemoKey struct{}
+
+// withAuthzMemo gives each request its own authzMemo. It goes inside
+// WithAuthentication and outside the routes (and so the response cache).
+func withAuthzMemo(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authzMemoFrom(r.Context()) == nil {
+			r = r.WithContext(context.WithValue(r.Context(), authzMemoKey{}, &authzMemo{}))
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authzMemoFrom(ctx context.Context) *authzMemo {
+	m, _ := ctx.Value(authzMemoKey{}).(*authzMemo)
+	return m
+}
+
+// authzFailed reports whether an authorization lookup of this request
+// failed, so its response reflects a denial that may not be real.
+func authzFailed(ctx context.Context) bool {
+	m := authzMemoFrom(ctx)
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failed
+}
+
 // scopeOf returns where the caller holds c. Unrestricted identities hold
-// everything without asking a.
+// everything without asking a. Within one request the first answer for c
+// is the answer.
 func scopeOf(ctx context.Context, a auth.Authorizer, c auth.Capability) (auth.Scope, error) {
 	id, ok := auth.FromContext(ctx)
 	if !ok {
@@ -32,10 +92,35 @@ func scopeOf(ctx context.Context, a auth.Authorizer, c auth.Capability) (auth.Sc
 	if id.Unrestricted {
 		return auth.Scope{All: true}, nil
 	}
-	if a == nil {
-		return auth.Scope{}, errNoAuthorizer
+	m := authzMemoFrom(ctx)
+	if m != nil {
+		m.mu.Lock()
+		ans, hit := m.scopes[c]
+		m.mu.Unlock()
+		if hit {
+			return ans.s, ans.err
+		}
 	}
-	return a.Scope(ctx, id, c)
+	var ans scopeAnswer
+	if a == nil {
+		ans.err = errNoAuthorizer
+	} else {
+		ans.s, ans.err = a.Scope(ctx, id, c)
+	}
+	if m == nil {
+		return ans.s, ans.err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prev, hit := m.scopes[c]; hit { // a concurrent lookup answered first
+		return prev.s, prev.err
+	}
+	if m.scopes == nil {
+		m.scopes = map[auth.Capability]scopeAnswer{}
+	}
+	m.scopes[c] = ans
+	m.failed = m.failed || ans.err != nil
+	return ans.s, ans.err
 }
 
 // allowed reports whether the caller holds c in namespace ns ("" for
@@ -56,10 +141,39 @@ func allowedErr(ctx context.Context, a auth.Authorizer, c auth.Capability, ns st
 	if id.Unrestricted {
 		return true, nil
 	}
-	if a == nil {
-		return false, errNoAuthorizer
+	if !c.Namespaced {
+		ns = ""
 	}
-	return a.Allowed(ctx, id, c, ns)
+	key := allowedKey{c, ns}
+	m := authzMemoFrom(ctx)
+	if m != nil {
+		m.mu.Lock()
+		ans, hit := m.allowed[key]
+		m.mu.Unlock()
+		if hit {
+			return ans.ok, ans.err
+		}
+	}
+	var ans allowedAnswer
+	if a == nil {
+		ans.err = errNoAuthorizer
+	} else {
+		ans.ok, ans.err = a.Allowed(ctx, id, c, ns)
+	}
+	if m == nil {
+		return ans.ok, ans.err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prev, hit := m.allowed[key]; hit {
+		return prev.ok, prev.err
+	}
+	if m.allowed == nil {
+		m.allowed = map[allowedKey]allowedAnswer{}
+	}
+	m.allowed[key] = ans
+	m.failed = m.failed || ans.err != nil
+	return ans.ok, ans.err
 }
 
 // filterByNamespace keeps the items whose namespace is in s. With s.All it
@@ -96,7 +210,7 @@ func ScopeKey(ctx context.Context, a auth.Authorizer, caps ...auth.Capability) (
 	h := sha256.New()
 	var names []string
 	for _, c := range caps {
-		h.Write([]byte(c.Verb + "/" + c.Group + "/" + c.Resource + "="))
+		h.Write([]byte(c.Verb + "/" + c.Group + "/" + c.Resource + "/" + strconv.FormatBool(c.Namespaced) + "="))
 		if !c.Namespaced {
 			ok, err := allowedErr(ctx, a, c, "")
 			if err != nil {
@@ -144,6 +258,8 @@ func CacheKeyFunc(a auth.Authorizer, version func() uint64, caps ...auth.Capabil
 		if version != nil {
 			v = version()
 		}
-		return r.URL.Path + "?" + r.URL.Query().Encode() + "\x00" + sk + "\x00" + strconv.FormatUint(v, 10), true
+		// The escaped path and the encoded query hold no raw "?" or NUL, so
+		// the parts cannot run into each other.
+		return r.URL.EscapedPath() + "?" + r.URL.Query().Encode() + "\x00" + sk + "\x00" + strconv.FormatUint(v, 10), true
 	}
 }

@@ -803,3 +803,89 @@ func BenchmarkAuthorizer(b *testing.B) {
 	b.Run("steady", steady(0)) // default deny TTL, 5m
 	b.Run("steady-deny1m", steady(time.Minute))
 }
+
+// ViewAudit and ViewClusterAudit share verb, group and resource; a cached
+// namespaced scope must never answer for the cluster-wide capability.
+func TestScopeKeyIncludesNamespaced(t *testing.T) {
+	rv := newFakeReviewer()
+	rv.grant("alice", "auditevents", "team-a")
+	a, _ := newAuthz(rv, fakeCandidates{"alice": {"team-a"}})
+	id := user("alice")
+	if s, err := a.Scope(ctx, id, ViewAudit); err != nil || !s.Has("team-a") {
+		t.Fatalf("namespaced audit scope = %+v, %v", s, err)
+	}
+	s, err := a.Scope(ctx, id, ViewClusterAudit)
+	if err != nil || s.All || len(s.Namespaces) != 0 {
+		t.Errorf("cluster-wide audit scope = %+v, %v; want nothing", s, err)
+	}
+	if ok, _ := a.Allowed(ctx, id, ViewClusterAudit, ""); ok {
+		t.Error("cluster-wide audit allowed from the namespaced grant")
+	}
+	if capKey(ViewAudit) == capKey(ViewClusterAudit) {
+		t.Error("capKey does not tell ViewAudit and ViewClusterAudit apart")
+	}
+}
+
+// readyCandidates proposes nothing until ready.
+type readyCandidates struct {
+	ready atomic.Bool
+	ns    []string
+}
+
+func (r *readyCandidates) Namespaces(string, []string, Capability) []string {
+	if !r.ready.Load() {
+		return nil
+	}
+	return r.ns
+}
+func (r *readyCandidates) Ready() bool { return r.ready.Load() }
+
+// A scope computed before the RBAC index exists is too narrow; caching it
+// would hide the user's namespaces for the whole TTL.
+func TestScopeWithoutCandidatesIsNotCached(t *testing.T) {
+	rv := newFakeReviewer()
+	rv.grant("alice", "pods", "team-a")
+	c := &readyCandidates{ns: []string{"team-a"}}
+	a, _ := newAuthz(rv, c)
+	id := user("alice")
+	if s, _ := a.Scope(ctx, id, ViewNamespace); len(s.Namespaces) != 0 {
+		t.Fatalf("scope before candidates = %+v", s)
+	}
+	c.ready.Store(true)
+	if s, _ := a.Scope(ctx, id, ViewNamespace); !s.Has("team-a") {
+		t.Errorf("scope once candidates are ready = %+v; the narrow one was cached", s)
+	}
+}
+
+// userBindingCandidates knows which users bindings name.
+type userBindingCandidates struct {
+	fakeCandidates
+	users map[string]bool
+}
+
+func (u userBindingCandidates) HasUserBindings(user string) bool { return u.users[user] }
+
+// With ShareByGroups, a user whom a binding names personally gets answers
+// of their own: their grant must not reach everyone in their groups.
+func TestShareByGroupsKeepsUserBindingsPersonal(t *testing.T) {
+	rv := newFakeReviewer()
+	rv.grant("alice", "pods", "secret") // a RoleBinding naming alice
+	cands := userBindingCandidates{fakeCandidates{"alice": {"secret"}, "bob": {"secret"}, "carol": {"secret"}}, map[string]bool{"alice": true}}
+	a, _ := newAuthz(rv, cands)
+	a.ShareByGroups = true
+	if s, _ := a.Scope(ctx, user("alice", "devs"), ViewNamespace); !s.Has("secret") {
+		t.Fatalf("alice's own grant = %+v", s)
+	}
+	if s, _ := a.Scope(ctx, user("bob", "devs"), ViewNamespace); s.Has("secret") {
+		t.Errorf("bob (same groups) got alice's personal grant: %+v", s)
+	}
+	if ok, _ := a.Allowed(ctx, user("bob", "devs"), ViewNamespace, "secret"); ok {
+		t.Error("bob allowed in alice's namespace")
+	}
+	// Users without personal bindings still share.
+	n := rv.total.Load()
+	a.Scope(ctx, user("carol", "devs"), ViewNamespace)
+	if rv.total.Load() != n {
+		t.Errorf("carol (same groups, no personal bindings) did not share bob's answers: %d -> %d reviews", n, rv.total.Load())
+	}
+}

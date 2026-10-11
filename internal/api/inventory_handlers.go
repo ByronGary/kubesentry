@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -72,29 +73,75 @@ func (s *Server) workloads(w http.ResponseWriter, r *http.Request) {
 type nodeScope struct {
 	nodes bool       // cluster-wide ViewNodes: full node details
 	pods  auth.Scope // ViewNamespace: which pods are listed under nodes
+	uses  nodeUses   // live pods' requests per node and namespace
 }
 
-func (s *Server) nodeScope(r *http.Request) nodeScope {
-	return nodeScope{nodes: s.can(r, auth.ViewNodes), pods: s.scope(r, auth.ViewNamespace)}
+// nodeUse is what the live pods of one namespace request on one node.
+type nodeUse struct {
+	cpuMilli, memBytes int64
+	pods               int
+}
+
+// nodeUses is node name → namespace → nodeUse.
+type nodeUses map[string]map[string]nodeUse
+
+// nodeUsesOf sums the live pods' app-container requests per node and
+// namespace, once per view, as detectors.SummarizeNodesWith sums them per
+// node.
+func nodeUsesOf(v *snapshot.View) nodeUses {
+	return v.Memo("api/nodeUses", func() any {
+		out := nodeUses{}
+		for i := range v.Inv.Pods {
+			p := &v.Inv.Pods[i]
+			if p.NodeName == "" || p.Phase == "Succeeded" || p.Phase == "Failed" {
+				continue
+			}
+			byNS := out[p.NodeName]
+			if byNS == nil {
+				byNS = map[string]nodeUse{}
+				out[p.NodeName] = byNS
+			}
+			u := byNS[p.Namespace]
+			u.pods++
+			for _, c := range p.Specs {
+				if !c.Init {
+					u.cpuMilli += c.CPURequestMilli
+					u.memBytes += c.MemoryRequestBytes
+				}
+			}
+			byNS[p.Namespace] = u
+		}
+		return out
+	}).(nodeUses)
+}
+
+func (s *Server) nodeScope(r *http.Request, v *snapshot.View) nodeScope {
+	return nodeScope{nodes: s.can(r, auth.ViewNodes), pods: s.scope(r, auth.ViewNamespace), uses: nodeUsesOf(v)}
 }
 
 // visibleNode returns n as the caller may see it, and false when they may
-// not see it at all. Pods are limited to the caller's namespaces (and
-// PodCount to the live ones among them). Without ViewNodes a node shows
-// only when it runs one of the caller's pods, and then by name only, with
-// status unknown. n is shared with the view and never modified.
+// not see it at all. Pods are limited to the caller's namespaces, and so are
+// PodCount and the requested CPU and memory, unless the caller sees every
+// namespace: totals over everyone's pods would describe namespaces they may
+// not see. Without ViewNodes a node shows only when it runs one of the
+// caller's pods, and then by name only, with status unknown. n is shared
+// with the view and never modified.
 func (ns nodeScope) visibleNode(n detectors.NodeSummary) (detectors.NodeSummary, bool) {
 	if ns.pods.All && ns.nodes {
 		return n, true
 	}
 	pods := make([]detectors.NodePod, 0, len(n.Pods))
-	live := 0
 	for _, p := range n.Pods {
 		if ns.pods.Has(p.Namespace) {
 			pods = append(pods, p)
-			if p.Phase != "Succeeded" && p.Phase != "Failed" {
-				live++
-			}
+		}
+	}
+	var mine nodeUse
+	for namespace, u := range ns.uses[n.Name] {
+		if ns.pods.Has(namespace) {
+			mine.cpuMilli += u.cpuMilli
+			mine.memBytes += u.memBytes
+			mine.pods += u.pods
 		}
 	}
 	if !ns.nodes {
@@ -103,11 +150,12 @@ func (ns nodeScope) visibleNode(n detectors.NodeSummary) (detectors.NodeSummary,
 		}
 		return detectors.NodeSummary{
 			Name: n.Name, Status: detectors.StatusUnknown, Roles: []string{}, Pressure: []string{}, Taints: []string{},
-			Pods: pods, PodCount: live,
+			Pods: pods, PodCount: mine.pods,
 		}, true
 	}
 	out := n
-	out.Pods, out.PodCount = pods, live
+	out.Pods, out.PodCount = pods, mine.pods
+	out.CPURequestedMilli, out.MemoryRequestedBytes = mine.cpuMilli, mine.memBytes
 	return out, true
 }
 
@@ -125,7 +173,7 @@ func (s *Server) nodes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sc := s.nodeScope(r)
+	sc := s.nodeScope(r, v)
 	if summary {
 		items := make([]nodeOut, 0, len(v.Nodes))
 		for _, n := range v.Nodes {
@@ -165,7 +213,7 @@ func (s *Server) node(w http.ResponseWriter, r *http.Request) {
 	}).(map[string]int)
 	i, found := byName[name]
 	if found {
-		if n, ok := s.nodeScope(r).visibleNode(v.Nodes[i]); ok {
+		if n, ok := s.nodeScope(r, v).visibleNode(v.Nodes[i]); ok {
 			writeJSON(w, http.StatusOK, n)
 			return
 		}
@@ -331,9 +379,10 @@ var securitySources = map[string]string{
 	snapshot.SourceServices: "services", snapshot.SourceIngresses: "ingresses",
 }
 
-// security lists risks in the caller's namespaces: pod specs, namespaced
-// RBAC, Pod Security labels and exposure, plus cluster-wide RBAC findings
-// with ViewClusterRBAC. ?view=summary returns the counts and the most severe
+// security lists risks in the caller's namespaces: pod specs, Pod Security
+// labels and exposure, namespaced RBAC where they hold ViewRBAC (list
+// rolebindings), plus cluster-wide RBAC findings with ViewClusterRBAC. The
+// counts follow the same gates. ?view=summary returns the counts and the most severe
 // findings; otherwise findings are paged. A source that could not be read
 // skips its checks and adds a warning instead of failing the page.
 func (s *Server) security(w http.ResponseWriter, r *http.Request) {
@@ -347,10 +396,17 @@ func (s *Server) security(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sc := s.scope(r, auth.ViewNamespace)
+	// RBAC findings name subjects and roles: in a namespace they need what
+	// kubectl get rolebindings needs there, cluster-wide ClusterRoleBinding
+	// access. Listing pods is not enough.
+	rbac := s.scope(r, auth.ViewRBAC)
 	clusterRBAC := s.can(r, auth.ViewClusterRBAC)
 	visible := func(row *keyed[detectors.SecurityFinding]) bool {
-		if row.ns == "" {
+		switch {
+		case row.ns == "":
 			return clusterRBAC
+		case row.v.Category == "rbac":
+			return rbac.Has(row.ns)
 		}
 		return sc.Has(row.ns)
 	}
@@ -483,6 +539,12 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 	}
 	v, ok := s.view(w, r)
 	if !ok {
+		return
+	}
+	// A namespace without pods in the view is 404 before any authorization
+	// lookup, with the same body as one the caller may not see.
+	if ns != "" && !slices.Contains(v.NamespacesWithPods, ns) {
+		writeError(w, http.StatusNotFound, "no pods in namespace "+ns)
 		return
 	}
 	sc := s.scope(r, auth.ViewNamespace)

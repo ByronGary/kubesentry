@@ -57,7 +57,7 @@ var ampHost = regexp.MustCompile(`^aps-workspaces\.[a-z0-9-]+\.amazonaws\.com(\.
 func Probe(ctx context.Context, baseURL string, client *http.Client) (BuildInfo, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return BuildInfo{}, fmt.Errorf("not an http(s) URL: %q", baseURL)
+		return BuildInfo{}, fmt.Errorf("not an http(s) URL: %q", Redact(baseURL))
 	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}

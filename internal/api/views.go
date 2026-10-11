@@ -81,8 +81,18 @@ func (s *Server) prepareAuthz(r *http.Request) {
 	_, _ = s.viewProvider().View(ctx)
 }
 
+// reportsCurrent reports whether the view provider can name its current
+// view without building one (snapshot.Manager); only then are responses
+// cached.
+func (s *Server) reportsCurrent() bool {
+	_, ok := s.Views.(interface{ Current() *snapshot.View })
+	return ok
+}
+
 // currentVersion is the version of the view being served, for response cache
-// keys; ok is false when the provider cannot say without building one.
+// keys; ok is false when the provider cannot say without building one, and
+// before the first view exists (scopes computed then lack the RBAC index's
+// candidates, so nothing is cached).
 func (s *Server) currentVersion() (uint64, bool) {
 	c, ok := s.Views.(interface{ Current() *snapshot.View })
 	if !ok {
@@ -91,11 +101,12 @@ func (s *Server) currentVersion() (uint64, bool) {
 	if v := c.Current(); v != nil {
 		return v.Version, true
 	}
-	return 0, true
+	return 0, false
 }
 
-// scope returns where the caller holds c. A failed check denies: the caller
-// sees nothing rather than an error.
+// scope returns where the caller holds c, as resolved once for this request
+// (see authzMemo). A failed check denies: the caller sees nothing rather
+// than an error, and the response is not cached.
 func (s *Server) scope(r *http.Request, c auth.Capability) auth.Scope {
 	sc, err := scopeOf(r.Context(), s.Authorizer, c)
 	if err != nil {

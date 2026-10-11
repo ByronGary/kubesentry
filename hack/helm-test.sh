@@ -115,6 +115,10 @@ echo "== refused configurations"
 refuses guardrail-memory-replicas --set replicas=2 --set audit.sources.webhook.enabled=true
 # Proxy mode must know which addresses may send identity headers.
 refuses guardrail-proxy-cidrs --set auth.mode=proxy
+# ...and not every address, unless the operator says the network ensures it.
+refuses guardrail-proxy-any-cidr --set auth.mode=proxy --set 'auth.trustedProxyCIDRs={10.0.0.0/8,0.0.0.0/0}'
+# Identity headers must be ones oauth2-proxy sets and strips, unless explicitly allowed.
+refuses schema-custom-user-header --set auth.userHeader=X-Remote-User
 # The CloudWatch reader needs a log group, from the cluster name or explicitly.
 refuses guardrail-cloudwatch-group --set audit.sources.cloudwatch.enabled=true
 # The schema rejects values the server would not understand.

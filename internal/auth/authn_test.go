@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -108,6 +109,85 @@ func TestHeaderAuthenticatorRejects(t *testing.T) {
 	r.Header.Set("X-Forwarded-Email", "alice@example.com")
 	if _, ok := h.Authenticate(r); ok {
 		t.Error("accepted without trusted proxies")
+	}
+}
+
+// A proxy sets the user header once; two values mean something else added
+// one, and picking either would trust it.
+func TestHeaderAuthenticatorRefusesRepeatedUserHeader(t *testing.T) {
+	h := proxyAuthn(t)
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "127.0.0.1:1"
+	r.Header.Add("X-Forwarded-Email", "alice@example.com")
+	r.Header.Add("X-Forwarded-Email", "platform-admin@example.com")
+	if id, ok := h.Authenticate(r); ok {
+		t.Errorf("repeated user header accepted as %+v", id)
+	}
+}
+
+// Platform principal prefixes (system:, eks:, and any the policy adds) are
+// not the identity provider's to claim; the admin's group map may.
+func TestHeaderAuthenticatorReservedPrefixes(t *testing.T) {
+	h := proxyAuthn(t)
+	h.GroupMap = map[string][]string{"ops": {"eks:cluster-admins"}}
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "127.0.0.1:1"
+	r.Header.Set("X-Forwarded-Email", "alice@example.com")
+	r.Header.Set("X-Forwarded-Groups", "eks:node-manager,system:masters,okta:admins,ops")
+	id, ok := h.Authenticate(r)
+	if !ok {
+		t.Fatal("rejected")
+	}
+	want := []string{"okta:admins", "ops", "eks:cluster-admins", "system:authenticated"}
+	if !reflect.DeepEqual(id.Groups, want) {
+		t.Errorf("groups = %v, want %v", id.Groups, want)
+	}
+	h.ReservedPrefixes = []string{"eks:", "okta:"}
+	id, _ = h.Authenticate(r)
+	if want := []string{"ops", "eks:cluster-admins", "system:authenticated"}; !reflect.DeepEqual(id.Groups, want) {
+		t.Errorf("with okta: reserved, groups = %v, want %v", id.Groups, want)
+	}
+	for _, user := range []string{"eks:node-manager", "system:admin", "okta:robot"} {
+		r.Header.Set("X-Forwarded-Email", user)
+		if id, ok := h.Authenticate(r); ok {
+			t.Errorf("user %q accepted as %+v", user, id)
+		}
+	}
+}
+
+// With TrustProxyConn only connections the proxy alone can open (a Unix
+// socket shared with the sidecar) carry identity: kubectl port-forward and
+// a DNS-rebinding page behind it arrive over TCP from loopback.
+func TestHeaderAuthenticatorProxyConnOnly(t *testing.T) {
+	h := HeaderAuthenticator{UserHeader: "X-Forwarded-Email", GroupsHeader: "X-Forwarded-Groups", TrustProxyConn: true,
+		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}} // ignored with TrustProxyConn
+	req := func(proxyConn bool) *http.Request {
+		r := httptest.NewRequest("GET", "http://rebind.attacker.example:8080/api/v1/pods", nil)
+		r.RemoteAddr = "127.0.0.1:40000"
+		r.Header.Set("X-Forwarded-Email", "platform-admin@corp.example")
+		if proxyConn {
+			r = r.WithContext(WithProxyConn(r.Context()))
+			r.RemoteAddr = "@"
+		}
+		return r
+	}
+	if id, ok := h.Authenticate(req(false)); ok {
+		t.Errorf("loopback TCP accepted as %+v", id)
+	}
+	if id, ok := h.Authenticate(req(true)); !ok || id.User != "platform-admin@corp.example" {
+		t.Errorf("socket connection = %+v, %v", id, ok)
+	}
+}
+
+func TestProxyCIDRHelpers(t *testing.T) {
+	for cidr, want := range map[string][2]bool{ // AnyAddress, HasLoopback
+		"0.0.0.0/0": {true, true}, "::/0": {true, true}, "127.0.0.1/32": {false, true}, "127.0.0.2/32": {false, true},
+		"::1/128": {false, true}, "10.0.0.0/8": {false, false}, "fd00::/8": {false, false},
+	} {
+		p := netip.MustParsePrefix(cidr)
+		if got := [2]bool{AnyAddress(p), HasLoopback(p)}; got != want {
+			t.Errorf("%s: any, loopback = %v, want %v", cidr, got, want)
+		}
 	}
 }
 

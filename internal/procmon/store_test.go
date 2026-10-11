@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -252,6 +254,105 @@ func TestDecodeReport(t *testing.T) {
 	r.Body = http.MaxBytesReader(httptest.NewRecorder(), r.Body, 10)
 	if _, err := DecodeReport(r, 1<<20); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("MaxBytesReader: %v", err)
+	}
+}
+
+// The process list is streamed: decoding stops at the limit, whatever the
+// spelling of the key, and the rest of the report decodes as before.
+func TestDecodeReportProcessLimit(t *testing.T) {
+	req := func(body string) *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/agent/report", strings.NewReader(body))
+	}
+	three := `[{"pid":1,"name":"a"},{"pid":2},{"pid":3}]`
+	for name, tc := range map[string]struct {
+		body  string
+		max   int
+		want  error
+		procs int
+	}{
+		"at the limit":         {`{"node":"n","processes":` + three + `}`, 3, nil, 3},
+		"over the limit":       {`{"node":"n","processes":` + three + `}`, 2, ErrTooLarge, 0},
+		"other spelling":       {`{"Node":"n","PROCESSES":` + three + `}`, 2, ErrTooLarge, 0},
+		"null processes":       {`{"node":"n","processes":null}`, 2, nil, 0},
+		"no processes":         {`{"node":"n","time":"2026-10-11T12:00:00Z","extra":{"x":[1,2]}}`, 2, nil, 0},
+		"processes twice":      {`{"node":"n","processes":[],"processes":[]}`, 2, ErrInvalidReport, 0},
+		"processes not a list": {`{"node":"n","processes":{"pid":1}}`, 2, ErrInvalidReport, 0},
+		"not an object":        {`[1,2]`, 2, ErrInvalidReport, 0},
+		"null report":          {`null`, 2, ErrInvalidReport, 0},
+		"bad element":          {`{"node":"n","processes":[{"pid":"x"}]}`, 2, ErrInvalidReport, 0},
+	} {
+		got, err := DecodeReportMax(req(tc.body), 1<<20, tc.max)
+		if !errors.Is(err, tc.want) && !(tc.want == nil && err == nil) {
+			t.Errorf("%s: err = %v, want %v", name, err, tc.want)
+			continue
+		}
+		if err == nil && (got.Node != "n" || len(got.Processes) != tc.procs) {
+			t.Errorf("%s: node %q, %d processes", name, got.Node, len(got.Processes))
+		}
+	}
+	got, _ := DecodeReportMax(req(`{"node":"n","time":"2026-10-11T12:00:00Z","processes":`+three+`}`), 1<<20, 3)
+	if got.Time.IsZero() || got.Processes[0].Name != "a" || got.Processes[2].PID != 3 {
+		t.Errorf("decoded %+v", got)
+	}
+}
+
+// A million tiny entries stop at the limit instead of becoming a million
+// structs first.
+func TestDecodeReportStopsEarly(t *testing.T) {
+	var body bytes.Buffer
+	body.WriteString(`{"node":"n","processes":[`)
+	body.WriteString(strings.Repeat("{},", 1_000_000-1))
+	body.WriteString(`{}]}`)
+	r := httptest.NewRequest(http.MethodPost, "/agent/report", &body)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := DecodeReportMax(r, 8<<20, DefaultMaxProcesses)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 32<<20 {
+		t.Errorf("allocated %d MiB before refusing", alloc>>20)
+	}
+}
+
+// Stored processes are bounded by bytes as well as by node count: inventing
+// node names cannot grow the store without bound.
+func TestStoreBoundedByBytes(t *testing.T) {
+	st := NewStoreWithOptions(StoreOptions{MaxBytes: 64 << 10})
+	now := time.Unix(10_000, 0)
+	st.Now = func() time.Time { return now }
+	long := strings.Repeat("x", 400)
+	report := func(node string) Report {
+		var procs []Process
+		for i := 0; i < 20; i++ {
+			procs = append(procs, Process{PID: i, Name: "p", Cmdline: long, PodUID: node + "-pod"})
+		}
+		return Report{Node: node, Processes: procs}
+	}
+	for i := 0; i < 100; i++ {
+		now = now.Add(time.Second)
+		st.Update(report(fmt.Sprintf("node-%03d", i)))
+		if b := st.Bytes(); b > 64<<10 {
+			t.Fatalf("after %d nodes the store holds %d bytes, over its 64 KiB bound", i+1, b)
+		}
+	}
+	// The newest nodes are kept, the oldest went first.
+	if _, ok := st.ForPod("node-099-pod"); !ok {
+		t.Error("the latest node was evicted")
+	}
+	if _, ok := st.ForPod("node-000-pod"); ok {
+		t.Error("the oldest node was kept")
+	}
+	// Replacing a node's report does not count it twice.
+	before := st.Bytes()
+	st.Update(report("node-099"))
+	if st.Bytes() != before {
+		t.Errorf("re-reporting changed the total from %d to %d", before, st.Bytes())
+	}
+	if o := NewStore().Options(); o.MaxBytes != 256<<20 {
+		t.Errorf("default MaxBytes = %d", o.MaxBytes)
 	}
 }
 

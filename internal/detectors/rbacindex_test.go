@@ -58,6 +58,14 @@ func TestRBACIndex(t *testing.T) {
 		}
 	}
 
+	// Personal bindings, for -authz-share-by-groups: any binding naming the
+	// user counts, whatever it grants.
+	for user, want := range map[string]bool{"alice": true, "system:serviceaccount:ci:bot": true, "bob": false, "team-a": false, "": false} {
+		if got := x.HasUserBindings(user); got != want {
+			t.Errorf("HasUserBindings(%q) = %v, want %v", user, got, want)
+		}
+	}
+
 	if !x.ClusterWide("dave", []string{"auditors"}, auth.ViewNamespace) || x.ClusterWide("dave", []string{"auditors"}, auth.ViewNodes) {
 		t.Error("auditors list pods cluster-wide, not nodes")
 	}

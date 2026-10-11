@@ -93,9 +93,25 @@ func (s *Server) getPVC(ctx context.Context, v *snapshot.View, ns, name string) 
 	return nil, model.ErrNotFound
 }
 
+// podInView reports whether the view holds the pod, from an index built
+// once per view.
+func podInView(v *snapshot.View, ns, name string) bool {
+	idx := v.Memo("api/podIndex", func() any {
+		m := make(map[[2]string]struct{}, len(v.Inv.Pods))
+		for i := range v.Inv.Pods {
+			m[[2]string{v.Inv.Pods[i].Namespace, v.Inv.Pods[i].Name}] = struct{}{}
+		}
+		return m
+	}).(map[[2]string]struct{})
+	_, ok := idx[[2]string{ns, name}]
+	return ok
+}
+
 // visiblePod resolves the pod named by the path for a caller who may see its
 // namespace. It answers 400, 404 (also for a namespace the caller may not
-// see, so existence does not leak) or 502 and returns false otherwise.
+// see, so existence does not leak) or 502 and returns false otherwise. A pod
+// the current view does not hold is 404 before any authorization review, so
+// made-up namespace names cost nothing; the body is the same either way.
 func (s *Server) visiblePod(w http.ResponseWriter, r *http.Request) (*model.Pod, *snapshot.View, bool) {
 	ns, name := r.PathValue("namespace"), r.PathValue("name")
 	if !validName(ns) || !validName(name) {
@@ -106,7 +122,7 @@ func (s *Server) visiblePod(w http.ResponseWriter, r *http.Request) (*model.Pod,
 	if !ok {
 		return nil, nil, false
 	}
-	if !allowed(r.Context(), s.Authorizer, auth.ViewNamespace, ns) {
+	if !podInView(v, ns, name) || !allowed(r.Context(), s.Authorizer, auth.ViewNamespace, ns) {
 		writeError(w, http.StatusNotFound, "pod not found")
 		return nil, nil, false
 	}

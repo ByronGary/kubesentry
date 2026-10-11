@@ -35,7 +35,8 @@ type promState struct {
 	client  *prom.Client
 	probe   *http.Client // signs for AMP; nil uses Probe's default
 	scanner *prom.LeakScanner
-	info    api.PrometheusInfo
+	info    api.PrometheusInfo // info.URL never carries user info
+	rawURL  string             // as configured, user info included: only for probing
 }
 
 func (p *promSource) MetricsAvailable() bool { return p.cur.Load() != nil }
@@ -61,6 +62,22 @@ func (p *promSource) ContainerMemoryLimits(ctx context.Context) (map[model.Conta
 		return nil, err
 	}
 	return st.client.ContainerMemoryLimits(ctx)
+}
+
+func (p *promSource) ContainerMemoryIn(ctx context.Context, namespaces []string, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	st, err := p.state()
+	if err != nil {
+		return nil, err
+	}
+	return st.client.ContainerMemoryIn(ctx, namespaces, lookback, step)
+}
+
+func (p *promSource) ContainerMemoryLimitsIn(ctx context.Context, namespaces []string) (map[model.ContainerKey]float64, error) {
+	st, err := p.state()
+	if err != nil {
+		return nil, err
+	}
+	return st.client.ContainerMemoryLimitsIn(ctx, namespaces)
 }
 
 func (p *promSource) PodMemory(ctx context.Context, ns, pod string, lookback, step time.Duration) ([]model.ContainerSeries, map[model.ContainerKey]float64, error) {
@@ -147,9 +164,13 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 	if err != nil {
 		return nil, err
 	}
-	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}}
+	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}, rawURL: url}
 	if tr != nil {
 		st.probe = &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	}
+	if c.HasURLCredentials() {
+		slog.Warn("-prometheus-url carries credentials (user:password@); they are sent as basic auth but kept out of logs and /info. "+
+			"Prefer PROMETHEUS_TOKEN (chart: prometheus.bearerTokenSecret), which stays out of the process arguments", "url", c.BaseURL())
 	}
 	st.scanner = prom.NewLeakScanner(c, s.pods, s.scan)
 	go st.scanner.Run(ctx)
@@ -161,8 +182,9 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 // describe probes a configured Prometheus for its flavour, version and
 // retention, for /info. A failed probe only logs: queries may still work.
 func (s promSetup) describe(ctx context.Context, p *promSource, st *promState) {
-	bi, err := prom.Probe(ctx, st.info.URL, st.probe)
+	bi, err := prom.Probe(ctx, st.rawURL, st.probe)
 	if err != nil {
+		// net/http masks the password in the URLs of its errors.
 		slog.Warn("prometheus probe failed; queries may still work", "url", st.info.URL, "err", err)
 		return
 	}

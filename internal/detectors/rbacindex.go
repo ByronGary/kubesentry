@@ -137,7 +137,22 @@ func (x *RBACIndex) ClusterWide(user string, groups []string, c auth.Capability)
 	return false
 }
 
-var _ auth.Candidates = (*RBACIndex)(nil)
+// HasUserBindings reports whether any RoleBinding or ClusterRoleBinding names
+// the user (service accounts included, as system:serviceaccount:ns:name) as a
+// subject. With -authz-share-by-groups such a user's access decisions are
+// cached per user, never shared with everyone in the same groups.
+func (x *RBACIndex) HasUserBindings(user string) bool {
+	if user == "" {
+		return false
+	}
+	k := "u:" + user
+	return len(x.ns[k]) > 0 || len(x.cluster[k]) > 0
+}
+
+var (
+	_ auth.Candidates   = (*RBACIndex)(nil)
+	_ auth.UserBindings = (*RBACIndex)(nil)
+)
 
 // grants reports whether a role allows the capability, memoised per role.
 func (x *RBACIndex) grants(role string, c auth.Capability) bool {

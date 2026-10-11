@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -41,10 +42,15 @@ func (s *Server) agentReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAgentBody)
-	rep, err := procmon.DecodeReport(r, maxAgentBody)
+	// Decoding stops at the store's per-node cap, before allocating more.
+	maxProcs := maxAgentProcesses
+	if o, ok := s.Processes.(storeOptions); ok && o.Options().MaxProcessesPerNode > 0 {
+		maxProcs = o.Options().MaxProcessesPerNode
+	}
+	rep, err := procmon.DecodeReportMax(r, maxAgentBody, maxProcs)
 	switch {
 	case errors.Is(err, procmon.ErrTooLarge):
-		writeError(w, http.StatusRequestEntityTooLarge, "report too large")
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("report too large: at most %d MiB and %d processes", maxAgentBody>>20, maxProcs))
 		return
 	case errors.Is(err, procmon.ErrUnsupportedEncoding):
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported content encoding: send plain or gzip JSON")
@@ -53,8 +59,8 @@ func (s *Server) agentReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid report")
 		return
 	}
-	if rep.Node == "" || len(rep.Node) > 253 || len(rep.Processes) > maxAgentProcesses {
-		writeError(w, http.StatusBadRequest, "report needs a node name and at most 20000 processes")
+	if rep.Node == "" || len(rep.Node) > 253 {
+		writeError(w, http.StatusBadRequest, "report needs a node name of at most 253 characters")
 		return
 	}
 	s.Processes.Update(rep)

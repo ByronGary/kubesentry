@@ -52,6 +52,24 @@ func (f fakeMetrics) ContainerMemoryLimits(context.Context) (map[model.Container
 	return f.limits, f.err
 }
 
+func (f fakeMetrics) ContainerMemoryIn(_ context.Context, namespaces []string, _, _ time.Duration) ([]model.ContainerSeries, error) {
+	in := map[string]bool{}
+	for _, ns := range namespaces {
+		in[ns] = true
+	}
+	var out []model.ContainerSeries
+	for _, s := range f.series {
+		if in[s.Key.Namespace] {
+			out = append(out, s)
+		}
+	}
+	return out, f.err
+}
+
+func (f fakeMetrics) ContainerMemoryLimitsIn(context.Context, []string) (map[model.ContainerKey]float64, error) {
+	return f.limits, f.err
+}
+
 func (f fakeMetrics) PodMemory(_ context.Context, ns, pod string, _, _ time.Duration) ([]model.ContainerSeries, map[model.ContainerKey]float64, error) {
 	if f.err != nil {
 		return nil, nil, f.err

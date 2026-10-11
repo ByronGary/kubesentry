@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -32,14 +33,16 @@ const (
 var allActors = map[string]bool{"user": true, "serviceaccount": true, "system": true}
 
 // guard requires "Authorization: Bearer <token>" when token is non-empty.
+// It compares fixed-length digests in constant time, so neither the token's
+// content nor its length shows in the response time.
 func guard(token string, next http.HandlerFunc) http.HandlerFunc {
 	if token == "" {
 		return next
 	}
-	want := []byte("Bearer " + token)
+	want := sha256.Sum256([]byte("Bearer " + token))
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
+		got := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -142,12 +145,14 @@ func (s *Server) auditEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.auditScope(r, &q)
-	q.Limit = limit + 1 // one more tells whether there is a next page
-	items, err := s.auditStore().Query(r.Context(), q)
-	if err != nil {
-		upstreamError(w, "audit store", err)
-		return
+	var items []audit.Event
+	if s.auditScope(r, &q) {
+		q.Limit = limit + 1 // one more tells whether there is a next page
+		items, err = s.auditStore().Query(r.Context(), q)
+		if err != nil {
+			upstreamError(w, "audit store", err)
+			return
+		}
 	}
 	resp := auditEventsResponse{Items: items}
 	if len(items) > limit {
@@ -161,14 +166,26 @@ func (s *Server) auditEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// auditScope narrows q to what the caller may read.
-func (s *Server) auditScope(r *http.Request, q *audit.Query) {
+// auditScope narrows q to what the caller may read. It returns false when
+// that is nothing at all (no namespace and no cluster-scoped events): the
+// caller then answers empty without asking the store, so a query scoped to
+// nothing never reaches a store (or its cache) at all.
+func (s *Server) auditScope(r *http.Request, q *audit.Query) bool {
 	s.prepareAuthz(r)
 	sc := s.scope(r, auth.ViewAudit)
-	if !sc.All {
-		q.Namespaces = sc.Namespaces
-		q.ClusterScoped = s.can(r, auth.ViewClusterAudit)
+	if sc.All {
+		q.Namespaces, q.ClusterScoped = nil, false
+		return true
 	}
+	held := make(map[string]bool, len(sc.Namespaces))
+	for ns, ok := range sc.Namespaces {
+		if ok && ns != "" {
+			held[ns] = true
+		}
+	}
+	q.Namespaces = held // never nil: nil would mean every namespace
+	q.ClusterScoped = s.can(r, auth.ViewClusterAudit)
+	return len(held) > 0 || q.ClusterScoped
 }
 
 type auditSummaryResponse struct {
@@ -192,11 +209,13 @@ func (s *Server) auditSummary(w http.ResponseWriter, r *http.Request) {
 	if params.Get("includeReads") == "" {
 		q.IncludeReads = true
 	}
-	s.auditScope(r, &q)
-	sum, err := s.auditStore().Summarize(r.Context(), q)
-	if err != nil {
-		upstreamError(w, "audit store", err)
-		return
+	sum := audit.Summarize(nil)
+	if s.auditScope(r, &q) {
+		sum, err = s.auditStore().Summarize(r.Context(), q)
+		if err != nil {
+			upstreamError(w, "audit store", err)
+			return
+		}
 	}
 	window, _ := durationParam(r, "since", defaultAuditWin, time.Minute, 365*24*time.Hour) // already validated
 	writeJSON(w, http.StatusOK, auditSummaryResponse{Window: window.String(), Summary: sum})

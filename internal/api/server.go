@@ -82,6 +82,16 @@ type Server struct {
 	Authorizer auth.Authorizer
 	// SignOutURL is where the UI's "Sign out" goes (proxy mode).
 	SignOutURL string
+	// AllowedHosts, if set, are the Host header patterns (ParseAllowedHosts)
+	// the web listener answers; other Hosts get 403. Nil means
+	// LoopbackHosts when Authenticator is auth.NoneAuthenticator (every
+	// local caller is trusted, so DNS rebinding must not reach it), else
+	// any Host.
+	AllowedHosts []string
+	// LongInflightPerIdentity caps the requests one identity may have in
+	// flight at once on the expensive routes (/oom, pod diagnostics, audit
+	// summary); more get 429 with Retry-After. Zero disables it.
+	LongInflightPerIdentity int
 
 	// ClusterInfo overrides what /info says about the cluster: a non-empty
 	// Name always wins, the rest fills in when the view knows nothing.
@@ -172,7 +182,11 @@ func (s *Server) Serve(p Parts) http.Handler {
 	mux := http.NewServeMux()
 	if p.Probes {
 		mux.HandleFunc("GET /healthz", s.healthz)
-		mux.HandleFunc("GET /readyz", s.readyz)
+		if p.Web {
+			mux.HandleFunc("GET /readyz", s.readyzStatus) // reachable by every UI user
+		} else {
+			mux.HandleFunc("GET /readyz", s.readyz)
+		}
 	}
 	if p.Metrics {
 		mux.Handle("GET /metrics", metricsHandler())
@@ -204,7 +218,7 @@ func (s *Server) Serve(p Parts) http.Handler {
 		if s.AccessLog != nil {
 			accessLog = WithAccessLog(s.AccessLog)
 		}
-		mux.Handle("/", Compose(WithRequestID(), accessLog, WithSecurityHeaders())(web))
+		mux.Handle("/", Compose(WithRequestID(), accessLog, WithSecurityHeaders(), WithAllowedHosts(s.allowedHosts()))(web))
 	}
 	return mux
 }
@@ -240,15 +254,17 @@ var cachedRoutes = map[string][]auth.Capability{
 	"GET /api/v1/nodes":        {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/nodes/{name}": {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/storage":      {auth.ViewNamespace, auth.ViewPVs, auth.ViewStorageClass},
-	"GET /api/v1/security":     {auth.ViewNamespace, auth.ViewClusterRBAC},
+	"GET /api/v1/security":     {auth.ViewNamespace, auth.ViewRBAC, auth.ViewClusterRBAC},
 	"GET /api/v1/map":          {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/certificates": {auth.ViewNamespace, auth.ViewClusterIssuer},
 }
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
 // over the route's capabilities and the view version. Other requests, and
-// every request while the provider cannot name its current view, are not
-// cached.
+// every request while the provider cannot name its current view (before the
+// first view exists, too), are not cached. The scope is looked up through
+// the request's authzMemo, so the handler filters by exactly the scope the
+// key names.
 func (s *Server) cacheKey(r *http.Request) (string, bool) {
 	caps := cachedRoutes[r.Pattern]
 	v, ok := s.currentVersion()
@@ -259,15 +275,21 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 }
 
 // route registers one API route with its per-route middleware: metrics,
-// timeout, ETag, the response cache (cachedRoutes only) and gzip.
+// timeout, the per-identity cap on expensive routes, ETag, the response
+// cache (cachedRoutes only) and gzip.
 func (s *Server) route(mux *http.ServeMux, pattern, name string, timeout time.Duration, h http.HandlerFunc) {
+	s.routeCapped(mux, pattern, name, timeout, nil, h)
+}
+
+// routeCapped is route with an extra limit inside the timeout (the
+// per-identity cap of the expensive routes), so a slot is held until the
+// handler has really finished.
+func (s *Server) routeCapped(mux *http.ServeMux, pattern, name string, timeout time.Duration, limit func(http.Handler) http.Handler, h http.HandlerFunc) {
 	var cache func(http.Handler) http.Handler
-	if s.ResponseCache != nil && len(cachedRoutes[pattern]) > 0 {
-		if _, ok := s.currentVersion(); ok {
-			cache = s.ResponseCache.Middleware
-		}
+	if s.ResponseCache != nil && len(cachedRoutes[pattern]) > 0 && s.reportsCurrent() {
+		cache = s.ResponseCache.Middleware
 	}
-	mux.Handle(pattern, Compose(WithMetrics(name), WithTimeout(timeout), WithETag(), cache, WithGzip())(h))
+	mux.Handle(pattern, Compose(WithMetrics(name), WithTimeout(timeout), limit, WithETag(), cache, WithGzip())(h))
 }
 
 func (s *Server) timeouts() (normal, long time.Duration) {
@@ -281,15 +303,18 @@ func (s *Server) timeouts() (normal, long time.Duration) {
 func (s *Server) apiRoutes() http.Handler {
 	mux := http.NewServeMux()
 	t, long := s.timeouts()
+	// One cap shared by the expensive routes: Prometheus range queries and
+	// audit aggregations, which one user could otherwise run many of at once.
+	expensive := WithIdentityInflight(s.LongInflightPerIdentity)
 	s.route(mux, "GET /api/v1/info", "info", t, s.info)
 	mux.Handle("POST /api/v1/auth/recheck", Compose(WithMetrics("auth_recheck"), WithTimeout(t))(http.HandlerFunc(s.recheck)))
 	s.route(mux, "GET /api/v1/pvcs/unused", "pvcs_unused", t, s.unusedPVCs)
-	s.route(mux, "GET /api/v1/oom", "oom", long, s.oom)
+	s.routeCapped(mux, "GET /api/v1/oom", "oom", long, expensive, s.oom)
 	s.route(mux, "GET /api/v1/pods", "pods", t, s.pods)
-	s.route(mux, "GET /api/v1/pods/{namespace}/{name}/diagnostics", "pod_diagnostics", long, s.podDiagnostics)
+	s.routeCapped(mux, "GET /api/v1/pods/{namespace}/{name}/diagnostics", "pod_diagnostics", long, expensive, s.podDiagnostics)
 	if s.Audit != nil {
 		s.route(mux, "GET /api/v1/audit/events", "audit_events", t, s.auditEvents)
-		s.route(mux, "GET /api/v1/audit/summary", "audit_summary", t, s.auditSummary)
+		s.routeCapped(mux, "GET /api/v1/audit/summary", "audit_summary", t, expensive, s.auditSummary)
 	}
 	if s.Processes != nil {
 		s.route(mux, "GET /api/v1/pods/{namespace}/{name}/processes", "pod_processes", t, s.podProcesses)
@@ -308,7 +333,7 @@ func (s *Server) apiRoutes() http.Handler {
 	if s.hasCerts() {
 		s.route(mux, "GET /api/v1/certificates", "certificates", t, s.certificates)
 	}
-	return mux
+	return withAuthzMemo(mux)
 }
 
 // ingestRoutes registers the routes that accept pushed data. Each keeps its

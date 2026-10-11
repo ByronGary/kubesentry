@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/detectors"
@@ -19,6 +20,13 @@ type (
 	leakReporter interface {
 		LeakReport() (report detectors.LeakReport, window time.Duration, ok bool)
 	}
+	// namespacedMetrics restricts the /oom queries to namespaces, for
+	// callers who may not see the whole cluster. A source without it serves
+	// such callers only the background leak report.
+	namespacedMetrics interface {
+		ContainerMemoryIn(ctx context.Context, namespaces []string, lookback, step time.Duration) ([]model.ContainerSeries, error)
+		ContainerMemoryLimitsIn(ctx context.Context, namespaces []string) (map[model.ContainerKey]float64, error)
+	}
 )
 
 // metrics returns the metrics source, or nil when there is none (yet).
@@ -32,11 +40,14 @@ func (s *Server) metrics() MetricsSource {
 	return s.Metrics
 }
 
-// prometheusInfo is /info's prometheus field.
+// prometheusInfo is /info's prometheus field. Its URL never carries user
+// info: every signed-in user reads it.
 func (s *Server) prometheusInfo() *PrometheusInfo {
 	if s.PrometheusInfo != nil {
 		if p := s.PrometheusInfo(); p != nil {
-			return p
+			out := *p
+			out.URL = prom.Redact(out.URL)
+			return &out
 		}
 	}
 	if s.metrics() != nil {

@@ -11,7 +11,7 @@ This guide installs kubesentry on an EKS cluster with the Helm chart in `charts/
 `charts/kubesentry/examples/values-eks.yaml` is the matching values file. Each section below explains one part of it.
 
 ```
-browser ──HTTPS──> ALB (internal, ACM cert) ──> pod:4180 oauth2-proxy ──loopback──> kubesentry :8080 (UI, /api)
+browser ──HTTPS──> ALB (internal, ACM cert) ──> pod:4180 oauth2-proxy ──unix socket──> kubesentry (UI, /api)    
                                                      │ OIDC                              │ informers, SubjectAccessReviews ──> EKS API server
                                                      └──> Okta / Entra ID / Cognito      │ SigV4 queries ──────────────────> AMP workspace
 node agents (DaemonSet) ──token──> kubesentry-ingest :8081 (every replica)              │ FilterLogEvents ────────────────> CloudWatch Logs
@@ -282,7 +282,11 @@ audit:
 
 ## 6. SSO with oauth2-proxy behind the ALB
 
-With `oauth2Proxy.enabled`, each pod runs an oauth2-proxy sidecar on port 4180. It is the only thing the web Service and the ALB reach. kubesentry listens on `127.0.0.1:8080` in proxy mode and accepts identity headers (`X-Forwarded-Email`, `X-Forwarded-Groups`) only from loopback. The sidecar strips any identity headers a client sends (`--skip-auth-strip-headers`). API calls without a session get 401 instead of a redirect (`--api-route=^/api/`).
+With `oauth2Proxy.enabled`, each pod runs an oauth2-proxy sidecar on port 4180. It is the only thing the web Service and the ALB reach. kubesentry has no TCP web port: in proxy mode it listens on a Unix socket, `/var/run/kubesentry/web.sock` (mode 0660), in an in-memory `emptyDir` only the two containers mount, and oauth2-proxy forwards to it (`--upstream=unix:///var/run/kubesentry/web.sock`; oauth2-proxy supports Unix socket upstreams since v7.6.0). Identity headers (`X-Forwarded-Email`, `X-Forwarded-Groups`) are trusted on that socket and nowhere else. A TCP listener trusting loopback would not do: `kubectl port-forward` arrives from loopback, so anyone allowed `pods/portforward` in the kubesentry namespace could claim any identity. The sidecar strips any identity headers a client sends (`--skip-auth-strip-headers`). API calls without a session get 401 instead of a redirect (`--api-route=^/api/`).
+
+- `X-Forwarded-Groups` is comma-separated (oauth2-proxy joins a user's groups with commas), so group names containing commas are not supported. A repeated `X-Forwarded-Email` is refused (401). IdP groups starting with a platform prefix (`system:`, `eks:`, or whatever `server.systemPrincipalPrefixes` lists) are dropped; groups your `auth.groupMap` produces are kept.
+- The chart's schema accepts only the headers oauth2-proxy sets and strips for `auth.userHeader` and `auth.groupsHeader`; set `auth.allowCustomHeaders: true` for an SSO proxy of your own.
+- `server.allowedHosts` (`-allowed-hosts`) optionally limits the Host names kubesentry answers, e.g. `[kubesentry.example.com]`.
 
 Secrets, created before installing:
 
@@ -460,7 +464,7 @@ Use prefixes for B and `groupMap` for A. Pick one per group, so the names stay e
 
 > **Caveat: EKS access *policies* are invisible to kubesentry.** Access policies such as `AmazonEKSViewPolicy` or `AmazonEKSClusterAdminPolicy` are associated with an IAM principal's access entry. EKS's authorizer applies them only to requests from that IAM principal's Kubernetes identity. A SubjectAccessReview for an SSO identity (an email and IdP groups) matches no IAM principal, so access policies grant it nothing. Only Kubernetes RBAC objects count. These are Roles and ClusterRoles bound to users or groups, including groups you attach to access entries with `--kubernetes-groups`. If a team's access today comes only from access policies, add an equivalent RoleBinding (for example `view` for `AmazonEKSViewPolicy`) for their group.
 
-**Many users, few groups.** With thousands of users who share a few dozen groups, set `auth.shareByGroups: true`. Reviews are then cached per RBAC-relevant group set rather than per user. This is only correct when no RoleBinding names an individual user. `auth.authzQPS` (default 200) caps how fast kubesentry sends reviews. Watch `kubesentry_authz_reviews_total` and the `KubesentryAuthzReviewErrors` alert.
+**Many users, few groups.** With thousands of users who share a few dozen groups, set `auth.shareByGroups: true`. Reviews are then cached per group set rather than per user. A user whom any RoleBinding or ClusterRoleBinding names personally is still cached on their own, so their grants never reach the rest of their groups; an authorizer that decides by user name outside RBAC (an EKS access entry for one IAM principal) is not visible to kubesentry, so with such entries leave this off. `auth.authzQPS` (default 200) caps how fast kubesentry sends reviews. Watch `kubesentry_authz_reviews_total` and the `KubesentryAuthzReviewErrors` alert.
 
 ## 8. Granting access to kubesentry's own data
 
@@ -537,7 +541,7 @@ With `egress.enabled`, the pods may reach only:
 - the cluster's service CIDR, since CNIs differ in whether they see the `kubernetes` Service's ClusterIP or the translated address
 - your VPC endpoints for STS, CloudWatch Logs and AMP
 
-`kubectl port-forward` does not cross the pod network, so the break-glass path keeps working under any policy.
+`kubectl port-forward` does not cross the pod network, so the break-glass path (token mode, port 8080) keeps working under any policy. With the sidecar there is no TCP port to forward to kubesentry itself: see the break-glass step in section 14.
 
 ## 10. The agent
 
@@ -617,6 +621,7 @@ These are starting points until the stress report in `test/stress` replaces them
 
 - **Memory:** the server sets GOMEMLIMIT to 90% of its memory limit, so the Go GC works harder near the limit instead of the pod being OOM-killed. Setting `GOMEMLIMIT` through `extraEnv` overrides it. Watch `kubesentry_snapshot_build_seconds` and container memory, then adjust.
 - **Users:** user count drives SubjectAccessReviews and CPU, not memory. Thousands of users sharing groups are cheap with `auth.shareByGroups`.
+- **Authorization cache and review rate:** each replica caches up to 100,000 access decisions (fixed; LRU), shared by all users. An active user needs about one entry per cluster-wide capability the UI checks (around 10), one scope per namespaced capability (pods, audit, processes, rolebindings), and one decision per namespace their RoleBindings propose for each of those: a user with 10 namespaces holds about 55 entries. Every entry is re-reviewed when it expires (`auth.authzCacheTTL`, default 5m), so the steady review rate is roughly *active users × entries per user ÷ TTL*: 1,000 such users need about 180 reviews/s, within the default `auth.authzQPS` of 200; 5,000 need about 900/s, and the cache (5,000 × 55 = 275,000 entries) no longer holds them, so evicted entries are reviewed again on the next request. At that scale use `auth.shareByGroups` (entries then scale with distinct group sets, not users), a longer `authzCacheTTL`, or a higher `authzQPS` if the API server has the headroom. Watch `kubesentry_authz_cache_total{result="miss"}` against `hit`, and `kubesentry_authz_reviews_total`.
 - **Audit volume:** this depends on the cluster's write rate and controllers. Count roughly 1–2 KB per stored event, indexes included. Measure the first day (`kubesentry_audit_ingested_total`) and size storage from that.
 - **Agents:** nodes with many thousands of processes need a higher agent memory limit. `agent.maxProcesses` caps what is sent.
 - **API Priority and Fairness:** `apf.enabled` gives kubesentry its own priority level, so its initial LIST burst after a restart queues against its own share.
@@ -671,5 +676,5 @@ helm rollback kubesentry <revision> -n kubesentry
 9. **Network policy:**
    - From a pod in another namespace, `curl kubesentry.kubesentry.svc:4180` times out.
    - Through the ALB the UI still works.
-10. **Break-glass:** `kubectl -n kubesentry port-forward deploy/kubesentry 8080` with the API token from `kubectl -n kubesentry get secret kubesentry-api -o jsonpath='{.data.token}' | base64 -d` reaches `/api/v1/info`. Store the token in your vault, or set `tokens.api.enabled: false` if you do not want one.
+10. **Break-glass:** with the sidecar, kubesentry listens only on the Unix socket inside the pod, so neither the token nor forged identity headers reach it from outside: `kubectl -n kubesentry port-forward deploy/kubesentry 8080` fails to connect. When SSO is down, `helm upgrade --reuse-values --set oauth2Proxy.enabled=false` switches to token mode on port 8080; then that port-forward with the API token from `kubectl -n kubesentry get secret kubesentry-api -o jsonpath='{.data.token}' | base64 -d` reaches `/api/v1/info`. Store the token in your vault, or set `tokens.api.enabled: false` if you do not want one.
 11. **Pod Security:** `kubectl label --dry-run=server --overwrite namespace kubesentry pod-security.kubernetes.io/enforce=restricted` prints no warnings.
