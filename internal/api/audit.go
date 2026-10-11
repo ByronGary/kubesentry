@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -119,6 +120,23 @@ func (s *Server) auditWebhook(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]int{"accepted": n})
 }
 
+// auditRetryAfter is the Retry-After of a 503 from an overloaded audit store.
+const auditRetryAfter = "5"
+
+// auditStoreError answers a failed audit store read: 503 with Retry-After
+// when the store is overloaded (its read slots stayed busy, or the query ran
+// past its time limit), so the caller hears back in seconds instead of when
+// the route or the SSO proxy times out; 502 otherwise.
+func auditStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, audit.ErrOverloaded) {
+		slog.Warn("audit store overloaded", "err", err)
+		w.Header().Set("Retry-After", auditRetryAfter)
+		writeError(w, http.StatusServiceUnavailable, "the audit store is overloaded; retry shortly")
+		return
+	}
+	upstreamError(w, "audit store", err)
+}
+
 type auditEventsResponse struct {
 	Count    int           `json:"count"`
 	Items    []audit.Event `json:"items"`
@@ -150,7 +168,7 @@ func (s *Server) auditEvents(w http.ResponseWriter, r *http.Request) {
 		q.Limit = limit + 1 // one more tells whether there is a next page
 		items, err = s.auditStore().Query(r.Context(), q)
 		if err != nil {
-			upstreamError(w, "audit store", err)
+			auditStoreError(w, err)
 			return
 		}
 	}
@@ -213,7 +231,7 @@ func (s *Server) auditSummary(w http.ResponseWriter, r *http.Request) {
 	if s.auditScope(r, &q) {
 		sum, err = s.auditStore().Summarize(r.Context(), q)
 		if err != nil {
-			upstreamError(w, "audit store", err)
+			auditStoreError(w, err)
 			return
 		}
 	}

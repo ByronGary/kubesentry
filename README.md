@@ -133,7 +133,7 @@ The most used; `docs/contracts.md` lists every flag, and `kubesentry -h` describ
 | `-audit-token` | | Bearer token the audit webhook requires; the webhook is disabled without it (env `KUBESENTRY_AUDIT_TOKEN`) |
 | `-audit-log-file` | | Follow a kube-apiserver audit log file |
 | `-audit-from-start` | `false` | With `-audit-log-file`, read existing content instead of starting at the end |
-| `-audit-store` | `memory` | `memory` or `postgres` (`-pg-dsn` or `KUBESENTRY_PG_DSN`, `-audit-retention`, default `30d`) |
+| `-audit-store` | `memory` | `memory` or `postgres` (`-pg-dsn` or `KUBESENTRY_PG_DSN`, `-audit-retention`, default `30d`; `-pg-max-conns` 10 per replica and `-pg-query-timeout` 10s, past which an audit read answers 503 + Retry-After) |
 | `-audit-journal` | | Memory store: JSONL file that keeps audit history across restarts (not rotated) |
 | `-audit-max-events` | `50000` | Memory store: audit events kept |
 | `-cloudwatch` | `false` | Read EKS audit logs from CloudWatch Logs |

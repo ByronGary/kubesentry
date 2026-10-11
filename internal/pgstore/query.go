@@ -2,8 +2,9 @@ package pgstore
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,14 +17,31 @@ import (
 
 // where translates a query into SQL conditions with the semantics of
 // audit.Query.Matches. The default-view clauses are spelled exactly like the
-// audit_events_default_view index predicate so the planner can use it.
+// audit_events_default_view and audit_events_scoped_view index predicates so
+// the planner can use them, and known actor kinds are literals so it can
+// prove audit_events_summary's predicate (actor_kind <> 'system').
 func where(q audit.Query) (string, []any) {
-	var conds []string
-	var args []any
-	arg := func(v any) string {
-		args = append(args, v)
-		return "$" + strconv.Itoa(len(args))
+	b := &sqlArgs{}
+	conds := b.conditions(q, true)
+	if len(conds) == 0 {
+		return "", b.args
 	}
+	return " WHERE " + strings.Join(conds, " AND "), b.args
+}
+
+// sqlArgs collects the parameters of one statement.
+type sqlArgs struct{ args []any }
+
+func (b *sqlArgs) arg(v any) string {
+	b.args = append(b.args, v)
+	return "$" + strconv.Itoa(len(b.args))
+}
+
+// conditions returns q's conditions, the scope (Namespaces, ClusterScoped)
+// included only when withScope is set.
+func (b *sqlArgs) conditions(q audit.Query, withScope bool) []string {
+	var conds []string
+	arg := b.arg
 	if !q.Since.IsZero() {
 		conds = append(conds, "time >= "+arg(q.Since))
 	}
@@ -47,9 +65,12 @@ func where(q audit.Query) (string, []any) {
 	}
 	if q.Actors != nil {
 		kinds := trueKeys(q.Actors, false)
-		if len(kinds) == 0 {
+		switch {
+		case len(kinds) == 0:
 			conds = append(conds, "false")
-		} else {
+		case knownActorKinds(kinds):
+			conds = append(conds, "actor_kind IN ('"+strings.Join(kinds, "', '")+"')")
+		default:
 			conds = append(conds, "actor_kind = ANY("+arg(kinds)+"::text[])")
 		}
 	} else {
@@ -58,7 +79,7 @@ func where(q audit.Query) (string, []any) {
 	if !q.IncludeReads && q.Verb == "" {
 		conds = append(conds, "(NOT is_read OR tags <> '{}')")
 	}
-	if q.Namespaces != nil {
+	if q.Namespaces != nil && withScope {
 		nss := trueKeys(q.Namespaces, true)
 		c := "namespace = ANY(" + arg(nss) + "::text[])"
 		if q.ClusterScoped {
@@ -69,10 +90,59 @@ func where(q audit.Query) (string, []any) {
 	if !q.Before.Time.IsZero() {
 		conds = append(conds, "(time, audit_id) < ("+arg(q.Before.Time)+", "+arg(q.Before.AuditID)+")")
 	}
-	if len(conds) == 0 {
-		return "", args
+	return conds
+}
+
+// maxScopeBranches is the most namespaces a scoped page is read with one
+// index range per namespace (scopedPageSQL); larger scopes use one scan.
+const maxScopeBranches = 32
+
+// scopedPageSQL returns the statement for a page of a scoped query: one
+// newest-first branch per namespace in the scope (and one for events without
+// a namespace when ClusterScoped), each reading at most Limit rows from
+// audit_events_scoped_view (namespace, time, audit_id), merged and cut to
+// Limit. The single statement with namespace = ANY(...) cannot read that
+// index in time order across several namespaces, so it walked the whole
+// window's time index filtering by namespace (25,000 rows for 201 at 2 of
+// 300 namespaces), or fetched and sorted every event of the scope. The
+// union matches exactly the same events. ok is false when q is not a
+// scoped page of a few namespaces.
+func scopedPageSQL(q audit.Query) (sql string, args []any, ok bool) {
+	if q.Namespaces == nil || q.Limit <= 0 {
+		return "", nil, false
 	}
-	return " WHERE " + strings.Join(conds, " AND "), args
+	nss := trueKeys(q.Namespaces, true)
+	if q.ClusterScoped {
+		nss = append(nss, "")
+	}
+	if len(nss) == 0 || len(nss) > maxScopeBranches {
+		return "", nil, false
+	}
+	b := &sqlArgs{}
+	common := b.conditions(q, false)
+	limit := strconv.Itoa(q.Limit)
+	branches := make([]string, len(nss))
+	for i, ns := range nss {
+		conds := append(append([]string{}, common...), "namespace = "+b.arg(ns))
+		branches[i] = "(SELECT * FROM audit_events WHERE " + strings.Join(conds, " AND ") +
+			" ORDER BY time DESC, audit_id DESC LIMIT " + limit + ")"
+	}
+	sql = "SELECT " + selectColumns + " FROM (" + strings.Join(branches, "\nUNION ALL ") +
+		") AS audit_events ORDER BY time DESC, audit_id DESC LIMIT " + limit
+	return sql, b.args, true
+}
+
+// knownActorKinds reports whether every kind is one the ingester assigns,
+// and so safe to write into SQL as a literal.
+func knownActorKinds(kinds []string) bool {
+	for _, k := range kinds {
+		switch k {
+		case "user", "serviceaccount", "system":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func trueKeys(m map[string]bool, skipEmpty bool) []string {
@@ -84,6 +154,38 @@ func trueKeys(m map[string]bool, skipEmpty bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// read runs one read against Postgres, bounded twice: it waits at most
+// AcquireTimeout for one of the store's read slots (MaxConns-2, so the
+// writer and maintenance always find a connection) and gives f at most
+// QueryTimeout. Either limit fails it with audit.ErrOverloaded, which the API
+// answers with 503 + Retry-After instead of holding the request until the
+// route (or the SSO proxy) times out. f must use the context it is given.
+func (s *Store) read(ctx context.Context, what string, f func(ctx context.Context) error) error {
+	if s.readers != nil {
+		t := time.NewTimer(s.o.AcquireTimeout)
+		select {
+		case s.readers <- struct{}{}:
+			t.Stop()
+		case <-ctx.Done():
+			t.Stop()
+			return fmt.Errorf("pgstore: %s: %w", what, ctx.Err())
+		case <-t.C:
+			return fmt.Errorf("pgstore: %s: %w: all %d read slots stayed busy for %s", what, audit.ErrOverloaded, cap(s.readers), s.o.AcquireTimeout)
+		}
+		defer func() { <-s.readers }()
+	}
+	qctx, cancel := context.WithTimeout(ctx, s.o.QueryTimeout)
+	defer cancel()
+	err := f(qctx)
+	switch {
+	case err == nil:
+		return nil
+	case ctx.Err() == nil && errors.Is(qctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("pgstore: %s: %w: no answer within %s", what, audit.ErrOverloaded, s.o.QueryTimeout)
+	}
+	return fmt.Errorf("pgstore: %s: %w", what, err)
 }
 
 const selectColumns = `audit_id, time, stage, verb, username, actor_kind, groups, coalesce(arn, ''),
@@ -99,29 +201,36 @@ func (s *Store) Query(ctx context.Context, q audit.Query) ([]audit.Event, error)
 	if q.Limit > 0 {
 		sql += " LIMIT " + strconv.Itoa(q.Limit)
 	}
-	rows, err := s.pool.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, fmt.Errorf("pgstore: query: %w", err)
+	if s, a, ok := scopedPageSQL(q); ok {
+		sql, args = s, a
 	}
-	out := []audit.Event{}
-	for rows.Next() {
-		var e audit.Event
-		var status int32
-		if err := rows.Scan(&e.AuditID, &e.Time, &e.Stage, &e.Verb, &e.Username, &e.ActorKind, &e.Groups, &e.ARN,
-			&e.SessionName, &e.ImpersonatedUser, &e.SourceIPs, &e.UserAgent, &e.APIGroup, &e.Resource, &e.Subresource,
-			&e.Namespace, &e.Name, &e.RequestURI, &status, &e.Decision, &e.Tags); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("pgstore: query: %w", err)
+	var out []audit.Event
+	err := s.read(ctx, "query", func(ctx context.Context) error {
+		rows, err := s.pool.Query(ctx, sql, args...)
+		if err != nil {
+			return err
 		}
-		e.StatusCode = int(status)
-		e.Time = e.Time.UTC()
-		e.Groups = nilIfEmpty(e.Groups)
-		e.SourceIPs = nilIfEmpty(e.SourceIPs)
-		e.Tags = nilIfEmpty(e.Tags)
-		out = append(out, e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("pgstore: query: %w", err)
+		defer rows.Close()
+		out = []audit.Event{}
+		for rows.Next() {
+			var e audit.Event
+			var status int32
+			if err := rows.Scan(&e.AuditID, &e.Time, &e.Stage, &e.Verb, &e.Username, &e.ActorKind, &e.Groups, &e.ARN,
+				&e.SessionName, &e.ImpersonatedUser, &e.SourceIPs, &e.UserAgent, &e.APIGroup, &e.Resource, &e.Subresource,
+				&e.Namespace, &e.Name, &e.RequestURI, &status, &e.Decision, &e.Tags); err != nil {
+				return err
+			}
+			e.StatusCode = int(status)
+			e.Time = e.Time.UTC()
+			e.Groups = nilIfEmpty(e.Groups)
+			e.SourceIPs = nilIfEmpty(e.SourceIPs)
+			e.Tags = nilIfEmpty(e.Tags)
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -133,110 +242,10 @@ func nilIfEmpty(s []string) []string {
 	return s
 }
 
-type sumEntry struct {
-	at  time.Time
-	sum audit.Summary
-}
-
-type covEntry struct {
-	at  time.Time
-	cov audit.Coverage
-}
-
-// Summarize aggregates matching events (Limit ignored) by user and by tag in
-// Postgres. Results are cached for CacheTTL per query; Since is bucketed to
-// CacheTTL for the cache key, so the rolling "last 24h" of many dashboard
-// users shares one aggregation.
-func (s *Store) Summarize(ctx context.Context, q audit.Query) (audit.Summary, error) {
-	q = q.Canonical()
-	q.Limit = 0
-	key := ""
-	if s.o.CacheTTL > 0 {
-		key = summaryCacheKey(q, s.o.CacheTTL)
-		s.cacheMu.Lock()
-		e, ok := s.sumCache[key]
-		s.cacheMu.Unlock()
-		if ok && time.Since(e.at) < s.o.CacheTTL {
-			return copySummary(e.sum), nil
-		}
-	}
-	sum, err := s.summarize(ctx, q)
-	if err != nil {
-		return audit.Summary{}, err
-	}
-	if key != "" {
-		s.cacheMu.Lock()
-		if len(s.sumCache) > 1000 {
-			for k, e := range s.sumCache {
-				if time.Since(e.at) >= s.o.CacheTTL {
-					delete(s.sumCache, k)
-				}
-			}
-		}
-		if len(s.sumCache) <= 1000 {
-			s.sumCache[key] = sumEntry{at: time.Now(), sum: sum}
-		}
-		s.cacheMu.Unlock()
-	}
-	return copySummary(sum), nil
-}
-
-// summaryKey is everything a summary depends on, spelled out so that two
-// queries share a cache entry exactly when where() gives them the same SQL.
-// fmt's %+v is not such a key: it prints a nil map (every namespace) and an
-// empty one (no namespace) alike. TestSummaryCacheKeyCoversEveryQueryField
-// fails when audit.Query gains a field this key does not carry.
-type summaryKey struct {
-	Since        time.Time `json:"since"`
-	User         string    `json:"user"`
-	Namespace    string    `json:"namespace"`
-	Resource     string    `json:"resource"`
-	Name         string    `json:"name"`
-	Verb         string    `json:"verb"`
-	Tag          string    `json:"tag"`
-	AnyActor     bool      `json:"anyActor"` // Actors == nil: the default view's actor rule
-	Actors       []string  `json:"actors"`
-	IncludeReads bool      `json:"includeReads"`
-	Limit        int       `json:"limit"`
-	// AllNamespaces is Namespaces == nil: no scope at all. Otherwise only
-	// Namespaces (sorted, possibly empty) and, with ClusterScoped, events
-	// without a namespace match.
-	AllNamespaces bool      `json:"allNamespaces"`
-	Namespaces    []string  `json:"namespaces"`
-	ClusterScoped bool      `json:"clusterScoped"`
-	BeforeTime    time.Time `json:"beforeTime"`
-	BeforeID      string    `json:"beforeID"`
-}
-
-// summaryCacheKey returns q's Summarize cache key, with Since bucketed to
-// ttl so the rolling windows of many dashboards share one aggregation. q
-// must be canonical.
-func summaryCacheKey(q audit.Query, ttl time.Duration) string {
-	k := summaryKey{
-		Since: q.Since, User: q.User, Namespace: q.Namespace, Resource: q.Resource, Name: q.Name, Verb: q.Verb, Tag: q.Tag,
-		AnyActor: q.Actors == nil, Actors: trueKeys(q.Actors, false), IncludeReads: q.IncludeReads, Limit: q.Limit,
-		AllNamespaces: q.Namespaces == nil, Namespaces: trueKeys(q.Namespaces, true), ClusterScoped: q.ClusterScoped,
-		BeforeTime: q.Before.Time, BeforeID: q.Before.AuditID,
-	}
-	if !k.Since.IsZero() && ttl > 0 {
-		k.Since = k.Since.Truncate(ttl)
-	}
-	b, err := json.Marshal(k)
-	if err != nil {
-		panic("pgstore: summary cache key: " + err.Error()) // strings, bools and times always encode
-	}
-	return string(b)
-}
-
-func copySummary(s audit.Summary) audit.Summary {
-	out := audit.Summary{TotalEvents: s.TotalEvents, ByTag: make(map[string]int, len(s.ByTag)), Users: append([]audit.UserSummary{}, s.Users...)}
-	for k, v := range s.ByTag {
-		out.ByTag[k] = v
-	}
-	return out
-}
-
-func (s *Store) summarize(ctx context.Context, q audit.Query) (audit.Summary, error) {
+// summarizeNow aggregates matching events by user and by tag in Postgres,
+// uncached. Summaries that leave system components out read only the
+// audit_events_summary index.
+func (s *Store) summarizeNow(ctx context.Context, q audit.Query) (audit.Summary, error) {
 	cond, args := where(q)
 	countTag := func(t string) string {
 		return "coalesce(sum(cardinality(array_positions(tags, '" + t + "'))), 0)"
@@ -247,79 +256,144 @@ func (s *Store) summarize(ctx context.Context, q audit.Query) (audit.Summary, er
 FROM audit_events` + cond + ` GROUP BY username, actor_kind`
 	tags := `SELECT tag, count(*) FROM audit_events CROSS JOIN LATERAL unnest(tags) AS tag` + cond + ` GROUP BY tag`
 
-	var b audit.SummaryBuilder
-	batch := &pgx.Batch{}
-	batch.Queue(users, args...)
-	batch.Queue(tags, args...)
-	br := s.pool.SendBatch(ctx, batch)
-	defer br.Close()
+	var sum audit.Summary
+	err := s.read(ctx, "summarize", func(ctx context.Context) error {
+		var b audit.SummaryBuilder
+		batch := &pgx.Batch{}
+		batch.Queue(users, args...)
+		batch.Queue(tags, args...)
+		br := s.pool.SendBatch(ctx, batch)
+		defer br.Close()
 
-	rows, err := br.Query()
-	if err != nil {
-		return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
-	}
-	for rows.Next() {
-		var u audit.UserSummary
-		var total, writes, execs, secrets, denied int64
-		if err := rows.Scan(&u.Username, &u.ActorKind, &total, &writes, &execs, &secrets, &denied, &u.LastSeen); err != nil {
-			rows.Close()
-			return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
+		rows, err := br.Query()
+		if err != nil {
+			return err
 		}
-		u.Total, u.Writes, u.Execs, u.SecretAccess, u.Denied = int(total), int(writes), int(execs), int(secrets), int(denied)
-		u.LastSeen = u.LastSeen.UTC()
-		b.AddUser(u)
-	}
-	if err := rows.Err(); err != nil {
-		return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
-	}
-	rows, err = br.Query()
-	if err != nil {
-		return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
-	}
-	for rows.Next() {
-		var tag string
-		var n int64
-		if err := rows.Scan(&tag, &n); err != nil {
-			rows.Close()
-			return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
+		for rows.Next() {
+			var u audit.UserSummary
+			var total, writes, execs, secrets, denied int64
+			if err := rows.Scan(&u.Username, &u.ActorKind, &total, &writes, &execs, &secrets, &denied, &u.LastSeen); err != nil {
+				rows.Close()
+				return err
+			}
+			u.Total, u.Writes, u.Execs, u.SecretAccess, u.Denied = int(total), int(writes), int(execs), int(secrets), int(denied)
+			u.LastSeen = u.LastSeen.UTC()
+			b.AddUser(u)
 		}
-		b.AddTag(tag, int(n))
-	}
-	if err := rows.Err(); err != nil {
-		return audit.Summary{}, fmt.Errorf("pgstore: summarize: %w", err)
-	}
-	return b.Summary(), nil
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		rows, err = br.Query()
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var tag string
+			var n int64
+			if err := rows.Scan(&tag, &n); err != nil {
+				rows.Close()
+				return err
+			}
+			b.AddTag(tag, int(n))
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		sum = b.Summary()
+		return nil
+	})
+	return sum, err
 }
 
-// Coverage reports the span and count of stored events and the retention,
-// cached for CacheTTL.
-func (s *Store) Coverage(ctx context.Context) (audit.Coverage, error) {
-	if s.o.CacheTTL > 0 {
-		s.cacheMu.Lock()
-		c := s.covCache
-		s.cacheMu.Unlock()
-		if c != nil && time.Since(c.at) < s.o.CacheTTL {
-			return c.cov, nil
-		}
+// exactCountBelow is the estimated store size under which coverageNow counts
+// events exactly: a count(*) of up to this many rows takes a few
+// milliseconds, and small stores (and the tests) get exact numbers.
+const exactCountBelow = 100_000
+
+// exactBelow is exactCountBelow, or the threshold a test set.
+func (s *Store) exactBelow() float64 {
+	if s.exactCountBelow > 0 {
+		return s.exactCountBelow
 	}
+	return exactCountBelow
+}
+
+// coverageNow reads the span and size of the store, uncached. The span is
+// exact, from both ends of the time index. The event count is exact below
+// exactCountBelow and otherwise estimated from the planner's statistics: each
+// partition's rows per page at its last ANALYZE times its pages now, which is
+// how the planner sizes it too. Autovacuum keeps that within a few percent;
+// count(*) took 0.8-4 s at 3-4M events, for a number that is only displayed.
+func (s *Store) coverageNow(ctx context.Context) (audit.Coverage, error) {
 	cov := audit.Coverage{Backend: "postgres"}
 	if s.o.Retention > 0 {
 		cov.Retention = s.o.Retention
 	}
-	var oldest, newest *time.Time
-	if err := s.pool.QueryRow(ctx, "SELECT min(time), max(time), count(*) FROM audit_events").Scan(&oldest, &newest, &cov.Events); err != nil {
-		return audit.Coverage{}, fmt.Errorf("pgstore: coverage: %w", err)
-	}
-	if oldest != nil {
-		cov.Oldest = oldest.UTC()
-	}
-	if newest != nil {
-		cov.Newest = newest.UTC()
-	}
-	if s.o.CacheTTL > 0 {
-		s.cacheMu.Lock()
-		s.covCache = &covEntry{at: time.Now(), cov: cov}
-		s.cacheMu.Unlock()
+	err := s.read(ctx, "coverage", func(ctx context.Context) error {
+		var oldest, newest *time.Time
+		if err := s.pool.QueryRow(ctx, `SELECT (SELECT time FROM audit_events ORDER BY time LIMIT 1),
+  (SELECT time FROM audit_events ORDER BY time DESC LIMIT 1)`).Scan(&oldest, &newest); err != nil {
+			return err
+		}
+		if oldest != nil {
+			cov.Oldest = oldest.UTC()
+		}
+		if newest != nil {
+			cov.Newest = newest.UTC()
+		}
+		n, err := s.countEvents(ctx)
+		cov.Events = n
+		return err
+	})
+	if err != nil {
+		return audit.Coverage{}, err
 	}
 	return cov, nil
+}
+
+// countEvents estimates the number of stored events (see coverageNow).
+func (s *Store) countEvents(ctx context.Context) (int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT c.reltuples::float8, c.relpages::bigint,
+  coalesce(pg_relation_size(c.oid), 0) / current_setting('block_size')::bigint
+FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+WHERE i.inhparent = 'audit_events'::regclass`)
+	if err != nil {
+		return 0, err
+	}
+	type part struct {
+		tuples      float64 // at the last VACUUM or ANALYZE; -1 never
+		pages, size int64   // pages then, and now
+	}
+	parts, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (part, error) {
+		var p part
+		return p, r.Scan(&p.tuples, &p.pages, &p.size)
+	})
+	if err != nil {
+		return 0, err
+	}
+	var tuples, pages float64 // over the partitions with statistics
+	for _, p := range parts {
+		if p.pages > 0 && p.tuples >= 0 {
+			tuples += p.tuples
+			pages += float64(p.pages)
+		}
+	}
+	est := 0.0
+	if pages > 0 {
+		for _, p := range parts {
+			switch {
+			case p.size == 0:
+			case p.pages > 0 && p.tuples >= 0:
+				est += p.tuples / float64(p.pages) * float64(p.size)
+			default: // filled since its last ANALYZE: the others' density
+				est += tuples / pages * float64(p.size)
+			}
+		}
+	}
+	if pages == 0 || est < s.exactBelow() {
+		var n int64
+		err := s.pool.QueryRow(ctx, "SELECT count(*) FROM audit_events").Scan(&n)
+		return n, err
+	}
+	return int64(math.Round(est)), nil
 }

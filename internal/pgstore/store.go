@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
@@ -33,11 +34,23 @@ type Options struct {
 	QueueSize     int           // 50,000 events waiting to be written before Add returns ErrBackpressure
 	BatchSize     int           // 5,000 events per COPY
 	FlushInterval time.Duration // 250ms: a partial batch is written after this long
-	CacheTTL      time.Duration // 30s for Summarize and Coverage results; negative disables
-	MaxConns      int32         // 10 pooled connections (leaders hold one more each)
-	Owner         string        // recorded with checkpoints; hostname/pid by default
-	Now           func() time.Time
-	Logger        *slog.Logger
+	// CacheTTL is how long a Summarize or Coverage result counts as fresh
+	// (30s). Older results are still served while one refresh per result
+	// runs in the background (see cache.go). Negative disables caching.
+	CacheTTL time.Duration
+	// MaxConns pooled connections (10; leaders hold one more each). Reads
+	// share MaxConns-2 of them, so the writer and maintenance always find one.
+	MaxConns int32
+	// QueryTimeout bounds each read (Query, and the queries behind Summarize
+	// and Coverage): past it the read fails with audit.ErrOverloaded and
+	// Postgres is asked to cancel the statement. Default 10s.
+	QueryTimeout time.Duration
+	// AcquireTimeout is how long a read waits for a free read slot before it
+	// fails with audit.ErrOverloaded. Default 2s.
+	AcquireTimeout time.Duration
+	Owner          string // recorded with checkpoints; hostname/pid by default
+	Now            func() time.Time
+	Logger         *slog.Logger
 }
 
 func (o *Options) defaults() error {
@@ -64,6 +77,12 @@ func (o *Options) defaults() error {
 	}
 	if o.MaxConns <= 0 {
 		o.MaxConns = 10
+	}
+	if o.QueryTimeout <= 0 {
+		o.QueryTimeout = 10 * time.Second
+	}
+	if o.AcquireTimeout <= 0 {
+		o.AcquireTimeout = 2 * time.Second
 	}
 	if o.Owner == "" {
 		h, _ := os.Hostname()
@@ -104,9 +123,20 @@ type Store struct {
 	abort      context.CancelFunc
 	writerDone chan struct{}
 
-	cacheMu  sync.Mutex
-	sumCache map[string]sumEntry
-	covCache *covEntry
+	// readers holds one token per read in flight: at most MaxConns-2.
+	readers chan struct{}
+
+	cacheMu    sync.Mutex
+	sumCache   map[string]*sumEntry              // by summaryCacheKey
+	sumFlights map[string]*flight[audit.Summary] // refreshes in flight, by the same key
+	covCache   *covEntry
+	covFlight  *flight[audit.Coverage]
+	// summarizeFn and coverageFn compute uncached results; nil means
+	// s.summarizeNow and s.coverageNow. Tests replace them.
+	summarizeFn func(context.Context, audit.Query) (audit.Summary, error)
+	coverageFn  func(context.Context) (audit.Coverage, error)
+	// exactCountBelow overrides the package's threshold (tests).
+	exactCountBelow float64
 }
 
 // Stats describes the write path. The server exports Queued as the gauge
@@ -147,7 +177,7 @@ func Open(ctx context.Context, dsn string, o Options) (*Store, error) {
 		progress:   make(chan struct{}),
 		wake:       make(chan struct{}, 1),
 		writerDone: make(chan struct{}),
-		sumCache:   map[string]sumEntry{},
+		readers:    make(chan struct{}, max(1, o.MaxConns-2)),
 	}
 	s.abortCtx, s.abort = context.WithCancel(context.Background())
 	if err := s.migrate(ctx); err != nil {
@@ -161,6 +191,9 @@ func Open(ctx context.Context, dsn string, o Options) (*Store, error) {
 		return nil, err
 	}
 	go s.writer()
+	if o.CacheTTL > 0 {
+		s.warmCoverage() // so the first /info finds it
+	}
 	return s, nil
 }
 
@@ -189,11 +222,25 @@ func poolConfig(dsn string, o Options) (*pgxpool.Config, error) {
 		return nil, fmt.Errorf("pgstore: parse DSN: %w", err)
 	}
 	cfg.MaxConns = o.MaxConns
+	// A cancelled context (a query past QueryTimeout, a request the client
+	// gave up on, a leader that lost its lock) sends Postgres a cancel
+	// request, so the statement stops there too; pgx's default only closes
+	// the socket, and the server keeps running the query until it next
+	// writes. The deadline still closes the socket if the server does not
+	// answer the cancel.
+	cfg.ConnConfig.BuildContextWatcherHandler = func(pc *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: pc, DeadlineDelay: 2 * time.Second}
+	}
 	rp := cfg.ConnConfig.RuntimeParams
 	rp["search_path"] = o.Schema
 	rp["timezone"] = "UTC"
 	if rp["application_name"] == "" {
 		rp["application_name"] = "kubesentry"
+	}
+	// JIT compiling costs 70-160 ms per summary (measured at 3.2M events)
+	// and buys nothing for queries this short.
+	if rp["jit"] == "" {
+		rp["jit"] = "off"
 	}
 	return cfg, nil
 }

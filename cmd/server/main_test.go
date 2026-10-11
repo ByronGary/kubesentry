@@ -107,6 +107,8 @@ func TestFlagValidation(t *testing.T) {
 		{"-tls-cert=x"},
 		{"-audit-store=sqlite"},
 		{"-audit-store=postgres", "-audit-journal=/tmp/j"},
+		{"-audit-store=postgres", "-pg-max-conns=2"},
+		{"-audit-store=postgres", "-pg-query-timeout=0s"},
 		{"-cloudwatch"},
 		{"-kube-qps=0"},
 		{"-audit-retention=forever"},
@@ -124,6 +126,7 @@ func TestFlagValidation(t *testing.T) {
 		{"-auth-mode=token", "-addr=:8080", "-api-token=s3cret"},
 		{"-auth-mode=proxy", "-addr=:8080"},
 		{"-cloudwatch", "-cluster-name=prod"},
+		{"-audit-store=postgres", "-pg-max-conns=20", "-pg-query-timeout=5s"},
 		{"-version"},
 	}
 	for _, args := range good {

@@ -352,6 +352,8 @@
             "existingSecret": { "type": "string" },
             "dsnKey": { "type": "string", "minLength": 1 },
             "schema": { "type": "string", "pattern": "^([a-z_][a-z0-9_]*)?$" },
+            "maxConns": { "type": ["integer", "null"], "minimum": 3 },
+            "queryTimeout": { "$ref": "#/definitions/durationOrEmpty" },
             "sslmode": { "enum": ["", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"] },
             "sslRootCert": {
               "type": "object",

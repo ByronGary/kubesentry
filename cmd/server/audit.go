@@ -32,6 +32,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		var err error
 		pg, err = pgstore.Open(ctx, pgstore.ResolveDSN(cfg.pgDSN), pgstore.Options{
 			Schema: cfg.pgSchema, Retention: cfg.auditRetention, Owner: hostname(), Logger: slog.Default(),
+			MaxConns: int32(cfg.pgMaxConns), QueryTimeout: cfg.pgQueryTimeout,
 		})
 		if err != nil {
 			return cleanup, fmt.Errorf("audit store: %w", err)

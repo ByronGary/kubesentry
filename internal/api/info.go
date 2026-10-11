@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math"
 	"net/http"
@@ -69,6 +70,10 @@ type infoAuditStore struct {
 // cluster is still being read.
 const infoViewWait = 5 * time.Second
 
+// infoCoverageWait bounds how long /info waits for the audit store's
+// coverage; past it, auditStore is left out of this answer.
+const infoCoverageWait = 50 * time.Millisecond
+
 // info tells the UI which features this server has, who the caller is and
 // what they may see, so it can hide what is empty or out of reach.
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
@@ -124,8 +129,16 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 
 	// The store's event count and span describe the whole cluster's
 	// activity: only for callers who may read audit events somewhere.
+	// The Postgres store serves it from a cache it refreshes in the
+	// background; /info waits only briefly for a first value and otherwise
+	// leaves it out, so it never queues behind a busy database.
 	if s.Audit != nil && (resp.Capabilities["audit"] || resp.Capabilities["clusterAudit"]) {
-		if c, err := s.auditStore().Coverage(ctx); err != nil {
+		cctx, cancel := context.WithTimeout(ctx, infoCoverageWait)
+		c, err := s.auditStore().Coverage(cctx)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			slog.Debug("audit coverage not ready; /info leaves it out", "err", err)
+		} else if err != nil {
 			slog.Warn("audit coverage", "err", err)
 		} else {
 			as := &infoAuditStore{Backend: c.Backend, Events: c.Events, MaxEvents: c.MaxEvents}

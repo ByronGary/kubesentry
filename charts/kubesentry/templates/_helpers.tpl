@@ -325,6 +325,8 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- $a = append $a (printf "-audit-store=%s" $au.store) -}}
 {{- if eq $au.store "postgres" -}}
 {{- with $au.postgres.schema }}{{ $a = append $a (printf "-pg-schema=%s" .) }}{{ end -}}
+{{- if not (kindIs "invalid" $au.postgres.maxConns) }}{{ $a = append $a (printf "-pg-max-conns=%s" (include "kubesentry.scalar" $au.postgres.maxConns)) }}{{ end -}}
+{{- with $au.postgres.queryTimeout }}{{ $a = append $a (printf "-pg-query-timeout=%s" .) }}{{ end -}}
 {{- with $au.retention }}{{ $a = append $a (printf "-audit-retention=%s" .) }}{{ end -}}
 {{- else if not (kindIs "invalid" $au.maxEvents) -}}
 {{- $a = append $a (printf "-audit-max-events=%s" (include "kubesentry.scalar" $au.maxEvents)) -}}
