@@ -54,27 +54,35 @@ This run tested the code tagged `baseline` as shipped: one replica, a 256 MiB me
 - **`/oom` outgrows its read cap at L3.**
 - **The audit store fills fast.** The 50k cap holds about 17 seconds of a 3k/s firehose.
 
-### After: the new build at L3, checkpoint D (2026-10-11, 18:55–19:27 UTC; in progress)
+### After: the new build at L3, checkpoint D (2026-10-11, 18:55–21:17 UTC): passed
+Full write-up: `test/stress/results/after-L3/checkpoint-d.md`.
+
 **Setup:**
 - installed with the Helm chart: 2 replicas, 1 GiB memory limit
-- SSO: oauth2-proxy over a Unix socket, using a test OIDC issuer that mints JWTs per persona
-- Postgres audit store, with CloudWatch read from an in-cluster fake
+- SSO: oauth2-proxy over a Unix socket, with a test OIDC issuer that mints JWTs per persona
+- Postgres 17 audit store, with CloudWatch read from an in-cluster fake
 - Prometheus found by autodiscovery
-- the agent DaemonSet runs only on the 6 real nodes; KWOK and Fargate nodes are excluded
+- agents on the 6 real nodes only
 
 | Check | Result |
 |---|---|
-| Authorization leaks (15 personas: admins, cluster viewers, team members, a 300-group user, a user with no grants; every list route paged through) | **0 leaks**, 0 problems. 245k items checked; median route time 1–8ms |
-| Association (L3: 9.5k pods, 1,755 Deployments, 1,161 EndpointSlices) | pod→owner, service→pods, pod→node, pod→PVC, CronJob→Job, Ingress→Service and security grouping all **100% / 100%**. Tricky cases **41/42**. The miss was terminating pods counted as live: fixed in 61e3d75, re-run pending |
-| Connectivity | **120/120**, including the ingest listener. Prometheus scrapes both kubesentry replicas |
-| CloudWatch (1M events through the fake) | **every event stored exactly once** (0 missing, 0 duplicated) |
-| Chaos: spoofed identity headers through port-forward | pass: with no TCP web port, forged headers never reach kubesentry |
-| Chaos: oversized agent reports (9 MiB, 25k processes, a gzip bomb) | pass: 413 for each; an unknown encoding gets 415 |
-| Chaos: Prometheus down | pass: pages kept serving (/oom says leak detection is unavailable); metrics were back 21s after restart |
-| Chaos: Postgres down for 2 min under a 1k events/s firehose | pass: 72 backpressure answers (503 + Retry-After), 0 missing, 0 duplicated, `/readyz` reported the degraded store |
-| Chaos: API server restart | pass: 5/5 probes answered, snapshot at most 5s old, fresh again immediately |
-| Chaos: kill the CloudWatch leader | data complete (270k events, 0 missing, 0 duplicated). The scenario flagged a failure because the Deployment's *replacement* pod took the lock in the same second, before the standby's 30s retry. That is a harness expectation issue; a standby-only variant is being added |
-| Users ramp through oauth2-proxy (10 → 200 → 500) | pending |
+| Authorization leaks (15 personas, every list route paged through) | **0 leaks**, 0 problems; about 200k items checked |
+| Association | **42/42 tricky cases** (baseline 29/42). Every relation at 100% precision and recall. Verifier time 14s (baseline 304s) |
+| Connectivity | **120/120**, including oauth2-proxy and ingest from every node |
+| CloudWatch | 1M events stored exactly once, with 0.5% duplicates and 1% late deliveries in the input. Live-tail lag 31–47s |
+| Chaos | **all pass**: spoofed headers, oversized reports, Prometheus down, Postgres down for 2 min (0 lost), API server restart, leader killed (the replacement took the lock in 2.6s), standby-only takeover (5.1s) |
+| Users through SSO, 10 → 200 → 500 | Errors 0% / 0.18% / 0.49%. 0 restarts. About 525 MiB per replica. **0 LISTs to the API server.** Inventory routes at 500 users: **p95 11–23 ms, p99 19–57 ms** |
+| **Audit-backed routes at 500 users** | **fail the target.** `/info` p95 10s; `audit/events` p50 8.5s, p95 30s, 7.7% errors; `audit/summary` p50 7s; diagnostics p95 15s. Cause: the Postgres coverage `count(*)` (834 ms over 3.4M rows) runs uncoordinated on every `/info`, and the 24h summary (1.5s) runs per team scope. Postgres hit 7.3 cores. A fix is in progress |
+
+**Smaller findings, being fixed:**
+- static pods are shown with their node as the workload
+- the oauth2-proxy upstream timeout (30s) is shorter than kubesentry's route timeouts
+- `--reverse-proxy` runs without trusted proxy IPs
+- a possibly stale CloudWatch lag gauge after the lock is lost
+- a Prometheus outage doesn't show in `/readyz` or `/info`
+
+### After: full L3 run (Phase 4)
+*Pending the audit fix.* It covers the 2,000-user ramp, a 2h soak at 500 users, every chaos scenario, and the baseline-vs-after report.
 
 ## Cautions and critical alerts across the cluster (baseline, 20 snapshots, 16:49–18:30 UTC)
 Full table: `test/stress/results/cautions-baseline/cautions.md`.
@@ -96,6 +104,10 @@ Full table: `test/stress/results/cautions-baseline/cautions.md`.
 | **Real node pressure** | caution | Real nodes went down to 24% memory available; load per CPU reached 1.04 | Fine for the load generators. On EKS, node pressure leads to evictions |
 | **Event volume** | caution | Events were the largest object type at L2 (7k). At L3, pods 10k and RoleBindings 3.1k led | Event churn costs etcd and API capacity. kind runs `--event-ttl=30m`; EKS uses 1h |
 | **API server restart: RBAC briefly denies** | caution | Right after the API server restart (after-run chaos), kubesentry's ServiceAccount got about 1s of `forbidden` watch errors while the API server's RBAC caches warmed up. It recovered by itself | Every controller sees this after a control-plane restart. Alert only if `forbidden` persists, and expect a burst during EKS control-plane upgrades |
+| **cert-manager keeps failing liveness** | warning | After run: 8,151 `Unhealthy` events and 5 restarts. Worse than the baseline's 3 restarts, under more load | Give cert-manager resource requests and raise its probe tolerance, and alert on restarts. A restart pauses issuance and renewal |
+| **API error budget burn after a control-plane restart** | warning | `KubeAPIErrorBudgetBurn` pending in 5 snapshots, plus `KubeClientErrors` and `PrometheusKubernetesListWatchFailures` around the API server restart. API 5xx up to 0.14/s, 429 up to 0.01/s, read p99 up to 697 ms | Expect the same during EKS control-plane upgrades. Route these to the platform team, not to application owners |
+| **Node disk I/O saturation** | caution | `NodeDiskIOSaturation` pending once (6 devices) during the after run's Postgres and CloudWatch load | On EKS, gp3 volumes for Postgres (or RDS) need provisioned IOPS sized to the audit ingest |
+| **kubesentry's own Postgres alert works** | info | `KubesentryPostgresErrors` (from the chart's PrometheusRule) went pending during the Postgres chaos test | Proof that the self-monitoring rules fire. They still need routing |
 | **Planted workload faults** | expected | crashloop (38 restarts), `leaky` (OOMKilled ×6, 88% of its limit), ImagePullBackOff (704 `Failed` events), Unschedulable (107 `FailedScheduling`) | kubesentry must flag all of these. The after run checks it |
 
 **Control plane, overall:**
