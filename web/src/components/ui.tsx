@@ -2,9 +2,10 @@ import { Fragment, useState, type ReactNode } from 'react'
 import { ApiError, setToken } from '../api'
 import { loadedText } from '../paging'
 import type { WindowChoice } from '../retention'
+import { retryText, type Retry } from '../retry'
 import type { Status } from '../types'
 import type { PagedState } from '../usePaged'
-import { bumpAuth, type ApiState } from '../useApi'
+import { bumpAuth, useNow, type ApiState } from '../useApi'
 import { SignInStuck } from './Access'
 
 /** Status plus a neutral "info" level used for security findings. UI-only. */
@@ -106,19 +107,52 @@ export function TokenForm() {
   )
 }
 
-/** Renders loading / error / content for an API state. */
+/**
+ * A calm note while a busy store is waited out: "Audit store is busy, retrying
+ * in 5 s…". The countdown is hidden from screen readers so it is not read out
+ * every second.
+ */
+export function BusyNotice({ retry, text = 'Audit store is busy', note }: { retry?: Retry; text?: string; note?: ReactNode }) {
+  const now = useNow(1000, retry !== undefined)
+  return (
+    <div className="notice busy" role="status">
+      <p>
+        {text}
+        {retry ? (
+          <>
+            , <span aria-hidden="true" className="countdown">{retryText(retry, now)}</span>
+            <span className="sr-only">retrying shortly.</span>
+          </>
+        ) : (
+          '; it will be asked again shortly.'
+        )}
+      </p>
+      {note && <p className="muted small">{note}</p>}
+    </div>
+  )
+}
+
+/**
+ * Renders loading / error / content for an API state. A 503 that the hook is
+ * retrying (`retryBusy`) shows as a calm BusyNotice saying `busy`, not as an error.
+ */
 export function Async<T>({
   state,
   children,
   what,
+  busy,
 }: {
   state: ApiState<T>
   what: string
   children: (data: T) => ReactNode
+  /** What is busy when a 503 is being retried, e.g. "Audit store is busy". */
+  busy?: string
 }) {
-  const { data, error, loading, reload } = state
+  const { data, error, loading, reload, retry } = state
   if (error instanceof ApiError && error.status === 401) return <Unauthorized error={error} />
+  const waiting = error !== undefined && retry !== undefined
   if (!data) {
+    if (waiting) return <BusyNotice retry={retry} text={busy} />
     if (error) {
       return (
         <div className="notice crit" role="alert">
@@ -131,10 +165,14 @@ export function Async<T>({
   }
   return (
     <div className={loading ? 'refetching' : undefined} aria-busy={loading}>
-      {error && (
-        <div className="notice warn" role="status">
-          Showing the last result. Refreshing failed: {error.message}
-        </div>
+      {waiting ? (
+        <BusyNotice retry={retry} text={busy} note="Showing the last result meanwhile." />
+      ) : (
+        error && (
+          <div className="notice warn" role="status">
+            Showing the last result. Refreshing failed: {error.message}
+          </div>
+        )
       )}
       {children(data)}
     </div>

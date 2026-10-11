@@ -1,11 +1,13 @@
 import { useMemo, useState } from 'react'
 import { can } from '../access'
 import { qs } from '../api'
+import { PrometheusNotice } from '../components/Access'
 import { ActivityTable } from '../components/ActivityTable'
 import { MemoryChart } from '../components/MemoryChart'
-import { Async, PageHead, Segmented, StatusGlyph } from '../components/ui'
+import { Async, BusyNotice, PageHead, Segmented, StatusGlyph } from '../components/ui'
 import { ago, formatBytes, formatCPU, plural } from '../format'
 import { activityEmptyText, metricsHistoryHours, metricsWhy, windowChoices, type WindowOption } from '../retention'
+import { podActivity, prometheusOutage, unexplainedWarnings } from '../sources'
 import type { Info, PodDiagnostics, ProcessesResponse, Status } from '../types'
 import { useApi } from '../useApi'
 
@@ -30,12 +32,16 @@ function verdict(d: PodDiagnostics): { status: Status; text: string } {
 
 export function PodDetail({ ns, name, info }: { ns: string; name: string; info: Info }) {
   const [win, setWin] = useState('6h')
+  const procsOK = info.processes && can(info, 'processes')
+  const auditOK = can(info, 'audit')
+  const down = prometheusOutage(info)
+  // The diagnostics answer 200 with a warning when the audit store did not answer:
+  // keep the rest and ask again sooner, backing off like the audit routes.
   const state = useApi<Diagnostics>(
     `/api/v1/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/diagnostics${qs({ window: win })}`,
     30_000,
+    { busyIn: (d) => auditOK && podActivity(d) === 'unavailable' },
   )
-  const procsOK = info.processes && can(info, 'processes')
-  const auditOK = can(info, 'audit')
   const procs = useApi<ProcessesResponse>(
     procsOK ? `/api/v1/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/processes` : null,
     15_000,
@@ -48,6 +54,9 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
       <Async state={state} what="pod">
         {(d) => {
           const v = verdict(d)
+          const activity = podActivity(d)
+          // The memory and activity sections explain these failures themselves.
+          const warnings = unexplainedWarnings(d.warnings, { prometheus: !!down && !d.metricsAvailable, audit: auditOK && activity === 'unavailable' })
           return (
             <>
               <PageHead title={d.name} lede={<span className="id">{d.namespace}</span>}>
@@ -57,7 +66,7 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
                 <StatusGlyph status={v.status} label={false} />
                 <span>{v.text}</span>
               </p>
-              {d.warnings?.map((w) => <div className="notice warn" key={w}>{w}</div>)}
+              {warnings.map((w) => <div className="notice warn" key={w}>{w}</div>)}
 
               <section aria-labelledby="h-checks">
                 <h2 id="h-checks">Diagnosis</h2>
@@ -77,7 +86,9 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
                   <h2 id="h-mem">Memory</h2>
                   <Segmented label="Time window" value={win} options={windows} onChange={setWin} />
                 </div>
-                {!d.metricsAvailable ? (
+                {!d.metricsAvailable && down ? (
+                  <PrometheusNotice reason={down} fallback={<p className="muted">Memory history is paused while Prometheus is unavailable.</p>} />
+                ) : !d.metricsAvailable ? (
                   <div className="notice">Memory history needs Prometheus. Start the server with <code>-prometheus-url</code>.</div>
                 ) : (
                   d.containers.map((c) => (
@@ -161,7 +172,11 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
               {auditOK && (
                 <section aria-labelledby="h-act">
                   <h2 id="h-act">Recent activity</h2>
-                  {!d.auditAvailable ? (
+                  {activity === 'unavailable' ? (
+                    <BusyNotice retry={state.retry} text="Audit store is not answering" note="The rest of this page is current." />
+                  ) : activity === 'hidden' ? (
+                    <p className="muted">You may not read audit events in this namespace.</p>
+                  ) : activity === 'off' ? (
                     <div className="notice">Activity needs audit ingestion. The README shows how to turn it on.</div>
                   ) : d.activity.length === 0 ? (
                     <p className="muted">{activityEmptyText(d.activityWindow, info.auditStore)}</p>

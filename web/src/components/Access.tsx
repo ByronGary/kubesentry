@@ -1,9 +1,10 @@
-import { createContext, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { capabilityNoun, missingCapabilities } from '../access'
 import { apiPost, ApiError, reloadForSignIn } from '../api'
 import { cooldownLeft, readNumber, readString, RECHECK_COOLDOWN_MS, RECHECK_KEY, sessionStore, sortGroups, sourceText, writeNumber, writeString } from '../auth'
 import { plural } from '../format'
 import { clusterFacts, stalenessText } from '../retention'
+import { unavailableBanner } from '../sources'
 import type { Info, RecheckResponse } from '../types'
 import { bumpAuth, useNow } from '../useApi'
 
@@ -159,18 +160,30 @@ export function ClusterBar({ info }: { info: Info }) {
 }
 
 const DISMISS_KEY = 'kubesentry.dismissedUnavailable'
+const PROMETHEUS_DISMISS_KEY = 'kubesentry.dismissedPrometheus'
 
-/** Staleness and unreadable-source notices, above every page. */
-export function StatusBanners({ info }: { info: Info }) {
-  const stale = stalenessText(info.snapshot)
-  const unavailable = Object.entries(info.unavailable ?? {}).sort(([a], [b]) => a.localeCompare(b))
-  const sig = unavailable.map(([k, v]) => `${k}=${v}`).join('\n')
-  // Dismissed per tab, and only for this exact set of sources: a new failure shows again.
-  const [dismissed, setDismissed] = useState(() => readString(sessionStore(), DISMISS_KEY) ?? '')
+/**
+ * Whether the notice for `sig` was dismissed, and how to dismiss it. Kept per
+ * tab, and only for that exact text: a different failure shows again.
+ */
+function useDismissed(key: string, sig: string): [boolean, () => void] {
+  const [dismissed, setDismissed] = useState(() => readString(sessionStore(), key) ?? '')
   const dismiss = () => {
     setDismissed(sig)
-    writeString(sessionStore(), DISMISS_KEY, sig)
+    writeString(sessionStore(), key, sig)
   }
+  return [sig !== '' && dismissed === sig, dismiss]
+}
+
+/**
+ * Staleness and unreadable-source notices, above every page. `explained`
+ * names sources the page has its own notice for (Prometheus on the pages that
+ * read metrics); the banner leaves them out.
+ */
+export function StatusBanners({ info, explained }: { info: Info; explained?: readonly string[] }) {
+  const stale = stalenessText(info.snapshot)
+  const { sig, shown: unavailable } = unavailableBanner(info.unavailable, explained)
+  const [dismissed, dismiss] = useDismissed(DISMISS_KEY, sig)
   return (
     <>
       {stale && (
@@ -181,7 +194,7 @@ export function StatusBanners({ info }: { info: Info }) {
           {info.snapshot?.error && <p className="muted small">{info.snapshot.error}</p>}
         </div>
       )}
-      {unavailable.length > 0 && dismissed !== sig && (
+      {unavailable.length > 0 && !dismissed && (
         <div className="notice banner" role="status">
           <div className="banner-head">
             <p>
@@ -197,6 +210,30 @@ export function StatusBanners({ info }: { info: Info }) {
         </div>
       )}
     </>
+  )
+}
+
+/**
+ * "Prometheus is unavailable: memory history and leak detection are paused",
+ * on the pages that read metrics while /info lists Prometheus as unavailable.
+ * Dismissed like the banner: per tab, for this reason, which stays the same
+ * while the failure does. `fallback` stands in once it is dismissed.
+ */
+export function PrometheusNotice({ reason, fallback }: { reason: string; fallback?: ReactNode }) {
+  const [dismissed, dismiss] = useDismissed(PROMETHEUS_DISMISS_KEY, reason)
+  if (dismissed) return <>{fallback}</>
+  return (
+    <div className="notice warn" role="status">
+      <div className="banner-head">
+        <p>
+          <strong>Prometheus is unavailable:</strong> memory history and leak detection are paused.
+        </p>
+        <button type="button" className="btn quiet" onClick={dismiss}>Dismiss</button>
+      </div>
+      <p className="muted small">
+        <span className="id">prometheus</span>: {reason}
+      </p>
+    </div>
   )
 }
 

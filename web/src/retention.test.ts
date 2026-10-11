@@ -5,6 +5,7 @@ import {
   auditWhy,
   clusterFacts,
   durationHours,
+  findingsLookback,
   formatSpan,
   lookbackText,
   metricsHistoryHours,
@@ -89,8 +90,25 @@ describe('retention-driven text', () => {
     expect(lookbackText(24, 6, 'Prometheus')).toBe('in the last 6 hours (all the history Prometheus has)')
     expect(lookbackText(24, 0, 'the audit log')).toBe('yet (the audit log has no history)')
   })
+  it('claims the Findings window only as far as the sources reach', () => {
+    const pg = { backend: 'postgres' as const, events: 120_000, retentionHours: 720, oldest: hoursAgo(500) }
+    expect(findingsLookback(24, undefined, { included: false }, now)).toBe('in the last 24 hours')
+    expect(findingsLookback(24, 6, { included: false }, now)).toBe('in the last 6 hours (all the history Prometheus has)')
+    expect(findingsLookback(24, 168, { included: true, store: pg }, now)).toBe('in the last 24 hours')
+    expect(findingsLookback(24, 168, { included: true, store: { backend: 'memory', events: 3, oldest: hoursAgo(2) } }, now)).toBe(
+      'in the last 2 hours (all the history the audit log has)',
+    )
+    expect(findingsLookback(24, undefined, { included: true, store: { backend: 'memory', events: 0 } }, now)).toBe('yet (the audit log has no history)')
+  })
+  it('stays neutral while the audit store has not answered /info', () => {
+    // At startup the server waits at most 50 ms for audit coverage and leaves auditStore out.
+    expect(findingsLookback(24, 168, { included: true, store: undefined }, now)).toBe('recently')
+    expect(activityEmptyText('168h0m0s', undefined, now)).toBe('Nobody has acted on this pod recently.')
+    expect(auditHistoryHours(undefined, now)).toBeUndefined()
+    expect(windowChoices([{ value: '720h', label: '30 days', hours: 720 }], auditHistoryHours(undefined, now), auditWhy(undefined)).every((c) => !c.disabled)).toBe(true)
+  })
   it('words the empty pod activity from the server window and the audit store', () => {
-    expect(activityEmptyText('168h0m0s', undefined, now)).toBe('Nobody has acted on this pod in the last 7 days.')
+    expect(activityEmptyText('168h0m0s', { backend: 'postgres', events: 4, retentionHours: 720, oldest: hoursAgo(500) }, now)).toBe('Nobody has acted on this pod in the last 7 days.')
     expect(activityEmptyText(undefined, undefined, now)).toBe('Nobody has acted on this pod recently.')
     expect(activityEmptyText('168h0m0s', { backend: 'memory', events: 4, oldest: hoursAgo(5) }, now)).toMatch(/^Nobody has acted on this pod since the audit log begins \(/)
     expect(activityEmptyText('24h', { backend: 'postgres', events: 4, retentionHours: 720, oldest: hoursAgo(500) }, now)).toBe('Nobody has acted on this pod in the last 24 hours.')

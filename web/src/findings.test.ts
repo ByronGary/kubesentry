@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activityFindings, certFindings, memoryFindings, oomFindings, rank, securityFindings, volumeFindings, workloadHref } from './findings'
+import { activityFindings, certFindings, memoryFindings, nothingFoundText, oomFindings, rank, securityFindings, volumeFindings, workloadHref } from './findings'
 import type { AuditEvent, CertificatesResponse, CertSummary, IssuerSummary, OOMResponse, SecurityFinding, SecurityResponse } from './types'
 
 const MiB = 1 << 20
@@ -158,5 +158,18 @@ describe('workloadHref', () => {
   it('filters the workloads page', () => {
     expect(workloadHref('data', 'ml trainer')).toBe('#/workloads?namespace=data&q=ml+trainer')
     expect(workloadHref('', '')).toBe('#/workloads')
+  })
+})
+
+describe('nothingFoundText', () => {
+  it('names only what was checked', () => {
+    expect(nothingFoundText({ leaks: true, security: true, certs: true, activity: true }, 'in the last 24 hours')).toBe(
+      'No OOM kills, leaking containers, security risks, failing certificates, unused volumes or notable activity in the last 24 hours.',
+    )
+    // Prometheus down and the audit store busy: neither leaks nor activity is claimed.
+    expect(nothingFoundText({ leaks: false, security: false, certs: false, activity: false }, 'recently')).toBe('No OOM kills or unused volumes recently.')
+    expect(nothingFoundText({ leaks: true, security: false, certs: true, activity: false }, 'in the last 6 hours (all the history Prometheus has)')).toBe(
+      'No OOM kills, leaking containers, failing certificates or unused volumes in the last 6 hours (all the history Prometheus has).',
+    )
   })
 })

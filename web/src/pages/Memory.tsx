@@ -1,19 +1,23 @@
+import { PrometheusNotice, useInfo } from '../components/Access'
 import { Async, Empty, PageHead } from '../components/ui'
 import { podHref } from '../findings'
 import { ago, formatBytes, formatHours } from '../format'
+import { prometheusOutage, unexplainedWarnings } from '../sources'
 import type { OOMResponse } from '../types'
 import { useApi } from '../useApi'
 
 export function Memory() {
   const state = useApi<OOMResponse>('/api/v1/oom?window=24h', 60_000)
+  const down = prometheusOutage(useInfo())
   return (
     <>
       <PageHead title="Memory" lede="Containers killed for running out of memory, and containers whose memory only climbs." />
+      {down && <PrometheusNotice reason={down} />}
       <Async state={state} what="memory findings">
         {(d) => (
           <>
-            {d.warnings?.map((w) => <div className="notice warn" key={w}>{w}</div>)}
-            {!d.metricsAvailable && <div className="notice warn">No Prometheus connection, so leak detection is off. OOM kills below still come from the cluster.</div>}
+            {unexplainedWarnings(d.warnings, { prometheus: !!down }).map((w) => <div className="notice warn" key={w}>{w}</div>)}
+            {!d.metricsAvailable && !down && <div className="notice warn">No Prometheus connection, so leak detection is off. OOM kills below still come from the cluster.</div>}
             <section aria-labelledby="h-oom">
               <h2 id="h-oom">OOMKilled</h2>
               {d.events.length === 0 ? (
@@ -39,7 +43,11 @@ export function Memory() {
             <section aria-labelledby="h-leak">
               <h2 id="h-leak">Likely leaks</h2>
               {d.leaks.length === 0 ? (
-                <Empty title="No steady memory growth found" />
+                down && !d.metricsAvailable ? (
+                  <Empty title="Leak detection is paused">Prometheus is unavailable. Leaks show here again once it answers.</Empty>
+                ) : (
+                  <Empty title="No steady memory growth found" />
+                )
               ) : (
                 <div className="table-wrap" tabIndex={0}>
                   <table>

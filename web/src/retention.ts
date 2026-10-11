@@ -39,7 +39,10 @@ export function durationHours(s: string | undefined): number | undefined {
 
 /**
  * Hours of audit history the store can answer for: the smaller of its
- * retention and the age of its oldest event. Undefined when the server does not say.
+ * retention and the age of its oldest event. Undefined when the server does not
+ * say, which includes the moment at startup before the store answers /info:
+ * callers then enable every window and word their text neutrally. `events` is
+ * an estimate above 100,000 with Postgres, but 0 is always exact.
  */
 export function auditHistoryHours(store: AuditStore | undefined, now: number = Date.now()): number | undefined {
   if (!store) return undefined
@@ -118,18 +121,38 @@ export function lookbackText(wantedHours: number, historyHours: number | undefin
 }
 
 /**
+ * The lookback the empty Findings page may claim for its `wantedHours` of
+ * queries: no more than Prometheus (`metricsHours`, when leaks were checked)
+ * or the audit log holds. An audit log that is part of the claim but has not
+ * said how far back it goes (a missing `auditStore` means "not known yet", not
+ * "empty") makes the claim neutral: "recently".
+ */
+export function findingsLookback(
+  wantedHours: number,
+  metricsHours: number | undefined,
+  audit: { included: boolean; store?: AuditStore },
+  now: number = Date.now(),
+): string {
+  if (audit.included && !audit.store) return 'recently'
+  const events = audit.included ? auditHistoryHours(audit.store, now) : undefined
+  if (events !== undefined && (metricsHours === undefined || events < metricsHours)) return lookbackText(wantedHours, events, 'the audit log')
+  return lookbackText(wantedHours, metricsHours, 'Prometheus')
+}
+
+/**
  * The empty state for a pod's recent activity. `window` is the server's
- * lookback (a Go duration) when it says; otherwise the text makes no claim
- * about how far back it looked.
+ * lookback (a Go duration) when it says. Without it, or while the audit store
+ * has not said how far back it goes (/info leaves `auditStore` out for a
+ * moment at startup), the text makes no claim about how far back it looked.
  */
 export function activityEmptyText(window: string | undefined, store: AuditStore | undefined, now: number = Date.now()): string {
   const wanted = durationHours(window)
   const history = auditHistoryHours(store, now)
-  if (wanted === undefined) {
+  if (wanted === undefined || history === undefined) {
     if (history !== undefined && store?.oldest) return `Nobody has acted on this pod since the audit log begins (${formatDateTime(store.oldest)}).`
     return 'Nobody has acted on this pod recently.'
   }
-  if (history !== undefined && history < wanted * 0.98 && store?.oldest) {
+  if (history < wanted * 0.98 && store?.oldest) {
     return `Nobody has acted on this pod since the audit log begins (${formatDateTime(store.oldest)}).`
   }
   return `Nobody has acted on this pod in the last ${formatSpan(wanted)}.`
