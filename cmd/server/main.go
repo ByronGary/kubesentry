@@ -167,6 +167,7 @@ func run(cfg *config) error {
 	}
 	srv.Metrics = metricsSource
 	srv.PrometheusInfo = metricsSource.Info
+	srv.PrometheusHealth = metricsSource.Health
 
 	closers, err := setupAudit(ctx, cfg, policy, srv)
 	if err != nil {

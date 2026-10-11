@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,9 +39,104 @@ type promState struct {
 	scanner *prom.LeakScanner
 	info    api.PrometheusInfo // info.URL never carries user info
 	rawURL  string             // as configured, user info included: only for probing
+	health  *promHealth
 }
 
 func (p *promSource) MetricsAvailable() bool { return p.cur.Load() != nil }
+
+// Health reports why Prometheus cannot be queried now, nil when it can or
+// when there is none to query (that is configuration, not an outage). /info
+// lists it under unavailable and the ops /readyz under degraded.
+func (p *promSource) Health() error {
+	if st := p.cur.Load(); st != nil && st.health != nil {
+		return st.health.Err()
+	}
+	return nil
+}
+
+// promDownAfter consecutive failed requests mark Prometheus down; the next
+// success marks it up.
+const promDownAfter = 2
+
+// promHeartbeat is how often the health probe checks Prometheus, so an
+// outage (and the recovery) shows even while nobody opens a page that
+// queries it, and while the query cache answers those who do.
+const promHeartbeat = 15 * time.Second
+
+// promHealth remembers how the last requests to Prometheus went: every
+// request (pages, the leak scanner, the probes) passes healthTransport.
+type promHealth struct {
+	mu      sync.Mutex
+	fails   int
+	lastErr string
+}
+
+func (h *promHealth) observe(reason string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if reason == "" {
+		h.fails, h.lastErr = 0, ""
+		return
+	}
+	h.fails++
+	h.lastErr = reason
+}
+
+// Err is non-nil while Prometheus is down.
+func (h *promHealth) Err() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.fails < promDownAfter {
+		return nil
+	}
+	return fmt.Errorf("%d queries failed in a row; last: %s", h.fails, h.lastErr)
+}
+
+// healthTransport records whether each request reached a Prometheus that
+// answered. Failures are a transport error, a 5xx, 401, 403 or 429; a 4xx
+// for a bad query still counts as an answer. A request its caller cancelled
+// says nothing either way. The reason never includes the URL: queries carry
+// namespace names, and /info shows the reason to every user.
+type healthTransport struct {
+	base http.RoundTripper
+	h    *promHealth
+}
+
+func (t healthTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(r)
+	switch {
+	case err != nil:
+		if r.Context().Err() == nil {
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Err
+			}
+			t.h.observe("unreachable: " + err.Error())
+		}
+	case resp.StatusCode >= 500, resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusTooManyRequests:
+		t.h.observe("HTTP " + resp.Status)
+	default:
+		t.h.observe("")
+	}
+	return resp, err
+}
+
+// heartbeat probes Prometheus (buildinfo and a count(up) query, uncached)
+// every interval until ctx ends; the outcome reaches st.health through the
+// probe client's transport.
+func (st *promState) heartbeat(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		_, _ = prom.Probe(ctx, st.rawURL, st.probe)
+	}
+}
 
 func (p *promSource) state() (*promState, error) {
 	if st := p.cur.Load(); st != nil {
@@ -117,6 +214,8 @@ type promSetup struct {
 	// discover returns candidate base URLs, best first (kube.DiscoverPrometheus).
 	discover func(ctx context.Context) ([]string, error)
 	retry    time.Duration // between discovery attempts; default 1m
+	// heartbeat is how often the health probe runs; default promHeartbeat.
+	heartbeat time.Duration
 }
 
 // start sets the source up: at once for -prometheus-url, otherwise by
@@ -150,9 +249,14 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 		}
 		tr, source = t, "amp"
 	}
+	health := &promHealth{}
+	queryTr := tr
+	if queryTr == nil {
+		queryTr = http.DefaultTransport
+	}
 	c, err := prom.NewClient(url, prom.Options{
 		BearerToken: os.Getenv("PROMETHEUS_TOKEN"),
-		Transport:   tr,
+		Transport:   healthTransport{base: queryTr, h: health},
 		Selector:    s.selector,
 		KSMLimits:   s.ksmLimits,
 		Cache:       prom.NewCache(prom.CacheOptions{}),
@@ -164,7 +268,14 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 	if err != nil {
 		return nil, err
 	}
-	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}, rawURL: url, probe: probeClient(tr)}
+	probe := probeClient(tr)
+	probe.Transport = healthTransport{base: probe.Transport, h: health}
+	st := &promState{client: c, info: api.PrometheusInfo{Source: source, URL: c.BaseURL()}, rawURL: url, probe: probe, health: health}
+	heartbeat := s.heartbeat
+	if heartbeat <= 0 {
+		heartbeat = promHeartbeat
+	}
+	go st.heartbeat(ctx, heartbeat)
 	if c.HasURLCredentials() {
 		slog.Warn("-prometheus-url carries credentials (user:password@); they are sent as basic auth but kept out of logs and /info. "+
 			"Prefer PROMETHEUS_TOKEN (chart: prometheus.bearerTokenSecret), which stays out of the process arguments", "url", c.BaseURL())

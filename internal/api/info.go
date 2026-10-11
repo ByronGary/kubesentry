@@ -159,7 +159,11 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	if s.Unavailable != nil {
 		live = s.Unavailable()
 	}
-	resp.Unavailable = mergeUnavailable(fromView, live)
+	var prom map[string]string
+	if err := s.prometheusDown(); err != nil {
+		prom = map[string]string{"prometheus": err.Error()}
+	}
+	resp.Unavailable = mergeUnavailable(fromView, live, prom)
 	writeJSON(w, http.StatusOK, resp)
 }
 
