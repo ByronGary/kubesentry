@@ -104,9 +104,9 @@ Each pod page then shows a Processes table: name, container, CPU, memory, thread
 
 Access has three modes (`-auth-mode`):
 
-- **proxy**: an SSO proxy (oauth2-proxy, as the Helm chart deploys it) signs users in and passes their identity in headers, trusted only from `-auth-trusted-proxy-cidrs`. Each user sees exactly what their Kubernetes RBAC lets them list: kubesentry asks the API server with SubjectAccessReviews and caches the answers (`-authz-cache-ttl`). A user can force a recheck after an RBAC change. Cluster-scoped data (nodes, volumes, storage classes, cluster RBAC, ClusterIssuers) needs its cluster-wide permission; without it the pages show only names related to the user's own objects. See `docs/deploy-eks.md`.
+- **proxy**: an SSO proxy (oauth2-proxy, as the Helm chart deploys it) signs users in and passes their identity in headers. With the sidecar, kubesentry listens only on a Unix socket the two containers share (`-addr unix:///var/run/kubesentry/web.sock`) and trusts the headers on it alone; a proxy elsewhere is trusted from `-auth-trusted-proxy-cidrs` (never `0.0.0.0/0` without `-auth-allow-any-proxy`, and with a startup warning for loopback, which `kubectl port-forward` also comes from). Each user sees exactly what their Kubernetes RBAC lets them list: kubesentry asks the API server with SubjectAccessReviews and caches the answers (`-authz-cache-ttl`). A user can force a recheck after an RBAC change. Cluster-scoped data (nodes, volumes, storage classes, cluster RBAC, ClusterIssuers) needs its cluster-wide permission; without it the pages show only names related to the user's own objects. See `docs/deploy-eks.md`.
 - **token** (default): the shared `-api-token`, a break-glass identity that sees everything. The UI asks for it and keeps it for the browser tab only. Without a token the server only listens on loopback.
-- **none**: everyone sees everything; loopback only.
+- **none**: everyone sees everything; loopback only. Here, and in token mode without a token, only the Host names `localhost`, `127.0.0.1` and `[::1]` are answered (`-allowed-hosts`), so a web page cannot reach the server through DNS rebinding.
 
 Credentials are resolved from `-kubeconfig`, then the in-cluster service account, then `KUBECONFIG` / `~/.kube/config`.
 
@@ -116,15 +116,17 @@ The most used; `docs/contracts.md` lists every flag, and `kubesentry -h` describ
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `-addr` | `127.0.0.1:8080` | UI and API listen address. Use `:8080` to listen on all interfaces, together with `-api-token` or `-auth-mode=proxy` |
+| `-addr` | `127.0.0.1:8080` | UI and API listen address. Use `:8080` to listen on all interfaces, together with `-api-token` or `-auth-mode=proxy`; `unix:///path` listens on a Unix socket (mode 0660) for an SSO proxy sidecar |
+| `-allowed-hosts` | loopback names without auth, else any | Host header patterns (`host[:port]`, `*.domain`, `*`) the web listener answers; others get 403 |
 | `-ingest-addr`, `-ops-addr` | | Separate listeners for agent reports and the audit webhook, and for `/healthz`, `/readyz`, `/metrics` (and `/debug/pprof/` with `-pprof`). Empty: ingest and probes on `-addr` |
 | `-auth-mode` | `token` | `token`, `proxy` or `none` (above); `-auth-user-header`, `-auth-groups-header`, `-auth-trusted-proxy-cidrs` configure proxy mode |
 | `-api-token` | | Break-glass bearer token for `/api/` routes (env `KUBESENTRY_API_TOKEN`) |
+| `-max-inflight-per-identity` | `4` | Requests one user may have in flight on the expensive routes (`/oom`, pod diagnostics, audit summary); more get 429 |
 | `-tls-cert`, `-tls-key` | | Serve HTTPS on the web and ingest listeners |
 | `-kubeconfig` | | Path to kubeconfig |
 | `-cache` | `true` | Serve from shared informers and a precomputed view; `false` lists the cluster on every request (debugging) |
 | `-cluster-name` | | Shown in the UI; names the EKS CloudWatch log group |
-| `-prometheus-url` | | Prometheus (or an AMP workspace, signed with SigV4) for leak detection; `PROMETHEUS_TOKEN` for bearer auth. Empty: discover an in-cluster Prometheus (`-prometheus-autodiscover`) |
+| `-prometheus-url` | | Prometheus (or an AMP workspace, signed with SigV4) for leak detection; `PROMETHEUS_TOKEN` for bearer auth (preferred over `user:password@` in the URL, which is sent as basic auth but kept out of logs and `/info`). Empty: discover an in-cluster Prometheus (`-prometheus-autodiscover`) |
 | `-pvc-min-age` | `24h` | Ignore unused PVCs younger than this |
 | `-pvc-default-price` | unset | USD per GiB-month for classes nothing else prices; unset means no estimate. EBS classes are priced from a table (`-ebs-prices`), and a StorageClass annotation `kubesentry.io/price-per-gib-month` wins |
 | `-pvc-class-prices` | | Per storage class, e.g. `gp3=0.08,io2=0.125` |
