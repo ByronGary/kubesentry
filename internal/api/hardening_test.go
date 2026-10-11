@@ -418,21 +418,52 @@ func (c *countingReviewer) Review(ctx context.Context, user string, groups []str
 	return c.grantReviewer.Review(ctx, user, groups, verb, group, resource, ns)
 }
 
-// Every distinct namespace name in a pod path costs a SubjectAccessReview
-// and a cache entry, also for namespaces that do not exist.
-func TestProbeUnknownNamespacesCostNoReviews(t *testing.T) {
+// Every distinct namespace name in a pod path once cost a
+// SubjectAccessReview and a cache entry, also for namespaces that do not
+// exist. Objects the view does not hold are 404 without any review, with
+// the same body as objects the caller may not see.
+func TestUnknownObjectsCostNoReviews(t *testing.T) {
 	s := tenantServer(t)
 	rv := &countingReviewer{grantReviewer: tenantGrants()}
 	s.Authorizer = &auth.SARAuthorizer{Reviewer: rv, Candidates: s.Authorizer.(*auth.SARAuthorizer).Candidates}
 	s.RateLimit = 0
 	h := s.Handler()
+	var bodies []string
 	for i := 0; i < 50; i++ {
-		if rec := getAs(t, h, "carol", fmt.Sprintf("/api/v1/pods/nope-%d/x/diagnostics", i), nil); rec.Code != 404 {
-			t.Fatalf("status %d", rec.Code)
+		for _, path := range []string{
+			fmt.Sprintf("/api/v1/pods/nope-%d/x/diagnostics", i),
+			fmt.Sprintf("/api/v1/pods/nope-%d/x/processes", i),
+			fmt.Sprintf("/api/v1/pods/team-b/web-%d/diagnostics", 10+i), // the namespace exists, the pod does not
+		} {
+			rec := getAs(t, h, "carol", path, nil)
+			if rec.Code != 404 {
+				t.Fatalf("%s = %d", path, rec.Code)
+			}
+			bodies = append(bodies, rec.Body.String())
 		}
 	}
-	if n := rv.n.Load(); n >= 50 {
-		t.Errorf("50 lookups of namespaces that do not exist made %d SubjectAccessReviews", n)
+	if n := rv.n.Load(); n != 0 {
+		t.Errorf("lookups of objects that do not exist made %d SubjectAccessReviews", n)
+	}
+	// The map's namespace and a node's name: no review per made-up name.
+	before := rv.n.Load()
+	getAs(t, h, "carol", "/api/v1/map?namespace=nope-0", nil)
+	getAs(t, h, "carol", "/api/v1/nodes/nope-0", nil)
+	after := rv.n.Load()
+	for i := 1; i < 20; i++ {
+		for _, path := range []string{fmt.Sprintf("/api/v1/map?namespace=nope-%d", i), fmt.Sprintf("/api/v1/nodes/nope-%d", i)} {
+			if rec := getAs(t, h, "carol", path, nil); rec.Code != 404 {
+				t.Fatalf("%s = %d", path, rec.Code)
+			}
+		}
+	}
+	if rv.n.Load() != after {
+		t.Errorf("made-up map namespaces and node names cost %d more reviews after the first (%d)", rv.n.Load()-after, after-before)
+	}
+	// Existing but hidden, and missing: the same answer.
+	hidden := getAs(t, h, "carol", "/api/v1/pods/team-b/web-0/diagnostics", nil)
+	if hidden.Code != 404 || hidden.Body.String() != bodies[0] {
+		t.Errorf("hidden pod = %d %q, missing pod = %q", hidden.Code, hidden.Body.String(), bodies[0])
 	}
 }
 
@@ -535,36 +566,60 @@ func TestAuditWithoutGrantsSkipsTheStore(t *testing.T) {
 	}
 }
 
-// A caller with ViewNodes but only some namespaces gets each node's
+// A caller with ViewNodes but only some namespaces once got each node's
 // requested CPU and memory summed over every pod on it, hidden namespaces
-// included, while pods and podCount are cut to their namespaces.
-func TestProbeNodeRequestsCoverOnlyVisiblePods(t *testing.T) {
+// included, while pods and podCount were cut to their namespaces. All of
+// them now cover the caller's pods only; unrestricted callers see totals.
+func TestNodeRequestsCoverOnlyVisiblePods(t *testing.T) {
 	inv := tenantInventory()
 	for i := range inv.Pods {
 		inv.Pods[i].Specs[0].CPURequestMilli = 100
+		inv.Pods[i].Specs[0].MemoryRequestBytes = 1 << 20
 	}
 	v := snapshot.Build(inv, detectors.DefaultPolicy(), now)
 	s := tenantServer(t)
 	s.Views = currentView{v}
 	s.Authorizer = &auth.SARAuthorizer{Reviewer: tenantGrants(), Candidates: v.RBAC()}
-	var nodes nodesResponse
-	getAs(t, s.Handler(), "bob", "/api/v1/nodes", &nodes)
-	for _, n := range nodes.Items {
-		visible := int64(0)
-		for _, p := range n.Pods {
-			if p.Namespace == "team-b" {
-				visible += 100
+	for _, path := range []string{"/api/v1/nodes", "/api/v1/nodes/n1"} {
+		var items []detectors.NodeSummary
+		if strings.HasSuffix(path, "/n1") {
+			var n detectors.NodeSummary
+			getAs(t, s.Handler(), "bob", path, &n)
+			items = []detectors.NodeSummary{n}
+		} else {
+			var nodes nodesResponse
+			getAs(t, s.Handler(), "bob", path, &nodes)
+			items = nodes.Items
+		}
+		for _, n := range items {
+			mine := 0
+			for _, p := range n.Pods {
+				if p.Namespace == "team-b" {
+					mine++
+				}
+			}
+			if n.CPURequestedMilli != int64(100*mine) || n.MemoryRequestedBytes != int64(mine)<<20 || n.PodCount != mine || mine == 0 {
+				t.Errorf("%s: bob (team-b) sees node %s requesting %dm CPU, %d bytes, %d pods; his %d pods there request %dm",
+					path, n.Name, n.CPURequestedMilli, n.MemoryRequestedBytes, n.PodCount, mine, 100*mine)
 			}
 		}
-		if n.CPURequestedMilli > visible {
-			t.Errorf("bob (team-b) sees node %s requesting %dm CPU; his pods there request %dm", n.Name, n.CPURequestedMilli, visible)
-		}
+	}
+	// Unrestricted: the node's own totals.
+	s.Authenticator = nil
+	var nodes nodesResponse
+	getAs(t, s.Handler(), "", "/api/v1/nodes", &nodes)
+	total := int64(0)
+	for _, n := range nodes.Items {
+		total += n.CPURequestedMilli
+	}
+	if total != int64(100*len(inv.Pods)) {
+		t.Errorf("unrestricted total = %dm, want %dm", total, 100*len(inv.Pods))
 	}
 }
 
 // Path and method tricks never reach an API handler without an identity.
-// (Passes: recorded as coverage.)
-func TestProbeNoUnauthenticatedAPIPaths(t *testing.T) {
+// (This passed already; kept as coverage.)
+func TestNoUnauthenticatedAPIPaths(t *testing.T) {
 	s := tenantServer(t)
 	s.UI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(299) })
 	h := s.Handler()

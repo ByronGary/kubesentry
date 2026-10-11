@@ -122,7 +122,9 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		resp.Cluster = &infoCluster{Name: ci.Name, Version: ci.Version, Platform: ci.Platform, Provider: ci.Provider, Region: ci.Region}
 	}
 
-	if s.Audit != nil {
+	// The store's event count and span describe the whole cluster's
+	// activity: only for callers who may read audit events somewhere.
+	if s.Audit != nil && (resp.Capabilities["audit"] || resp.Capabilities["clusterAudit"]) {
 		if c, err := s.auditStore().Coverage(ctx); err != nil {
 			slog.Warn("audit coverage", "err", err)
 		} else {

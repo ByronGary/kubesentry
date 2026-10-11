@@ -182,7 +182,11 @@ func (s *Server) Serve(p Parts) http.Handler {
 	mux := http.NewServeMux()
 	if p.Probes {
 		mux.HandleFunc("GET /healthz", s.healthz)
-		mux.HandleFunc("GET /readyz", s.readyz)
+		if p.Web {
+			mux.HandleFunc("GET /readyz", s.readyzStatus) // reachable by every UI user
+		} else {
+			mux.HandleFunc("GET /readyz", s.readyz)
+		}
 	}
 	if p.Metrics {
 		mux.Handle("GET /metrics", metricsHandler())
@@ -250,7 +254,7 @@ var cachedRoutes = map[string][]auth.Capability{
 	"GET /api/v1/nodes":        {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/nodes/{name}": {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/storage":      {auth.ViewNamespace, auth.ViewPVs, auth.ViewStorageClass},
-	"GET /api/v1/security":     {auth.ViewNamespace, auth.ViewClusterRBAC},
+	"GET /api/v1/security":     {auth.ViewNamespace, auth.ViewRBAC, auth.ViewClusterRBAC},
 	"GET /api/v1/map":          {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/certificates": {auth.ViewNamespace, auth.ViewClusterIssuer},
 }

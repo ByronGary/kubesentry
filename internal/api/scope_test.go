@@ -92,14 +92,23 @@ func tenantInventory() model.Inventory {
 			{Kind: "ClusterRole", Name: "kubesentry-viewer", Rules: []model.PolicyRule{
 				{APIGroups: []string{"kubesentry.io"}, Resources: []string{"auditevents", "processes"}, Verbs: []string{"get", "list"}}}},
 			{Kind: "ClusterRole", Name: "cluster-admin", Rules: []model.PolicyRule{{APIGroups: []string{"*"}, Resources: []string{"*"}, Verbs: []string{"*"}}}},
+			{Kind: "ClusterRole", Name: "rbac-reader", Rules: []model.PolicyRule{
+				{APIGroups: []string{"rbac.authorization.k8s.io"}, Resources: []string{"rolebindings"}, Verbs: []string{"list"}}}},
 		},
 		Bindings: []model.RoleBinding{
+			// The reviewer confirms this one only where a test grants it.
+			{Kind: "RoleBinding", Namespace: "team-a", Name: "alice-rbac", RoleKind: "ClusterRole", RoleName: "rbac-reader", Subjects: []model.Subject{{Kind: "User", Name: "alice"}}},
 			{Kind: "RoleBinding", Namespace: "team-a", Name: "alice-view", RoleKind: "ClusterRole", RoleName: "view", Subjects: []model.Subject{{Kind: "User", Name: "alice"}}},
 			{Kind: "RoleBinding", Namespace: "team-a", Name: "alice-ks", RoleKind: "ClusterRole", RoleName: "kubesentry-viewer", Subjects: []model.Subject{{Kind: "User", Name: "alice"}}},
 			{Kind: "RoleBinding", Namespace: "team-b", Name: "alice-stale", RoleKind: "ClusterRole", RoleName: "view", Subjects: []model.Subject{{Kind: "User", Name: "alice"}}},
 			{Kind: "RoleBinding", Namespace: "team-b", Name: "bob-view", RoleKind: "ClusterRole", RoleName: "view", Subjects: []model.Subject{{Kind: "User", Name: "bob"}}},
 			{Kind: "ClusterRoleBinding", Name: "erin-admin", RoleKind: "ClusterRole", RoleName: "cluster-admin", Subjects: []model.Subject{{Kind: "User", Name: "erin"}}},
 		},
+	}
+	// A namespaced RBAC finding in every namespace: cluster-admin bound in it.
+	for _, ns := range tenants {
+		inv.RBAC.Bindings = append(inv.RBAC.Bindings, model.RoleBinding{Kind: "RoleBinding", Namespace: ns, Name: "ns-admins",
+			RoleKind: "ClusterRole", RoleName: "cluster-admin", Subjects: []model.Subject{{Kind: "Group", Name: ns + "-admins"}}})
 	}
 	return inv
 }
@@ -288,6 +297,9 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		if f.Namespace == "" {
 			t.Errorf("alice sees a cluster-scoped finding: %+v", f)
 		}
+		if f.Category == "rbac" {
+			t.Errorf("alice (pods, not rolebindings, in team-a) sees an RBAC finding: %+v", f)
+		}
 		if !f.System {
 			own[f.Severity]++
 		}
@@ -373,6 +385,43 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 				t.Errorf("bob sees pod %s/%s on %s", p.Namespace, p.Name, n.Name)
 			}
 		}
+	}
+
+	// Namespaced RBAC findings need ViewRBAC (list rolebindings) in their
+	// namespace; the counts follow.
+	g := tenantGrants()
+	g[grant("alice", auth.ViewRBAC, "team-a")] = true
+	s.Authorizer = &auth.SARAuthorizer{Reviewer: g, Candidates: s.Authorizer.(*auth.SARAuthorizer).Candidates}
+	h = s.Handler()
+	var withRBAC, withRBACSummary securityResponse
+	getAs(t, h, "alice", "/api/v1/security?limit=1000", &withRBAC)
+	getAs(t, h, "alice", "/api/v1/security?view=summary", &withRBACSummary)
+	rbacFindings := 0
+	for _, f := range withRBAC.Findings {
+		if f.Category == "rbac" {
+			rbacFindings++
+			if f.Namespace != "team-a" {
+				t.Errorf("alice's RBAC finding outside team-a: %+v", f)
+			}
+		}
+	}
+	total := func(c map[string]int) int { return c["crit"] + c["warn"] + c["info"] }
+	if rbacFindings == 0 || total(withRBAC.Counts) != total(sec.Counts)+rbacFindings || total(withRBACSummary.Counts) != total(withRBAC.Counts) {
+		t.Errorf("with ViewRBAC in team-a alice sees %d RBAC findings, counts %v (summary %v), without %v",
+			rbacFindings, withRBAC.Counts, withRBACSummary.Counts, sec.Counts)
+	}
+
+	// The audit store's cluster-wide counts only for callers who may read
+	// audit events.
+	var info infoResponse
+	getAs(t, h, "carol", "/api/v1/info", &info)
+	if info.AuditStore != nil {
+		t.Errorf("carol (no audit grant) reads the audit store's coverage: %+v", info.AuditStore)
+	}
+	info = infoResponse{}
+	getAs(t, h, "alice", "/api/v1/info", &info)
+	if info.AuditStore == nil || info.AuditStore.Events == 0 {
+		t.Errorf("alice (audit in team-a) has no audit store coverage: %+v", info.AuditStore)
 	}
 }
 
@@ -576,21 +625,42 @@ func TestReadiness(t *testing.T) {
 		}
 		return nil
 	}}}
+	ops := s.Serve(Parts{Probes: true, Metrics: true}) // the ops listener
+	probe := func(h http.Handler, out *readyResponse) int {
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		*out = readyResponse{}
+		_ = json.Unmarshal(rec.Body.Bytes(), out)
+		return rec.Code
+	}
 	var r readyResponse
-	if code := get(t, s, "/readyz", &r); code != 503 || r.Status != "starting" {
+	if code := probe(ops, &r); code != 503 || r.Status != "starting" {
 		t.Errorf("before sync = %d %+v", code, r)
 	}
 	ready = true
-	if code := get(t, s, "/readyz", &r); code != 200 || r.Status != "ready" || len(r.Degraded) != 0 || r.Unavailable["clusterrolebindings"] != "forbidden" {
+	if code := probe(ops, &r); code != 200 || r.Status != "ready" || len(r.Degraded) != 0 || r.Unavailable["clusterrolebindings"] != "forbidden" {
 		t.Errorf("after sync = %d %+v", code, r)
 	}
 	pgDown = true
-	r = readyResponse{}
-	if code := get(t, s, "/readyz", &r); code != 200 || r.Degraded["postgres"] != "connection refused" {
+	if code := probe(ops, &r); code != 200 || r.Degraded["postgres"] != "connection refused" {
 		t.Errorf("degraded = %d %+v", code, r)
 	}
 	if code := get(t, s, "/healthz", nil); code != 200 {
 		t.Errorf("healthz = %d", code)
+	}
+
+	// On the web listener (no -ops-addr) every UI user can call /readyz: the
+	// status only, no dependency errors.
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "connection refused") || strings.Contains(rec.Body.String(), "forbidden") {
+		t.Errorf("readyz on the web listener = %d %s", rec.Code, rec.Body.String())
+	}
+	ready = false
+	if probe(s.Handler(), &r) != 503 || r.Status != "starting" {
+		t.Errorf("web readyz before sync = %+v", r)
 	}
 }
 
