@@ -274,11 +274,18 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 // timeout, the per-identity cap on expensive routes, ETag, the response
 // cache (cachedRoutes only) and gzip.
 func (s *Server) route(mux *http.ServeMux, pattern, name string, timeout time.Duration, h http.HandlerFunc) {
+	s.routeCapped(mux, pattern, name, timeout, nil, h)
+}
+
+// routeCapped is route with an extra limit inside the timeout (the
+// per-identity cap of the expensive routes), so a slot is held until the
+// handler has really finished.
+func (s *Server) routeCapped(mux *http.ServeMux, pattern, name string, timeout time.Duration, limit func(http.Handler) http.Handler, h http.HandlerFunc) {
 	var cache func(http.Handler) http.Handler
 	if s.ResponseCache != nil && len(cachedRoutes[pattern]) > 0 && s.reportsCurrent() {
 		cache = s.ResponseCache.Middleware
 	}
-	mux.Handle(pattern, Compose(WithMetrics(name), WithTimeout(timeout), WithETag(), cache, WithGzip())(h))
+	mux.Handle(pattern, Compose(WithMetrics(name), WithTimeout(timeout), limit, WithETag(), cache, WithGzip())(h))
 }
 
 func (s *Server) timeouts() (normal, long time.Duration) {
@@ -292,15 +299,18 @@ func (s *Server) timeouts() (normal, long time.Duration) {
 func (s *Server) apiRoutes() http.Handler {
 	mux := http.NewServeMux()
 	t, long := s.timeouts()
+	// One cap shared by the expensive routes: Prometheus range queries and
+	// audit aggregations, which one user could otherwise run many of at once.
+	expensive := WithIdentityInflight(s.LongInflightPerIdentity)
 	s.route(mux, "GET /api/v1/info", "info", t, s.info)
 	mux.Handle("POST /api/v1/auth/recheck", Compose(WithMetrics("auth_recheck"), WithTimeout(t))(http.HandlerFunc(s.recheck)))
 	s.route(mux, "GET /api/v1/pvcs/unused", "pvcs_unused", t, s.unusedPVCs)
-	s.route(mux, "GET /api/v1/oom", "oom", long, s.oom)
+	s.routeCapped(mux, "GET /api/v1/oom", "oom", long, expensive, s.oom)
 	s.route(mux, "GET /api/v1/pods", "pods", t, s.pods)
-	s.route(mux, "GET /api/v1/pods/{namespace}/{name}/diagnostics", "pod_diagnostics", long, s.podDiagnostics)
+	s.routeCapped(mux, "GET /api/v1/pods/{namespace}/{name}/diagnostics", "pod_diagnostics", long, expensive, s.podDiagnostics)
 	if s.Audit != nil {
 		s.route(mux, "GET /api/v1/audit/events", "audit_events", t, s.auditEvents)
-		s.route(mux, "GET /api/v1/audit/summary", "audit_summary", t, s.auditSummary)
+		s.routeCapped(mux, "GET /api/v1/audit/summary", "audit_summary", t, expensive, s.auditSummary)
 	}
 	if s.Processes != nil {
 		s.route(mux, "GET /api/v1/pods/{namespace}/{name}/processes", "pod_processes", t, s.podProcesses)

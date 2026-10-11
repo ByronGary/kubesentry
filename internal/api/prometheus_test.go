@@ -37,6 +37,11 @@ func (s scannedMetrics) ContainerMemory(ctx context.Context, lookback, step time
 	return s.fakeMetrics.ContainerMemory(ctx, lookback, step)
 }
 
+func (s scannedMetrics) ContainerMemoryIn(ctx context.Context, nss []string, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	*s.calls++
+	return s.fakeMetrics.ContainerMemoryIn(ctx, nss, lookback, step)
+}
+
 func TestOOMServesTheLeakScan(t *testing.T) {
 	scanned := []detectors.LeakFinding{
 		{ContainerKey: model.ContainerKey{Namespace: "team-a", Pod: "web-1", Container: "web"}, SlopeBytesPerHour: 1 << 22, Confidence: "high"},
@@ -67,7 +72,7 @@ func TestOOMServesTheLeakScan(t *testing.T) {
 		t.Errorf("a caller without namespaces sees leaks: %+v", resp.Leaks)
 	}
 
-	// Another window falls back to querying every container now.
+	// Another window falls back to querying now (alice's namespaces only).
 	resp = oomResponse{}
 	getAs(t, h, "alice", "/api/v1/oom?window=6h", &resp)
 	if calls != 1 || !resp.MetricsAvailable || len(resp.Leaks) != 1 || resp.Leaks[0].Namespace != "team-a" {

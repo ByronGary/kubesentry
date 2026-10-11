@@ -2,8 +2,12 @@ package prom
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -58,6 +62,71 @@ func TestQueryInstantAndLimits(t *testing.T) {
 	for k, v := range limits {
 		if k.Pod != "web-0" || v != 536870912 {
 			t.Errorf("limit %+v = %v", k, v)
+		}
+	}
+}
+
+// A caller restricted to some namespaces never makes the server query the
+// whole cluster: every query names namespaces, only valid ones, and long
+// lists are split so each query stays under ~8 KiB.
+func TestContainerMemoryInRestrictsAndChunks(t *testing.T) {
+	var mu sync.Mutex
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		queries = append(queries, r.PostForm.Get("query"))
+		mu.Unlock()
+		w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer srv.Close()
+	c, err := NewClient(srv.URL, Options{KSMLimits: true, Selector: Matchers{{Name: "cluster", Op: "=", Value: "prod"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	if _, err := c.ContainerMemoryIn(ctx, nil, time.Hour, time.Minute); err != nil || len(queries) != 0 {
+		t.Fatalf("no namespaces: %d queries, %v", len(queries), err)
+	}
+	var nss []string
+	for i := 0; i < 600; i++ {
+		nss = append(nss, fmt.Sprintf("team-%03d.payments-production-eu-west-1", i))
+	}
+	nss = append(nss, "Bad_Namespace", `x"}or{y`, "team-000.payments-production-eu-west-1")
+	if _, err := c.ContainerMemoryIn(ctx, nss, time.Hour, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ContainerMemoryLimitsIn(ctx, nss); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) < 4 {
+		t.Fatalf("600 long namespaces fit in %d queries; want them split", len(queries))
+	}
+	seen := map[string]int{}
+	for _, q := range queries {
+		if len(q) > 8<<10 {
+			t.Errorf("query of %d bytes", len(q))
+		}
+		if !strings.Contains(q, `namespace=~"`) && !strings.Contains(q, `namespace="`) {
+			t.Errorf("query without a namespace matcher: %.200s", q)
+		}
+		if !strings.Contains(q, `cluster="prod"`) {
+			t.Errorf("query without the selector: %.200s", q)
+		}
+		if strings.Contains(q, "Bad_Namespace") || strings.Contains(q, "or{y") {
+			t.Errorf("invalid namespace reached PromQL: %.200s", q)
+		}
+		for _, ns := range nss[:600] {
+			if strings.Contains(q, regexp.QuoteMeta(ns)) || strings.Contains(q, strings.ReplaceAll(regexp.QuoteMeta(ns), `\`, `\\`)) {
+				seen[ns]++
+			}
+		}
+	}
+	for _, ns := range nss[:600] {
+		if seen[ns] != 2 { // once for memory, once for limits
+			t.Errorf("%s queried %d times, want 2", ns, seen[ns])
+			break
 		}
 	}
 }

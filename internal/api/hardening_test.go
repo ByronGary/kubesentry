@@ -269,10 +269,12 @@ func TestParseAllowedHosts(t *testing.T) {
 	}
 }
 
-// countingMetrics records cluster-wide memory queries.
+// countingMetrics records cluster-wide and namespace-restricted memory queries.
 type countingMetrics struct {
 	fakeMetrics
 	clusterWide atomic.Int64
+	mu          sync.Mutex
+	restricted  [][]string
 }
 
 func (c *countingMetrics) ContainerMemory(ctx context.Context, lookback, step time.Duration) ([]model.ContainerSeries, error) {
@@ -280,9 +282,30 @@ func (c *countingMetrics) ContainerMemory(ctx context.Context, lookback, step ti
 	return c.fakeMetrics.ContainerMemory(ctx, lookback, step)
 }
 
-// A caller who may see no namespace at all can still make the server run a
-// range query over every container in the cluster, once per distinct window.
-func TestProbeOOMWithoutGrantsQueriesNothing(t *testing.T) {
+func (c *countingMetrics) ContainerMemoryIn(ctx context.Context, nss []string, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	c.mu.Lock()
+	c.restricted = append(c.restricted, nss)
+	c.mu.Unlock()
+	return c.fakeMetrics.ContainerMemoryIn(ctx, nss, lookback, step)
+}
+
+// clusterOnlyMetrics cannot restrict queries to namespaces.
+type clusterOnlyMetrics struct{ m *countingMetrics }
+
+func (c clusterOnlyMetrics) ContainerMemory(ctx context.Context, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	return c.m.ContainerMemory(ctx, lookback, step)
+}
+func (c clusterOnlyMetrics) ContainerMemoryLimits(ctx context.Context) (map[model.ContainerKey]float64, error) {
+	return c.m.ContainerMemoryLimits(ctx)
+}
+func (c clusterOnlyMetrics) PodMemory(ctx context.Context, ns, pod string, lookback, step time.Duration) ([]model.ContainerSeries, map[model.ContainerKey]float64, error) {
+	return c.m.PodMemory(ctx, ns, pod, lookback, step)
+}
+
+// A caller who may not see every namespace never makes the server run a
+// range query over every container in the cluster: with no namespace there
+// is no query at all, otherwise the query names their namespaces.
+func TestOOMQueriesOnlyTheCallersNamespaces(t *testing.T) {
 	s := tenantServer(t)
 	m := &countingMetrics{fakeMetrics: s.Metrics.(fakeMetrics)}
 	s.Metrics = m
@@ -292,9 +315,96 @@ func TestProbeOOMWithoutGrantsQueriesNothing(t *testing.T) {
 			t.Fatalf("oom as carol = %d", rec.Code)
 		}
 	}
-	if n := m.clusterWide.Load(); n > 0 {
-		t.Errorf("carol (no grants) caused %d cluster-wide Prometheus range queries", n)
+	if n := m.clusterWide.Load(); n > 0 || len(m.restricted) > 0 {
+		t.Errorf("carol (no grants) caused %d cluster-wide and %d restricted Prometheus range queries", n, len(m.restricted))
 	}
+
+	var oom oomResponse
+	getAs(t, h, "alice", "/api/v1/oom?window=90m", &oom)
+	if n := m.clusterWide.Load(); n > 0 {
+		t.Errorf("alice (team-a) caused %d cluster-wide queries", n)
+	}
+	if len(m.restricted) != 1 || strings.Join(m.restricted[0], ",") != "team-a" {
+		t.Errorf("alice's queries named %v, want [[team-a]]", m.restricted)
+	}
+	if len(oom.Leaks) != 1 || oom.Leaks[0].Namespace != "team-a" || !oom.MetricsAvailable {
+		t.Errorf("alice's leaks = %+v", oom)
+	}
+
+	// Unrestricted callers still query the cluster.
+	s.Authenticator = nil
+	getAs(t, s.Handler(), "", "/api/v1/oom?window=90m", nil)
+	if m.clusterWide.Load() != 1 {
+		t.Errorf("unrestricted caller made %d cluster-wide queries, want 1", m.clusterWide.Load())
+	}
+
+	// A source that cannot restrict queries serves restricted callers only
+	// the background report, with a warning.
+	s = tenantServer(t)
+	m2 := &countingMetrics{fakeMetrics: s.Metrics.(fakeMetrics)}
+	s.Metrics = clusterOnlyMetrics{m2}
+	oom = oomResponse{}
+	getAs(t, s.Handler(), "alice", "/api/v1/oom?window=90m", &oom)
+	if m2.clusterWide.Load() != 0 || len(oom.Warnings) == 0 || len(oom.Leaks) != 0 {
+		t.Errorf("cluster-only source: %d cluster-wide queries, response %+v", m2.clusterWide.Load(), oom)
+	}
+}
+
+// One identity may hold at most LongInflightPerIdentity requests on the
+// expensive routes at once; others are not affected.
+func TestExpensiveRoutesCapPerIdentity(t *testing.T) {
+	s := tenantServer(t)
+	s.LongInflightPerIdentity = 2
+	block := make(chan struct{})
+	entered := make(chan struct{}, 8)
+	s.Metrics = blockingMetrics{fakeMetrics: s.Metrics.(fakeMetrics), block: block, entered: entered}
+	s.Authenticator = nil // unrestricted: /oom queries the cluster
+	h := s.Handler()
+	var wg sync.WaitGroup
+	codes := make(chan int, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- getAs(t, h, "", fmt.Sprintf("/api/v1/oom?window=%dm", 20+i), nil).Code
+		}()
+	}
+	<-entered
+	<-entered
+	rec := getAs(t, h, "", "/api/v1/oom?window=30m", nil)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("third expensive request = %d (Retry-After %q), want 429", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if rec := getAs(t, h, "", "/api/v1/pods", nil); rec.Code != 200 {
+		t.Errorf("a cheap route while capped = %d", rec.Code)
+	}
+	close(block)
+	wg.Wait()
+	close(codes)
+	for c := range codes {
+		if c != 200 {
+			t.Errorf("held request = %d", c)
+		}
+	}
+	if rec := getAs(t, h, "", "/api/v1/oom?window=31m", nil); rec.Code != 200 {
+		t.Errorf("after the others finished = %d", rec.Code)
+	}
+}
+
+// blockingMetrics holds every cluster-wide query until block closes.
+type blockingMetrics struct {
+	fakeMetrics
+	block   chan struct{}
+	entered chan struct{}
+}
+
+func (b blockingMetrics) ContainerMemory(ctx context.Context, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	b.entered <- struct{}{}
+	select {
+	case <-b.block:
+	case <-ctx.Done():
+	}
+	return b.fakeMetrics.ContainerMemory(ctx, lookback, step)
 }
 
 // countingReviewer counts SubjectAccessReviews.

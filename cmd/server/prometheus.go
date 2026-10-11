@@ -63,6 +63,22 @@ func (p *promSource) ContainerMemoryLimits(ctx context.Context) (map[model.Conta
 	return st.client.ContainerMemoryLimits(ctx)
 }
 
+func (p *promSource) ContainerMemoryIn(ctx context.Context, namespaces []string, lookback, step time.Duration) ([]model.ContainerSeries, error) {
+	st, err := p.state()
+	if err != nil {
+		return nil, err
+	}
+	return st.client.ContainerMemoryIn(ctx, namespaces, lookback, step)
+}
+
+func (p *promSource) ContainerMemoryLimitsIn(ctx context.Context, namespaces []string) (map[model.ContainerKey]float64, error) {
+	st, err := p.state()
+	if err != nil {
+		return nil, err
+	}
+	return st.client.ContainerMemoryLimitsIn(ctx, namespaces)
+}
+
 func (p *promSource) PodMemory(ctx context.Context, ns, pod string, lookback, step time.Duration) ([]model.ContainerSeries, map[model.ContainerKey]float64, error) {
 	st, err := p.state()
 	if err != nil {
