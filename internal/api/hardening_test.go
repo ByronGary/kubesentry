@@ -1,11 +1,12 @@
 package api
 
-// Review probes. Each test states the property it expects; a failure on the
-// current code is the finding.
+// Regression tests for the findings of the October 2026 security review.
+// Each states the property it guards.
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,20 +58,114 @@ func (g *growingAuthorizer) Allowed(context.Context, auth.Identity, auth.Capabil
 	return false, nil
 }
 
-// The response cache keys a response by the scope it looked up, but the
-// handler looks the scope up again. If the two differ, the response is
-// stored under a key other callers share.
-func TestProbeResponseCacheKeyScopeMatchesHandlerScope(t *testing.T) {
+// The response cache keys a response by the scope it looked up and the
+// handler filters by a scope too: both must be the same lookup, or the
+// response is stored under a key other callers share.
+func TestResponseCacheKeyScopeMatchesHandlerScope(t *testing.T) {
 	s := tenantServer(t)
 	s.Authorizer = &growingAuthorizer{}
 	h := s.Handler()
 
-	getAs(t, h, "alice", "/api/v1/pods", nil) // key from {team-a}, body from {team-a, team-b}
+	getAs(t, h, "alice", "/api/v1/pods", nil) // her first lookup says {team-a}, any later one {team-a, team-b}
 	rec := getAs(t, h, "bob", "/api/v1/pods", nil)
 	nss, _ := namespacesIn(rec.Body.Bytes())
 	if nss["team-b"] > 0 {
 		t.Errorf("bob (team-a only) received team-b pods from the cache (X-Kubesentry-Cache=%s): %v",
 			rec.Header().Get("X-Kubesentry-Cache"), nss)
+	}
+}
+
+// flakyAuthorizer fails every lookup while failing is set, then defers to
+// the inner authorizer.
+type flakyAuthorizer struct {
+	inner   auth.Authorizer
+	failing atomic.Bool
+}
+
+func (f *flakyAuthorizer) Scope(ctx context.Context, id auth.Identity, c auth.Capability) (auth.Scope, error) {
+	if f.failing.Load() {
+		return auth.Scope{}, errors.New("apiserver unavailable")
+	}
+	return f.inner.Scope(ctx, id, c)
+}
+
+func (f *flakyAuthorizer) Allowed(ctx context.Context, id auth.Identity, c auth.Capability, ns string) (bool, error) {
+	if f.failing.Load() {
+		return false, errors.New("apiserver unavailable")
+	}
+	return f.inner.Allowed(ctx, id, c, ns)
+}
+
+// A lookup that fails while the response is built leaves the caller with
+// less than they may see (fail closed). That response is served, but never
+// cached: not under the key it was computed for, nor for anyone else.
+func TestResponseCacheSkipsResponsesBuiltOnFailedAuthorization(t *testing.T) {
+	s := tenantServer(t)
+	fa := &flakyAuthorizer{inner: s.Authorizer}
+	s.Authorizer = fa
+	h := s.Handler()
+
+	// Every lookup fails: the caller sees nothing, and nothing is cached.
+	fa.failing.Store(true)
+	rec := getAs(t, h, "alice", "/api/v1/pods", nil)
+	if rec.Code != 200 {
+		t.Fatalf("pods with failing authorization = %d", rec.Code)
+	}
+	if nss, _ := namespacesIn(rec.Body.Bytes()); len(nss) > 0 {
+		t.Errorf("failed authorization showed %v", nss)
+	}
+	if n := s.ResponseCache.Len(); n != 0 {
+		t.Errorf("a response built on a failed lookup was cached (%d entries)", n)
+	}
+	// Once lookups work again alice sees her namespace at once.
+	fa.failing.Store(false)
+	rec = getAs(t, h, "alice", "/api/v1/pods", nil)
+	if nss, _ := namespacesIn(rec.Body.Bytes()); nss["team-a"] == 0 {
+		t.Errorf("after recovery alice sees %v; the degraded response was replayed", nss)
+	}
+}
+
+// The same when only the handler's lookup fails, after the key's succeeded
+// (a capability missing from cachedRoutes): the response is not kept.
+func TestResponseCacheSkipsWhenHandlerLookupFails(t *testing.T) {
+	ok := &flakyAuthorizer{inner: denyAll{}}
+	bad := &flakyAuthorizer{inner: denyAll{}}
+	bad.failing.Store(true)
+	c := &ResponseCache{KeyFunc: CacheKeyFunc(ok, func() uint64 { return 1 }, auth.ViewNamespace)}
+	h := withAuthzMemo(c.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = scopeOf(r.Context(), bad, auth.ViewNodes) // fails closed
+		writeJSON(w, http.StatusOK, map[string]int{"items": 0})
+	})))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/x", nil)
+	req = req.WithContext(auth.WithIdentity(req.Context(), auth.Identity{User: "alice", Source: "proxy"}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || c.Len() != 0 {
+		t.Errorf("status %d, %d cached; want 200 and nothing cached", rec.Code, c.Len())
+	}
+}
+
+// notYetCurrent serves a view but, like a snapshot.Manager before its first
+// build is published, cannot name a current one.
+type notYetCurrent struct{ v *snapshot.View }
+
+func (n notYetCurrent) View(context.Context) (*snapshot.View, error) { return n.v, nil }
+func (n notYetCurrent) Current() *snapshot.View                      { return nil }
+
+// Before the first view exists nothing is cached: scopes computed then lack
+// the RBAC index's candidates.
+func TestResponseCacheBypassedBeforeFirstView(t *testing.T) {
+	s := tenantServer(t)
+	s.Views = notYetCurrent{s.Views.(currentView).v}
+	h := s.Handler()
+	for i := 0; i < 2; i++ {
+		rec := getAs(t, h, "alice", "/api/v1/pods", nil)
+		if rec.Code != 200 || rec.Header().Get("X-Kubesentry-Cache") != "" {
+			t.Errorf("request %d = %d, cache %q", i, rec.Code, rec.Header().Get("X-Kubesentry-Cache"))
+		}
+	}
+	if n := s.ResponseCache.Len(); n != 0 {
+		t.Errorf("%d responses cached before the first view", n)
 	}
 }
 
@@ -192,12 +287,16 @@ func TestProbeAgentReportProcessCountBoundsMemory(t *testing.T) {
 
 // recordingStore records the queries the API hands the audit store.
 type recordingStore struct {
-	mu   sync.Mutex
-	sums []audit.Query
+	mu      sync.Mutex
+	sums    []audit.Query
+	queries []audit.Query
 }
 
 func (r *recordingStore) Add(context.Context, []audit.Event) error { return nil }
-func (r *recordingStore) Query(context.Context, audit.Query) ([]audit.Event, error) {
+func (r *recordingStore) Query(_ context.Context, q audit.Query) ([]audit.Event, error) {
+	r.mu.Lock()
+	r.queries = append(r.queries, q)
+	r.mu.Unlock()
 	return nil, nil
 }
 func (r *recordingStore) Summarize(_ context.Context, q audit.Query) (audit.Summary, error) {
@@ -216,29 +315,41 @@ func (activeBackend) IngestReader(io.Reader) (int, error) { return 0, nil }
 func (activeBackend) Query(audit.Query) []audit.Event     { return nil }
 func (a activeBackend) Active() audit.Store               { return a.st }
 
-// pgstore caches Summarize results under fmt.Sprintf("%+v", query). The API
-// hands it Namespaces == nil for a caller with cluster-wide audit access and
-// an empty map for a caller with none: the two queries print alike, so the
-// second caller is served the first one's cluster-wide summary.
-func TestProbeAuditSummaryQueriesOfDifferentScopesPrintApart(t *testing.T) {
+// The API hands the store Namespaces == nil for a caller with cluster-wide
+// audit access and, once, handed it an empty map for a caller with none;
+// pgstore's Summarize cache printed both alike and served the second caller
+// the first one's cluster-wide summary. A caller who may read no audit
+// event at all now gets an empty answer without the store being asked, and
+// every query that reaches it says exactly what it covers.
+func TestAuditWithoutGrantsSkipsTheStore(t *testing.T) {
 	s := tenantServer(t)
 	rec := &recordingStore{}
 	s.Audit = activeBackend{rec}
 	g := tenantGrants()
-	g[grant("erin", auth.ViewAudit, "")] = true
+	g[grant("erin", auth.ViewAudit, "")] = true // cluster-wide: every namespace
 	s.Authorizer = &auth.SARAuthorizer{Reviewer: g, Candidates: s.Authorizer.(*auth.SARAuthorizer).Candidates}
 	h := s.Handler()
-	for _, user := range []string{"erin", "carol"} {
-		if r := getAs(t, h, user, "/api/v1/audit/summary", nil); r.Code != 200 {
+	for _, user := range []string{"erin", "carol", "alice"} {
+		var sum auditSummaryResponse
+		if r := getAs(t, h, user, "/api/v1/audit/summary", &sum); r.Code != 200 {
 			t.Fatalf("summary as %s = %d", user, r.Code)
 		}
+		var ev auditEventsResponse
+		if r := getAs(t, h, user, "/api/v1/audit/events", &ev); r.Code != 200 || ev.Items == nil {
+			t.Fatalf("events as %s = %d %+v", user, r.Code, ev)
+		}
 	}
-	if len(rec.sums) != 2 {
-		t.Fatalf("store saw %d summaries", len(rec.sums))
+	if len(rec.sums) != 2 || len(rec.queries) != 2 {
+		t.Fatalf("store saw %d summaries and %d queries; carol (no grants) must not reach it", len(rec.sums), len(rec.queries))
 	}
-	erin, carol := fmt.Sprintf("%+v", rec.sums[0]), fmt.Sprintf("%+v", rec.sums[1])
-	if erin == carol {
-		t.Errorf("erin (all namespaces) and carol (none) produce the same printed query, pgstore's Summarize cache key:\n%s", carol)
+	for _, qs := range [][]audit.Query{rec.sums, rec.queries} {
+		erin, alice := qs[0], qs[1]
+		if erin.Namespaces != nil {
+			t.Errorf("erin's query is scoped: %+v", erin.Namespaces)
+		}
+		if alice.Namespaces == nil || len(alice.Namespaces) != 1 || !alice.Namespaces["team-a"] || alice.ClusterScoped {
+			t.Errorf("alice's query = namespaces %v, clusterScoped %v", alice.Namespaces, alice.ClusterScoped)
+		}
 	}
 }
 

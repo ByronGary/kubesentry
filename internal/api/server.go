@@ -247,8 +247,10 @@ var cachedRoutes = map[string][]auth.Capability{
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
 // over the route's capabilities and the view version. Other requests, and
-// every request while the provider cannot name its current view, are not
-// cached.
+// every request while the provider cannot name its current view (before the
+// first view exists, too), are not cached. The scope is looked up through
+// the request's authzMemo, so the handler filters by exactly the scope the
+// key names.
 func (s *Server) cacheKey(r *http.Request) (string, bool) {
 	caps := cachedRoutes[r.Pattern]
 	v, ok := s.currentVersion()
@@ -259,13 +261,12 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 }
 
 // route registers one API route with its per-route middleware: metrics,
-// timeout, ETag, the response cache (cachedRoutes only) and gzip.
+// timeout, the per-identity cap on expensive routes, ETag, the response
+// cache (cachedRoutes only) and gzip.
 func (s *Server) route(mux *http.ServeMux, pattern, name string, timeout time.Duration, h http.HandlerFunc) {
 	var cache func(http.Handler) http.Handler
-	if s.ResponseCache != nil && len(cachedRoutes[pattern]) > 0 {
-		if _, ok := s.currentVersion(); ok {
-			cache = s.ResponseCache.Middleware
-		}
+	if s.ResponseCache != nil && len(cachedRoutes[pattern]) > 0 && s.reportsCurrent() {
+		cache = s.ResponseCache.Middleware
 	}
 	mux.Handle(pattern, Compose(WithMetrics(name), WithTimeout(timeout), WithETag(), cache, WithGzip())(h))
 }
@@ -308,7 +309,7 @@ func (s *Server) apiRoutes() http.Handler {
 	if s.hasCerts() {
 		s.route(mux, "GET /api/v1/certificates", "certificates", t, s.certificates)
 	}
-	return mux
+	return withAuthzMemo(mux)
 }
 
 // ingestRoutes registers the routes that accept pushed data. Each keeps its

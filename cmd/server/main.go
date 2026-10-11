@@ -290,6 +290,25 @@ func (c viewCandidates) Namespaces(user string, groups []string, cp auth.Capabil
 	return nil
 }
 
+// Ready is false until the first view exists: scopes computed before then
+// have no candidates, so the authorizer does not cache them.
+func (c viewCandidates) Ready() bool { return c.current() != nil }
+
+// HasUserBindings reports whether a binding names the user. Before the first
+// view nobody knows, so it says yes: with -authz-share-by-groups the user's
+// answers are then cached per user rather than shared.
+func (c viewCandidates) HasUserBindings(user string) bool {
+	if v := c.current(); v != nil {
+		return v.RBAC().HasUserBindings(user)
+	}
+	return true
+}
+
+var (
+	_ auth.CandidatesReadiness = viewCandidates{}
+	_ auth.UserBindings        = viewCandidates{}
+)
+
 // recordingViews remembers the last view an OnDemand provider built, for the
 // authorizer's candidates and metrics in -cache=false mode.
 type recordingViews struct {

@@ -150,7 +150,7 @@ func (a *SARAuthorizer) observeReview(result string) {
 // with hundreds of groups do not make every cache key kilobytes long.
 func (a *SARAuthorizer) subject(id Identity) string {
 	h := sha256.New()
-	if a.ShareByGroups {
+	if a.ShareByGroups && !a.hasUserBindings(id.User) {
 		gs := append([]string(nil), id.Groups...)
 		sort.Strings(gs)
 		h.Write([]byte("groups"))
@@ -173,7 +173,37 @@ func (a *SARAuthorizer) subject(id Identity) string {
 	return string(h.Sum(nil)[:16])
 }
 
-func capKey(c Capability) string { return c.Verb + "/" + c.Group + "/" + c.Resource }
+// capKey names the whole capability, Namespaced included: ViewAudit and
+// ViewClusterAudit share verb, group and resource, and a namespaced scope
+// must never answer for the cluster-wide capability (or the other way).
+// hasUserBindings reports whether any binding names the user as a subject,
+// so that ShareByGroups must not share their answers with their groups.
+// Candidates that cannot tell (no UserBindings) count as no: ShareByGroups
+// then rests on its documented assumption that only groups are granted.
+func (a *SARAuthorizer) hasUserBindings(user string) bool {
+	if ub, ok := a.Candidates.(UserBindings); ok {
+		return ub.HasUserBindings(user)
+	}
+	return false
+}
+
+// candidatesReady reports whether Candidates can propose namespaces yet. A
+// scope computed while they cannot is too narrow, so it is used but not
+// cached.
+func (a *SARAuthorizer) candidatesReady() bool {
+	if r, ok := a.Candidates.(CandidatesReadiness); ok {
+		return r.Ready()
+	}
+	return true
+}
+
+func capKey(c Capability) string {
+	ns := "cluster"
+	if c.Namespaced {
+		ns = "namespaced"
+	}
+	return c.Verb + "/" + c.Group + "/" + c.Resource + "/" + ns
+}
 
 func decisionKey(subj string, c Capability, ns string) string {
 	if ns == "" {
@@ -222,6 +252,9 @@ func (a *SARAuthorizer) observeMiss(coalesced bool) {
 // computeScope builds a scope from decisions. start is the epoch the lookup
 // began in (see store).
 func (a *SARAuthorizer) computeScope(ctx context.Context, subj, key string, id Identity, c Capability, start uint64) (Scope, error) {
+	// Asked before the candidates are read: if they become ready meanwhile,
+	// this scope may still lack them.
+	ready := !c.Namespaced || a.Candidates == nil || a.candidatesReady()
 	all, exp, err := a.decide(ctx, subj, id, c, "")
 	if err != nil {
 		return Scope{}, err
@@ -281,7 +314,11 @@ func (a *SARAuthorizer) computeScope(ctx context.Context, subj, key string, id I
 	}
 	// The scope lives no longer than the shortest-lived decision it is made
 	// of, so a revoked grant or a new one shows up within the decision TTLs.
-	a.store(subj, key, s, exp, start)
+	// Without candidates (no RBAC index yet) it is not cached at all: the
+	// decisions it confirmed are, and the next lookup proposes the rest.
+	if ready {
+		a.store(subj, key, s, exp, start)
+	}
 	return s, nil
 }
 

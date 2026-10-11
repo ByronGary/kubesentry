@@ -1126,7 +1126,10 @@ func (c *ResponseCache) serve(w http.ResponseWriter, r *http.Request, next http.
 		rec.status = http.StatusOK
 	}
 	body := rec.buf.Bytes()
-	if storable(rec.status, rec.h) {
+	// A response built while an authorization lookup failed shows the
+	// caller less than they may see (lookups fail closed): serve it, but
+	// never keep it for others.
+	if storable(rec.status, rec.h) && !authzFailed(r.Context()) {
 		if rec.h.Get("ETag") == "" {
 			rec.h.Set("ETag", bodyETag(body))
 		}
