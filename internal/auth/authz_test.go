@@ -26,7 +26,8 @@ type fakeReviewer struct {
 	entered     chan struct{} // signalled once per review start, if set
 	inflight    atomic.Int64
 	maxInflight atomic.Int64
-	failNext    atomic.Int64 // number of reviews to fail
+	failNext    atomic.Int64  // number of reviews to fail
+	hold        func(n int64) // called with each review's sequence number after it decided, if set
 }
 
 func newFakeReviewer() *fakeReviewer {
@@ -51,12 +52,16 @@ func (f *fakeReviewer) Review(ctx context.Context, user string, groups []string,
 			break
 		}
 	}
-	f.total.Add(1)
+	seq := f.total.Add(1)
+	ok, err := f.decide(user, groups, resource, ns)
 	if f.entered != nil {
 		select {
 		case f.entered <- struct{}{}:
 		default:
 		}
+	}
+	if f.hold != nil {
+		f.hold(seq)
 	}
 	if f.gate != nil {
 		<-f.gate
@@ -64,6 +69,10 @@ func (f *fakeReviewer) Review(ctx context.Context, user string, groups []string,
 	if f.delay > 0 {
 		time.Sleep(f.delay)
 	}
+	return ok, err
+}
+
+func (f *fakeReviewer) decide(user string, groups []string, resource, ns string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[user+"|"+resource+"|"+ns]++
@@ -77,6 +86,12 @@ func (f *fakeReviewer) Review(ctx context.Context, user string, groups []string,
 		}
 	}
 	return false, nil
+}
+
+func (f *fakeReviewer) revoke(subject, resource, ns string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.grants[subject], resource+"@"+ns)
 }
 
 func (f *fakeReviewer) count(user, resource, ns string) int {
@@ -277,6 +292,7 @@ func TestTTLAndDenyTTL(t *testing.T) {
 	rv := newFakeReviewer()
 	rv.grant("alice", "pods", "a")
 	a, clk := newAuthz(rv, nil)
+	a.DenyTTL = time.Minute
 	alice := user("alice")
 	check := func(ns string, want bool) {
 		t.Helper()
@@ -312,6 +328,7 @@ func TestScopeExpiresWithShortestDecision(t *testing.T) {
 	rv := newFakeReviewer()
 	rv.grant("alice", "pods", "a")
 	a, clk := newAuthz(rv, fakeCandidates{"alice": {"a"}})
+	a.DenyTTL = time.Minute
 	alice := user("alice")
 	a.Scope(ctx, alice, ViewNamespace) // cluster-wide deny (1m) + a allowed (5m)
 	clk.Advance(61 * time.Second)
@@ -324,9 +341,7 @@ func TestScopeExpiresWithShortestDecision(t *testing.T) {
 			rv.count("alice", "pods", ""), rv.count("alice", "pods", "a"))
 	}
 	// A grant revoked in the meantime disappears once its TTL passes.
-	rv.mu.Lock()
-	delete(rv.grants["alice"], "pods@a")
-	rv.mu.Unlock()
+	rv.revoke("alice", "pods", "a")
 	clk.Advance(5 * time.Minute)
 	if s, _ := a.Scope(ctx, alice, ViewNamespace); s.Has("a") {
 		t.Fatal("revoked grant still in scope after TTL")
@@ -509,6 +524,166 @@ func TestCapabilities(t *testing.T) {
 	}
 }
 
+func TestDefaultTTLs(t *testing.T) {
+	a := &SARAuthorizer{}
+	for range 100 {
+		if d := a.ttl(true); d > 5*time.Minute || d < 4*time.Minute+30*time.Second {
+			t.Fatalf("allow TTL %v", d)
+		}
+		if d := a.ttl(false); d > 5*time.Minute || d < 4*time.Minute+30*time.Second {
+			t.Fatalf("deny TTL %v", d)
+		}
+	}
+}
+
+func TestForgetClearsOnlyThatIdentity(t *testing.T) {
+	rv := newFakeReviewer()
+	rv.grant("alice", "pods", "a")
+	rv.grant("bob", "pods", "a")
+	a, _ := newAuthz(rv, fakeCandidates{"alice": {"a", "b"}, "bob": {"a", "b"}})
+	alice, bob := user("alice"), user("bob")
+	for _, id := range []Identity{alice, bob} {
+		a.Scope(ctx, id, ViewNamespace)             // cluster deny, a allow, b deny, scope
+		a.Allowed(ctx, id, ViewNodes, "")           // cluster deny
+		a.Allowed(ctx, id, ViewNamespace, "direct") // namespace deny outside the candidates
+	}
+	entries := a.cache.len()
+	reviews := rv.total.Load()
+
+	a.Forget(alice)
+	if n := a.cache.len(); n != entries/2 {
+		t.Fatalf("%d entries after Forget, want %d (bob's)", n, entries/2)
+	}
+	// Bob is untouched: everything still cached.
+	a.Scope(ctx, bob, ViewNamespace)
+	a.Allowed(ctx, bob, ViewNodes, "")
+	a.Allowed(ctx, bob, ViewNamespace, "direct")
+	if rv.total.Load() != reviews {
+		t.Fatalf("bob re-reviewed: %d -> %d", reviews, rv.total.Load())
+	}
+	// Alice's allows and denials are both gone.
+	if ok, _ := a.Allowed(ctx, alice, ViewNamespace, "a"); !ok || rv.count("alice", "pods", "a") != 2 {
+		t.Fatalf("allow not re-reviewed: %d", rv.count("alice", "pods", "a"))
+	}
+	if ok, _ := a.Allowed(ctx, alice, ViewNamespace, "b"); ok || rv.count("alice", "pods", "b") != 2 {
+		t.Fatalf("denial not re-reviewed: %d", rv.count("alice", "pods", "b"))
+	}
+	a.Allowed(ctx, alice, ViewNodes, "")
+	if rv.count("alice", "nodes", "") != 2 {
+		t.Fatal("cluster-wide denial not re-reviewed")
+	}
+	// Unrestricted identities have nothing cached; Forget is a no-op.
+	a.Forget(Identity{User: TokenUser, Source: "token", Unrestricted: true})
+}
+
+func TestForgetThenScopeReReviews(t *testing.T) {
+	rv := newFakeReviewer()
+	rv.grant("alice", "pods", "a")
+	cands := fakeCandidates{"alice": {"a"}}
+	a, _ := newAuthz(rv, cands)
+	alice := user("alice")
+	if s, _ := a.Scope(ctx, alice, ViewNamespace); !reflect.DeepEqual(nsList(s), []string{"a"}) {
+		t.Fatalf("scope %v", nsList(s))
+	}
+	n := rv.total.Load() // cluster-wide + a
+	// RBAC changes: a new binding in b. The cached scope does not know yet.
+	rv.grant("alice", "pods", "b")
+	cands["alice"] = []string{"a", "b"}
+	a.Scope(ctx, alice, ViewNamespace)
+	if rv.total.Load() != n {
+		t.Fatal("cached scope re-reviewed before Forget")
+	}
+	a.Forget(alice)
+	s, err := a.Scope(ctx, alice, ViewNamespace)
+	if err != nil || !reflect.DeepEqual(nsList(s), []string{"a", "b"}) {
+		t.Fatalf("scope after Forget %v %v", nsList(s), err)
+	}
+	if d := rv.total.Load() - n; d != 3 {
+		t.Fatalf("%d reviews after Forget, want 3 (cluster-wide, a, b)", d)
+	}
+
+	// With ShareByGroups, Forget clears the group set's entries for everyone in it.
+	rv2 := newFakeReviewer()
+	rv2.grant("team", "pods", "a")
+	b, _ := newAuthz(rv2, fakeCandidates{"carol": {"a"}, "dave": {"a"}})
+	b.ShareByGroups = true
+	b.Scope(ctx, user("carol", "team"), ViewNamespace)
+	m := rv2.total.Load()
+	b.Forget(user("carol", "team"))
+	b.Scope(ctx, user("dave", "team"), ViewNamespace)
+	if rv2.total.Load() == m {
+		t.Fatal("group-set entries survived Forget")
+	}
+}
+
+func TestForgetRacingSingleflight(t *testing.T) {
+	for _, kind := range []string{"decision", "scope"} {
+		t.Run(kind, func(t *testing.T) {
+			rv := newFakeReviewer()
+			release := make(chan struct{})
+			held := make(chan struct{})
+			rv.hold = func(n int64) {
+				if n == 1 { // the first review has decided "denied" and is still in flight
+					close(held)
+					<-release
+				}
+			}
+			a, _ := newAuthz(rv, fakeCandidates{"alice": {"a"}})
+			alice := user("alice")
+			lookup := func() bool {
+				if kind == "scope" {
+					// Granted cluster-wide below; the first review is the cluster-wide one.
+					s, err := a.Scope(ctx, alice, ViewNamespace)
+					return err == nil && s.All
+				}
+				ok, err := a.Allowed(ctx, alice, ViewNamespace, "a")
+				return ok && err == nil
+			}
+			oldResult := make(chan bool)
+			go func() { oldResult <- lookup() }()
+			<-held
+
+			// The grant arrives and the user asks for a recheck while the old
+			// lookup is still in flight.
+			rv.grant("alice", "pods", "")
+			a.Forget(alice)
+			if !lookup() {
+				t.Fatal("lookup after Forget joined the stale flight or used its answer")
+			}
+
+			close(release)
+			if <-oldResult {
+				t.Fatal("old lookup should have returned its own (denied) answer")
+			}
+			// The stale denial must not have been written back over the new
+			// grant, and the fresh answer stays cached.
+			reviews := rv.total.Load()
+			for range 3 {
+				if !lookup() {
+					t.Fatal("stale denial resurrected after the in-flight lookup finished")
+				}
+			}
+			if rv.total.Load() != reviews {
+				t.Fatalf("fresh answer not cached: %d -> %d reviews", reviews, rv.total.Load())
+			}
+		})
+	}
+}
+
+func TestForgetMarksArePruned(t *testing.T) {
+	rv := newFakeReviewer()
+	a, clk := newAuthz(rv, nil)
+	a.Forget(user("alice"))
+	a.Forget(user("bob"))
+	clk.Advance(2 * time.Hour)
+	a.Forget(user("carol"))
+	a.forgetMu.RLock()
+	defer a.forgetMu.RUnlock()
+	if len(a.forgotten) != 1 {
+		t.Fatalf("%d forget marks kept", len(a.forgotten))
+	}
+}
+
 func TestCacheIsBounded(t *testing.T) {
 	rv := newFakeReviewer()
 	a, _ := newAuthz(rv, nil)
@@ -531,8 +706,8 @@ func TestCacheIsBounded(t *testing.T) {
 // hit-rate is the share of cache lookups answered without a review once
 // warm. The steady variants advance a fake clock so every user views a page
 // every 10s for 10 minutes (TTLs expire as in production) and report
-// reviews/identity/min and reviews/s, with the default 1m deny TTL and with
-// a 5m one: denials (mostly the cluster-wide checks) dominate the rate.
+// reviews/identity/min and reviews/s, with the default 5m deny TTL and with
+// a 1m one: denials (mostly the cluster-wide checks) dominate the rate.
 func BenchmarkAuthorizer(b *testing.B) {
 	const users, namespaces = 2000, 300
 	type userData struct {
@@ -625,6 +800,6 @@ func BenchmarkAuthorizer(b *testing.B) {
 			}
 		}
 	}
-	b.Run("steady", steady(0)) // default deny TTL, 1m
-	b.Run("steady-deny5m", steady(5*time.Minute))
+	b.Run("steady", steady(0)) // default deny TTL, 5m
+	b.Run("steady-deny1m", steady(time.Minute))
 }

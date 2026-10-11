@@ -8,7 +8,9 @@ import (
 	"hash/fnv"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,7 +28,7 @@ type Observer interface {
 // Defaults for SARAuthorizer's zero fields.
 const (
 	DefaultAuthzTTL           = 5 * time.Minute
-	DefaultAuthzDenyTTL       = time.Minute
+	DefaultAuthzDenyTTL       = 5 * time.Minute
 	DefaultAuthzMaxParallel   = 32
 	DefaultAuthzMaxEntries    = 100_000
 	DefaultAuthzReviewTimeout = 10 * time.Second
@@ -46,8 +48,10 @@ const (
 //
 // Decisions are cached in a bounded LRU for TTL (allowed) or DenyTTL
 // (denied), keyed by subject, capability and namespace; concurrent identical
-// lookups share one review. Errors are never cached. Use a pointer; the
-// zero value of the unexported state is initialised on first use.
+// lookups share one review. Errors are never cached. Forget drops one
+// identity's cached answers, e.g. when a user asks for a recheck after an
+// RBAC change. Use a pointer; the zero value of the unexported state is
+// initialised on first use.
 type SARAuthorizer struct {
 	Reviewer Reviewer
 	// Candidates proposes namespaces to confirm (detectors.RBACIndex). Nil
@@ -55,7 +59,7 @@ type SARAuthorizer struct {
 	Candidates Candidates
 
 	TTL           time.Duration // allowed decisions; default 5m
-	DenyTTL       time.Duration // denied decisions; default 1m
+	DenyTTL       time.Duration // denied decisions; default 5m
 	MaxParallel   int           // reviews in flight at once, across all callers; default 32
 	MaxEntries    int           // cache bound; default 100,000
 	ReviewTimeout time.Duration // per review, including the wait for a slot; default 10s
@@ -72,7 +76,24 @@ type SARAuthorizer struct {
 	cache    *lruCache
 	flights  flightGroup
 	sem      chan struct{}
+
+	// epoch orders lookups against Forget: a lookup notes the epoch when it
+	// starts, and its result is stored only if its subject has not been
+	// forgotten since. Stores hold forgetMu for reading, Forget for writing.
+	epoch     atomic.Uint64
+	forgetMu  sync.RWMutex
+	forgotten map[string]forgetMark // subject -> last Forget
 }
+
+type forgetMark struct {
+	epoch uint64
+	at    time.Time
+}
+
+// forgetRetention is how long a Forget is remembered to fence off lookups
+// that started before it. Every review is bounded by ReviewTimeout, so no
+// lookup runs anywhere near this long.
+const forgetRetention = time.Hour
 
 func (a *SARAuthorizer) init() {
 	a.initOnce.Do(func() {
@@ -177,10 +198,11 @@ func (a *SARAuthorizer) Scope(ctx context.Context, id Identity, c Capability) (S
 		return v.(Scope), nil
 	}
 	v, coalesced, err := a.flights.do(ctx, key, func(ctx context.Context) (any, error) {
+		start := a.epoch.Load()
 		if v, _, ok := a.cache.get(key, a.now()); ok {
 			return v, nil
 		}
-		return a.computeScope(ctx, subj, key, id, c)
+		return a.computeScope(ctx, subj, key, id, c, start)
 	})
 	a.observeMiss(coalesced)
 	if err != nil {
@@ -197,14 +219,16 @@ func (a *SARAuthorizer) observeMiss(coalesced bool) {
 	}
 }
 
-func (a *SARAuthorizer) computeScope(ctx context.Context, subj, key string, id Identity, c Capability) (Scope, error) {
+// computeScope builds a scope from decisions. start is the epoch the lookup
+// began in (see store).
+func (a *SARAuthorizer) computeScope(ctx context.Context, subj, key string, id Identity, c Capability, start uint64) (Scope, error) {
 	all, exp, err := a.decide(ctx, subj, id, c, "")
 	if err != nil {
 		return Scope{}, err
 	}
 	if all {
 		s := Scope{All: true}
-		a.cache.set(key, s, exp)
+		a.store(subj, key, s, exp, start)
 		return s, nil
 	}
 	s := Scope{Namespaces: map[string]bool{}}
@@ -257,7 +281,7 @@ func (a *SARAuthorizer) computeScope(ctx context.Context, subj, key string, id I
 	}
 	// The scope lives no longer than the shortest-lived decision it is made
 	// of, so a revoked grant or a new one shows up within the decision TTLs.
-	a.cache.set(key, s, exp)
+	a.store(subj, key, s, exp, start)
 	return s, nil
 }
 
@@ -301,6 +325,7 @@ func (a *SARAuthorizer) decide(ctx context.Context, subj string, id Identity, c 
 		return v.(bool), exp, nil
 	}
 	v, coalesced, err := a.flights.do(ctx, key, func(ctx context.Context) (any, error) {
+		start := a.epoch.Load()
 		// A flight that finished between our miss and now has filled the cache.
 		if v, exp, ok := a.cache.get(key, a.now()); ok {
 			return decision{v.(bool), exp}, nil
@@ -310,7 +335,7 @@ func (a *SARAuthorizer) decide(ctx context.Context, subj string, id Identity, c 
 			return nil, err
 		}
 		exp := a.now().Add(a.ttl(ok))
-		a.cache.set(key, ok, exp)
+		a.store(subj, key, ok, exp, start)
 		return decision{ok, exp}, nil
 	})
 	a.observeMiss(coalesced)
@@ -319,6 +344,52 @@ func (a *SARAuthorizer) decide(ctx context.Context, subj string, id Identity, c 
 	}
 	d := v.(decision)
 	return d.ok, d.exp, nil
+}
+
+// store caches a lookup result unless the subject was forgotten after the
+// lookup started: a review begun before Forget may reflect the old RBAC
+// state and must not come back as a cached answer.
+func (a *SARAuthorizer) store(subj, key string, val any, exp time.Time, start uint64) {
+	a.forgetMu.RLock()
+	defer a.forgetMu.RUnlock()
+	if f, ok := a.forgotten[subj]; ok && f.epoch > start {
+		return
+	}
+	a.cache.set(key, val, exp)
+}
+
+// Forget drops every cached decision and scope for the identity's subject
+// (with ShareByGroups, for everyone with the same groups), so the next
+// lookups ask the API server again. Lookups already in flight finish for
+// the callers waiting on them but are not cached; later callers start new
+// ones. It scans the cache, so callers should rate-limit it.
+func (a *SARAuthorizer) Forget(id Identity) {
+	if id.Unrestricted {
+		return
+	}
+	a.init()
+	subj := a.subject(id)
+	prefixes := [2]string{"d\x00" + subj + "\x00", "s\x00" + subj + "\x00"}
+	match := func(key string) bool {
+		return strings.HasPrefix(key, prefixes[0]) || strings.HasPrefix(key, prefixes[1])
+	}
+	now := a.now()
+	a.forgetMu.Lock()
+	defer a.forgetMu.Unlock()
+	// Under the write lock no lookup can store, so after the scan the cache
+	// holds nothing for subj, and the epoch bump fences off every lookup
+	// that started before it.
+	a.cache.deleteFunc(match)
+	a.flights.forget(match)
+	if a.forgotten == nil {
+		a.forgotten = map[string]forgetMark{}
+	}
+	for s, f := range a.forgotten {
+		if now.Sub(f.at) > forgetRetention {
+			delete(a.forgotten, s)
+		}
+	}
+	a.forgotten[subj] = forgetMark{epoch: a.epoch.Add(1), at: now}
 }
 
 func (a *SARAuthorizer) review(ctx context.Context, id Identity, c Capability, ns string) (bool, error) {
@@ -436,7 +507,9 @@ func (g *flightGroup) do(ctx context.Context, key string, fn func(context.Contex
 					f.err = fmt.Errorf("authorization lookup panicked: %v", p)
 				}
 				g.mu.Lock()
-				delete(g.m, key)
+				if g.m[key] == f { // Forget may have replaced it
+					delete(g.m, key)
+				}
 				g.mu.Unlock()
 				close(f.done)
 			}()
@@ -521,6 +594,33 @@ func (c *lruCache) set(key string, val any, exp time.Time) {
 		old := s.ll.Back()
 		s.ll.Remove(old)
 		delete(s.m, old.Value.(*lruEntry).key)
+	}
+}
+
+// forget detaches the flights whose key matches: callers already waiting
+// keep waiting for them, new callers start fresh ones.
+func (g *flightGroup) forget(match func(key string) bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k := range g.m {
+		if match(k) {
+			delete(g.m, k)
+		}
+	}
+}
+
+// deleteFunc removes every entry whose key matches.
+func (c *lruCache) deleteFunc(match func(key string) bool) {
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		for k, el := range s.m {
+			if match(k) {
+				s.ll.Remove(el)
+				delete(s.m, k)
+			}
+		}
+		s.mu.Unlock()
 	}
 }
 
