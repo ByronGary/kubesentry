@@ -768,12 +768,8 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            # The Go GC works to stay under the container's memory limit.
-            - name: GOMEMLIMIT
-              valueFrom:
-                resourceFieldRef:
-                  containerName: server
-                  resource: limits.memory
+            # GOMEMLIMIT is left unset on purpose: the server sets it to 90% of the
+            # cgroup memory limit, leaving headroom for non-heap memory.
             - name: AWS_REGION
               value: "us-east-1"
             - name: KUBESENTRY_API_TOKEN

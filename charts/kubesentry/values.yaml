@@ -42,8 +42,9 @@ updateStrategy:
     maxUnavailable: 0
     maxSurge: 1
 
-# -- Server container resources. GOMEMLIMIT is set from limits.memory, so the
-# Go GC works to stay under it. See docs/deploy-eks.md for sizing per cluster size.
+# -- Server container resources. The server sets GOMEMLIMIT to 90% of
+# limits.memory, so the Go GC works to stay under it with headroom for non-heap
+# memory. See docs/deploy-eks.md for sizing per cluster size.
 resources:
   requests:
     cpu: 100m

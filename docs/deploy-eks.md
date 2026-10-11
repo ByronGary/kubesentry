@@ -615,7 +615,7 @@ These are starting points until the stress report in `test/stress` replaces them
 | up to 500 nodes, 10,000 pods | 2 | 250m, 512Mi / 1.5Gi | same | db.t4g.medium, 50 GiB |
 | up to 1,000 nodes, 20,000 pods | 2 or 3 | 500m, 1Gi / 2Gi | same | db.m7g.large, 100 GiB+ |
 
-- **Memory:** GOMEMLIMIT follows the memory limit, so the Go GC works harder near the limit instead of the pod being OOM-killed. Watch `kubesentry_snapshot_build_seconds` and container memory, then adjust.
+- **Memory:** the server sets GOMEMLIMIT to 90% of its memory limit, so the Go GC works harder near the limit instead of the pod being OOM-killed. Setting `GOMEMLIMIT` through `extraEnv` overrides it. Watch `kubesentry_snapshot_build_seconds` and container memory, then adjust.
 - **Users:** user count drives SubjectAccessReviews and CPU, not memory. Thousands of users sharing groups are cheap with `auth.shareByGroups`.
 - **Audit volume:** this depends on the cluster's write rate and controllers. Count roughly 1–2 KB per stored event, indexes included. Measure the first day (`kubesentry_audit_ingested_total`) and size storage from that.
 - **Agents:** nodes with many thousands of processes need a higher agent memory limit. `agent.maxProcesses` caps what is sent.
