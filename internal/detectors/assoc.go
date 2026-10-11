@@ -668,10 +668,12 @@ func (a *Assoc) Found(r Ref) bool {
 func (a *Assoc) ControllerKind(r Ref) string { return a.ownerOf[keyOf(r)].real }
 
 // WorkloadOf names a pod's owner as "Kind/name", using the real kind for
-// Controllers; "" for a bare pod.
+// Controllers; "" for a bare pod and for a static (mirror) pod, whose owner
+// reference names its Node: the node runs it but is not its workload, which
+// is how the map and the security grouping show it too.
 func (a *Assoc) WorkloadOf(p *model.Pod) string {
 	o := a.ownerOfPod(p)
-	if !o.ok {
+	if !o.ok || o.ref.Kind == KindNode {
 		return ""
 	}
 	if o.real != "" {

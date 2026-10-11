@@ -171,6 +171,18 @@ func TestAssociateOwners(t *testing.T) {
 	if got := a.WorkloadOf(&bare); got != "" {
 		t.Errorf("bare pod workload = %q", got)
 	}
+	// Static (mirror) pods are owned by their Node, which is not a workload:
+	// no workload, as on the map and in the security grouping. The pods and
+	// nodes routes take it from here.
+	for _, i := range []int{10, 11} {
+		static := inv.Pods[i]
+		if got := a.WorkloadOf(&static); got != "" {
+			t.Errorf("static pod %s workload = %q, want none", static.Name, got)
+		}
+		if got := PodSummaryOf(&static, a).Workload; got != "" {
+			t.Errorf("static pod %s summary workload = %q, want none", static.Name, got)
+		}
+	}
 
 	// A pod read after the inventory (the pod page) resolves the same way.
 	fresh := runningPod("shop", "web-111-z", ctrl("ReplicaSet", "web-111"), labels("app", "web"))

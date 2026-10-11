@@ -81,6 +81,8 @@ type config struct {
 	auditMaxEvents      int
 	auditStore          string
 	pgDSN, pgSchema     string
+	pgMaxConns          int
+	pgQueryTimeout      time.Duration
 	auditRetention      time.Duration
 	auditRedactExecArgs bool
 	cloudwatch          bool
@@ -203,6 +205,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.StringVar(&c.pgDSN, "pg-dsn", "", "Postgres DSN (env "+pgstore.DSNEnv+"; PG* variables fill in the rest)")
 	fs.StringVar(&c.pgSchema, "pg-schema", "kubesentry", "Postgres schema, one per cluster")
 	dur(&c.auditRetention, "audit-retention", 30*24*time.Hour, "Postgres store: how long audit events are kept")
+	fs.IntVar(&c.pgMaxConns, "pg-max-conns", 10, "Postgres connections per replica; reads share all but two (writes, maintenance)")
+	dur(&c.pgQueryTimeout, "pg-query-timeout", 10*time.Second, "Postgres store: an audit read running longer is cancelled and answered with 503")
 	fs.BoolVar(&c.auditRedactExecArgs, "audit-redact-exec-args", false, "drop exec command arguments from stored request URIs")
 	fs.BoolVar(&c.cloudwatch, "cloudwatch", false, "read EKS audit logs from CloudWatch Logs")
 	fs.StringVar(&c.cloudwatchLogGroup, "cloudwatch-log-group", "", "log group (default /aws/eks/<cluster-name>/cluster)")
@@ -263,6 +267,12 @@ func (c *config) validate() error {
 	case "postgres":
 		if c.auditJournal != "" {
 			return errors.New("-audit-journal keeps the memory store across restarts; Postgres does not need it")
+		}
+		if c.pgMaxConns < 3 {
+			return errors.New("-pg-max-conns must be at least 3: two connections stay free for writes and maintenance")
+		}
+		if c.pgQueryTimeout <= 0 {
+			return errors.New("-pg-query-timeout must be positive")
 		}
 	default:
 		return fmt.Errorf("-audit-store %q: use memory or postgres", c.auditStore)

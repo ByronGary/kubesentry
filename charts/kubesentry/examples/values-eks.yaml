@@ -89,6 +89,14 @@ oauth2Proxy:
   allowedGroups:
     - platform-team
     - payments-engineers
+  # Longer than kubesentry's longest route (60s); the ALB idle timeout below is longer still.
+  upstreamTimeout: 65s
+  # The ALB's subnets, as in networkPolicy.ingress.web.fromCIDRs below (or the
+  # VPC CIDR): only they may set X-Forwarded-For/Host/Proto.
+  trustedProxyIPs:
+    - 10.20.0.0/22
+    - 10.20.4.0/22
+    - 10.20.8.0/22
   cookie:
     name: _kubesentry
     secure: true
@@ -117,6 +125,9 @@ ingress:
     alb.ingress.kubernetes.io/healthcheck-path: /ping
     alb.ingress.kubernetes.io/success-codes: "200"
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    # Above oauth2Proxy.upstreamTimeout (65s); the ALB default of 60s would cut
+    # the pod page and /oom off with a 504 before kubesentry answers.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=75
     # Share one ALB with other internal tools:
     # alb.ingress.kubernetes.io/group.name: internal-tools
 

@@ -47,12 +47,23 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request, detail bool) 
 		return
 	}
 	resp.Degraded = s.runChecks(r.Context())
+	if err := s.prometheusDown(); err != nil {
+		resp.Degraded = mergeUnavailable(resp.Degraded, map[string]string{"prometheus": err.Error()})
+	}
 	if s.Unavailable != nil {
 		if u := s.Unavailable(); len(u) > 0 {
 			resp.Unavailable = u
 		}
 	}
 	writeJSON(w, code, resp)
+}
+
+// prometheusDown is why Prometheus cannot be queried now, or nil.
+func (s *Server) prometheusDown() error {
+	if s.PrometheusHealth == nil {
+		return nil
+	}
+	return s.PrometheusHealth()
 }
 
 // runChecks runs every check concurrently, each bounded to 2s, and returns

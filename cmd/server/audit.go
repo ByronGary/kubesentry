@@ -32,6 +32,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		var err error
 		pg, err = pgstore.Open(ctx, pgstore.ResolveDSN(cfg.pgDSN), pgstore.Options{
 			Schema: cfg.pgSchema, Retention: cfg.auditRetention, Owner: hostname(), Logger: slog.Default(),
+			MaxConns: int32(cfg.pgMaxConns), QueryTimeout: cfg.pgQueryTimeout,
 		})
 		if err != nil {
 			return cleanup, fmt.Errorf("audit store: %w", err)
@@ -112,12 +113,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 			}
 			return nil
 		}})
-		metrics.CloudWatchLag.SetFunc(func() float64 {
-			if st, ok := cw.status(); ok && !st.WindowEnd.IsZero() {
-				return st.Lag.Seconds()
-			}
-			return 0
-		})
+		metrics.CloudWatchLag.SetFunc(cw.lagSeconds)
 		slog.Info("reading EKS audit logs from CloudWatch", "logGroup", group, "streamPrefix", cfg.cloudwatchPrefix)
 	}
 	go pollAuditCounters(ctx, pg, cw)
@@ -207,22 +203,48 @@ func (c *cwRunner) run(ctx context.Context) {
 	}
 }
 
-// lead runs the reader while l is held, and releases it afterwards.
-func (c *cwRunner) lead(ctx context.Context, l *pgstore.Leader) {
+// leadership is the held lock the reader runs under: *pgstore.Leader.
+type leadership interface {
+	cloudwatch.Committer
+	Lost() <-chan struct{}
+	Release(ctx context.Context) error
+}
+
+var _ leadership = (*pgstore.Leader)(nil)
+
+// stopWarnAfter is how long lead waits for the reader to stop after the lock
+// is lost before it logs that the reader is stuck.
+const stopWarnAfter = 10 * time.Second
+
+// lead runs the reader while l is held, and releases it afterwards. The
+// moment the lock is lost the reader stops counting as this replica's: its
+// status, the lag gauge and the readiness check drop it at once, even if
+// Run takes a while to return (a commit stuck on a dead connection), so a
+// replica without the lock never reports lag. Run's context is cancelled at
+// the same time, and every call it makes honours it.
+func (c *cwRunner) lead(ctx context.Context, l leadership) {
 	slog.Info("cloudwatch reader: this replica leads")
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	r := c.reader(l)
+	c.cur.Store(r)
+	stopped := make(chan struct{})
 	go func() {
 		select {
 		case <-l.Lost():
+			c.cur.CompareAndSwap(r, nil)
 			cancel()
 		case <-lctx.Done():
 		}
+		select {
+		case <-stopped:
+		case <-time.After(stopWarnAfter):
+			slog.Warn("cloudwatch reader: still stopping after losing the lock", "waited", stopWarnAfter)
+		}
 	}()
-	r := c.reader(l)
-	c.cur.Store(r)
 	err := r.Run(lctx)
-	c.cur.Store(nil)
+	close(stopped)
+	c.cur.CompareAndSwap(r, nil)
 	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
 	_ = l.Release(rctx)
 	rcancel()
@@ -231,10 +253,20 @@ func (c *cwRunner) lead(ctx context.Context, l *pgstore.Leader) {
 	}
 }
 
-// status is the running reader's status; false on a standby replica.
+// status is the running reader's status; false on a standby replica and
+// from the moment a leader loses its lock.
 func (c *cwRunner) status() (cloudwatch.Status, bool) {
 	if r := c.cur.Load(); r != nil {
 		return r.Status(), true
 	}
 	return cloudwatch.Status{}, false
+}
+
+// lagSeconds is kubesentry_cloudwatch_lag_seconds: how far the reader is
+// behind, 0 on a replica that is not reading.
+func (c *cwRunner) lagSeconds() float64 {
+	if st, ok := c.status(); ok && !st.WindowEnd.IsZero() {
+		return st.Lag.Seconds()
+	}
+	return 0
 }

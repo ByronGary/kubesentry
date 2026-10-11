@@ -218,6 +218,9 @@ spec:
             # kubesentry listens only on this socket, in a volume only these two
             # containers mount; it trusts identity headers on it and nowhere else.
             - --upstream=unix://{{ include "kubesentry.webSocket" . }}
+            # Longer than kubesentry's longest route timeout, so a slow request
+            # ends in kubesentry's own 503 rather than oauth2-proxy's 502.
+            - --upstream-timeout={{ $o.upstreamTimeout }}
             - --provider={{ $o.provider }}
             {{- with $o.issuerURL }}
             - --oidc-issuer-url={{ . }}
@@ -246,8 +249,12 @@ spec:
             - --skip-auth-strip-headers=true
             # API calls get 401 instead of a login redirect.
             - --api-route=^/api/
-            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects.
+            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects, from
+            # these peers only (none listed: oauth2-proxy trusts every peer).
             - --reverse-proxy=true
+            {{- range $o.trustedProxyIPs }}
+            - --trusted-proxy-ip={{ . }}
+            {{- end }}
             - --skip-provider-button=true
             - --silence-ping-logging=true
             - --cookie-name={{ $o.cookie.name }}

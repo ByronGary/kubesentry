@@ -73,6 +73,11 @@ type Coverage struct {
 // ErrBackpressure means the store's write queue is full.
 var ErrBackpressure = errors.New("audit store is busy; retry later")
 
+// ErrOverloaded means a read could not be answered in time: every query slot
+// stayed busy, or the query ran past its time limit. The API answers 503
+// with Retry-After rather than hold the request.
+var ErrOverloaded = errors.New("audit store is overloaded")
+
 // Matches reports whether e matches q, exactly as every Store evaluates it.
 func (q Query) Matches(e *Event) bool {
 	c := q.Canonical()

@@ -848,6 +848,9 @@ spec:
             # kubesentry listens only on this socket, in a volume only these two
             # containers mount; it trusts identity headers on it and nowhere else.
             - --upstream=unix:///var/run/kubesentry/web.sock
+            # Longer than kubesentry's longest route timeout, so a slow request
+            # ends in kubesentry's own 503 rather than oauth2-proxy's 502.
+            - --upstream-timeout=65s
             - --provider=oidc
             - --oidc-issuer-url=https://example.okta.com/oauth2/default
             - --client-id=0oa1example2kubesentry3
@@ -865,8 +868,12 @@ spec:
             - --skip-auth-strip-headers=true
             # API calls get 401 instead of a login redirect.
             - --api-route=^/api/
-            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects.
+            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects, from
+            # these peers only (none listed: oauth2-proxy trusts every peer).
             - --reverse-proxy=true
+            - --trusted-proxy-ip=10.20.0.0/22
+            - --trusted-proxy-ip=10.20.4.0/22
+            - --trusted-proxy-ip=10.20.8.0/22
             - --skip-provider-button=true
             - --silence-ping-logging=true
             - --cookie-name=_kubesentry
@@ -964,6 +971,7 @@ metadata:
     alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000
     alb.ingress.kubernetes.io/healthcheck-path: /ping
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=75
     alb.ingress.kubernetes.io/scheme: internal
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/success-codes: "200"

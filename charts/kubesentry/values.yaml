@@ -299,6 +299,18 @@ oauth2Proxy:
   emailDomains: ["*"]
   # -- --allowed-group: only members of these IdP groups may sign in.
   allowedGroups: []
+  # -- --upstream-timeout: how long oauth2-proxy waits for kubesentry before
+  # answering 502 (oauth2-proxy's own default is 30s). kubesentry gives API
+  # routes 30s and the pod page and /oom 60s, then answers 503 itself; 65s
+  # lets that answer through. An ALB in front needs a longer idle timeout
+  # (ALB default 60s): idle_timeout.timeout_seconds=75 (docs/deploy-eks.md).
+  upstreamTimeout: 65s
+  # -- --trusted-proxy-ip: IPs or CIDRs of the reverse proxy in front (the ALB's
+  # subnets, or the VPC CIDR) allowed to set X-Forwarded-For/Host/Proto. Headers
+  # from other peers are ignored. Empty: oauth2-proxy trusts them from every
+  # peer (0.0.0.0/0, ::/0). Identity headers do not depend on this: the sidecar
+  # always strips them and sets its own.
+  trustedProxyIPs: []
   cookie:
     name: _kubesentry
     # -- Requires HTTPS in front (the ALB terminates TLS).
@@ -385,6 +397,13 @@ audit:
     dsnKey: dsn
     # -- -pg-schema: one schema per cluster when clusters share a database.
     schema: kubesentry
+    # -- -pg-max-conns (10 when empty): connections per replica; audit reads
+    # share all but two (writes, maintenance). Size against max_connections
+    # (RDS: by instance class) times replicas.
+    maxConns: null
+    # -- -pg-query-timeout (10s when empty): an audit read running longer is
+    # cancelled in Postgres and answered 503 + Retry-After.
+    queryTimeout: ""
     # -- Sets PGSSLMODE (an sslmode in the DSN wins). verify-full checks the
     # server certificate and host name: with RDS, provide the RDS CA bundle in
     # sslRootCert. Use disable only for a Postgres without TLS inside the cluster.

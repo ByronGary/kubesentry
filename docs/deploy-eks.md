@@ -311,7 +311,32 @@ ingress:
     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
     alb.ingress.kubernetes.io/healthcheck-path: /ping     # oauth2-proxy's health endpoint; /healthz without the sidecar
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=75
 ```
+
+**Timeouts.** A request passes three timeouts, and each must be longer than the one above it in this table:
+
+| Hop | Timeout | Setting |
+|---|---|---|
+| kubesentry | 30s for API routes, 60s for the pod page (`/diagnostics`) and `/oom`; then it answers 503 `timeout` | built in |
+| oauth2-proxy | 65s by default; then it answers 502 | `oauth2Proxy.upstreamTimeout` (`--upstream-timeout`; oauth2-proxy's own default is 30s) |
+| ALB | 60s by default; then it answers 504 | `idle_timeout.timeout_seconds` in `alb.ingress.kubernetes.io/load-balancer-attributes` |
+
+With the ALB default of 60s, the pod page and `/oom` can end in the ALB's 504 before kubesentry's own answer arrives, so raise the idle timeout above `upstreamTimeout`, e.g. to 75. The idle timeout is an attribute of the whole load balancer: with `group.name`, set it on one Ingress of the group, or give every Ingress the same value. oauth2-proxy sets no idle timeout on its keep-alive connections, so a longer ALB idle timeout does not cause 502s from connections the target closed first.
+
+**Trusted proxies.** The sidecar runs with `--reverse-proxy`, so it believes forwarded headers: `X-Forwarded-Proto` and `X-Forwarded-Host` for redirects, and the client address header for its logs and IP rules. `oauth2Proxy.trustedProxyIPs` (`--trusted-proxy-ip`, one per entry) limits which direct peers may set them; from any other peer they are ignored. Left empty, oauth2-proxy trusts them from every peer (`0.0.0.0/0`, `::/0`) and logs a warning at startup, and the chart's install notes repeat it. With `target-type: ip` the ALB connects to the pods from its ENIs in the ALB's subnets, so list those subnets' CIDRs, the same list as `networkPolicy.ingress.web.fromCIDRs` (section 9), or the VPC CIDR if you prefer one entry:
+
+```yaml
+oauth2Proxy:
+  trustedProxyIPs:      # the ALB's subnets
+    - 10.20.0.0/22
+    - 10.20.4.0/22
+    - 10.20.8.0/22
+```
+
+- Identity headers (`X-Forwarded-Email`, `X-Forwarded-Groups`) do not depend on this setting: the sidecar always strips them from the request and sets its own.
+- Kubelet probes (`/ping`) come from the node's IP and send no forwarded headers, so they keep working whatever the list holds.
+- `alb.ingress.kubernetes.io/inbound-cidrs` is a different setting: it limits which clients may reach the ALB's listener (its security group). `trustedProxyIPs` limits which peers oauth2-proxy believes about the original client. Set both.
 
 Label the namespace for [pod readiness gates](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/deploy/pod_readiness_gate/) so a rolling update waits until new pods are healthy in the target group:
 

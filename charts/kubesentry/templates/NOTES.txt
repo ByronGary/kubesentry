@@ -99,6 +99,9 @@ kubesentry {{ include "kubesentry.imageTag" (dict "image" .Values.image "root" .
 {{- if and (eq .Values.audit.store "postgres") (eq .Values.audit.postgres.sslmode "disable") -}}
 {{- $warnings = append $warnings "audit.postgres.sslmode=disable: audit events travel to Postgres unencrypted." -}}
 {{- end -}}
+{{- if and .Values.oauth2Proxy.enabled .Values.ingress.enabled (empty .Values.oauth2Proxy.trustedProxyIPs) -}}
+{{- $warnings = append $warnings "oauth2Proxy.trustedProxyIPs is empty: oauth2-proxy trusts X-Forwarded-For/Host/Proto from any source. Set it to the ALB's subnets or the VPC CIDR (identity headers are not affected)." -}}
+{{- end -}}
 {{- if and .Values.agent.enabled (not .Values.tls.enabled) -}}
 {{- $warnings = append $warnings "Agents report over plain http inside the cluster. Set tls.enabled to encrypt the ingest listener." -}}
 {{- end -}}

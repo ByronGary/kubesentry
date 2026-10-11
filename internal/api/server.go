@@ -99,6 +99,11 @@ type Server struct {
 	// PrometheusInfo describes the metrics source for /info (it may change as
 	// discovery finds one); nil derives it from Metrics.
 	PrometheusInfo func() *PrometheusInfo
+	// PrometheusHealth, if set, says why the metrics source cannot be queried
+	// right now (nil while it can, or while there is none). /info lists the
+	// reason under unavailable["prometheus"] and the ops /readyz under
+	// degraded["prometheus"]; readiness does not fail, Prometheus is optional.
+	PrometheusHealth func() error
 	// Unavailable, if set, adds live unreadable sources (the informer cache's)
 	// to those the view recorded, for /info and /readyz.
 	Unavailable func() map[string]string
