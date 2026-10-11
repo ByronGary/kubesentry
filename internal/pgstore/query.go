@@ -2,6 +2,7 @@ package pgstore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -151,11 +152,7 @@ func (s *Store) Summarize(ctx context.Context, q audit.Query) (audit.Summary, er
 	q.Limit = 0
 	key := ""
 	if s.o.CacheTTL > 0 {
-		kq := q
-		if !kq.Since.IsZero() {
-			kq.Since = kq.Since.Truncate(s.o.CacheTTL)
-		}
-		key = fmt.Sprintf("%+v", kq)
+		key = summaryCacheKey(q, s.o.CacheTTL)
 		s.cacheMu.Lock()
 		e, ok := s.sumCache[key]
 		s.cacheMu.Unlock()
@@ -182,6 +179,53 @@ func (s *Store) Summarize(ctx context.Context, q audit.Query) (audit.Summary, er
 		s.cacheMu.Unlock()
 	}
 	return copySummary(sum), nil
+}
+
+// summaryKey is everything a summary depends on, spelled out so that two
+// queries share a cache entry exactly when where() gives them the same SQL.
+// fmt's %+v is not such a key: it prints a nil map (every namespace) and an
+// empty one (no namespace) alike. TestSummaryCacheKeyCoversEveryQueryField
+// fails when audit.Query gains a field this key does not carry.
+type summaryKey struct {
+	Since        time.Time `json:"since"`
+	User         string    `json:"user"`
+	Namespace    string    `json:"namespace"`
+	Resource     string    `json:"resource"`
+	Name         string    `json:"name"`
+	Verb         string    `json:"verb"`
+	Tag          string    `json:"tag"`
+	AnyActor     bool      `json:"anyActor"` // Actors == nil: the default view's actor rule
+	Actors       []string  `json:"actors"`
+	IncludeReads bool      `json:"includeReads"`
+	Limit        int       `json:"limit"`
+	// AllNamespaces is Namespaces == nil: no scope at all. Otherwise only
+	// Namespaces (sorted, possibly empty) and, with ClusterScoped, events
+	// without a namespace match.
+	AllNamespaces bool      `json:"allNamespaces"`
+	Namespaces    []string  `json:"namespaces"`
+	ClusterScoped bool      `json:"clusterScoped"`
+	BeforeTime    time.Time `json:"beforeTime"`
+	BeforeID      string    `json:"beforeID"`
+}
+
+// summaryCacheKey returns q's Summarize cache key, with Since bucketed to
+// ttl so the rolling windows of many dashboards share one aggregation. q
+// must be canonical.
+func summaryCacheKey(q audit.Query, ttl time.Duration) string {
+	k := summaryKey{
+		Since: q.Since, User: q.User, Namespace: q.Namespace, Resource: q.Resource, Name: q.Name, Verb: q.Verb, Tag: q.Tag,
+		AnyActor: q.Actors == nil, Actors: trueKeys(q.Actors, false), IncludeReads: q.IncludeReads, Limit: q.Limit,
+		AllNamespaces: q.Namespaces == nil, Namespaces: trueKeys(q.Namespaces, true), ClusterScoped: q.ClusterScoped,
+		BeforeTime: q.Before.Time, BeforeID: q.Before.AuditID,
+	}
+	if !k.Since.IsZero() && ttl > 0 {
+		k.Since = k.Since.Truncate(ttl)
+	}
+	b, err := json.Marshal(k)
+	if err != nil {
+		panic("pgstore: summary cache key: " + err.Error()) // strings, bools and times always encode
+	}
+	return string(b)
 }
 
 func copySummary(s audit.Summary) audit.Summary {
