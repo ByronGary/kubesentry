@@ -436,9 +436,10 @@ func TestProbeUnknownNamespacesCostNoReviews(t *testing.T) {
 	}
 }
 
-// The agent route decodes the whole report before it checks the process
-// count, so an 8 MiB body of empty objects becomes millions of structs.
-func TestProbeAgentReportProcessCountBoundsMemory(t *testing.T) {
+// The agent route once decoded the whole report before it checked the
+// process count, so an 8 MiB body of empty objects became millions of
+// structs. Decoding now stops at the store's per-node cap: 413.
+func TestAgentReportProcessCountBoundsMemory(t *testing.T) {
 	s := &Server{Processes: procmon.NewStore(), AgentToken: "t"}
 	h := s.Handler()
 	var body bytes.Buffer
@@ -455,8 +456,11 @@ func TestProbeAgentReportProcessCountBoundsMemory(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	runtime.ReadMemStats(&after)
 	alloc := after.TotalAlloc - before.TotalAlloc
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status %d", rec.Code)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d, want 413", rec.Code)
+	}
+	if s.Processes.(*procmon.Store).Nodes() != 0 {
+		t.Error("the refused report was stored")
 	}
 	if alloc > 64<<20 {
 		t.Errorf("a %d-process report (limit %d) allocated %d MiB before it was refused", n, maxAgentProcesses, alloc>>20)

@@ -22,6 +22,20 @@ type StoreOptions struct {
 	// MaxProcessesPerNode keeps a node's largest processes by memory; default
 	// 20000, the most a report may carry.
 	MaxProcessesPerNode int
+	// MaxBytes bounds the estimated memory of all stored processes; when a
+	// report takes the total beyond it, the nodes silent longest are dropped
+	// until it fits. Default 256 MiB. Together with MaxNodes it bounds what
+	// one leaked agent token can make the server hold, however many node
+	// names it invents.
+	MaxBytes int64
+}
+
+// processOverhead is the estimated heap of one stored process besides its
+// strings: the struct and its share of the index.
+const processOverhead = 160
+
+func processSize(p *Process) int64 {
+	return processOverhead + int64(len(p.Name)+len(p.Cmdline)+len(p.PodUID)+len(p.ContainerID))
 }
 
 func (o *StoreOptions) defaults() {
@@ -40,6 +54,9 @@ func (o *StoreOptions) defaults() {
 	if o.MaxProcessesPerNode <= 0 {
 		o.MaxProcessesPerNode = 20000
 	}
+	if o.MaxBytes <= 0 {
+		o.MaxBytes = 256 << 20
+	}
 }
 
 // Store keeps the latest report from each node, indexed by pod UID so a pod's
@@ -51,6 +68,7 @@ type Store struct {
 	mu        sync.RWMutex
 	nodes     map[string]*nodeEntry
 	pods      map[string]podEntry // pod UID → its processes on one node
+	size      int64               // estimated bytes of every node's processes
 	lastSweep time.Time
 }
 
@@ -59,6 +77,7 @@ type nodeEntry struct {
 	processes int   // kept, after the per-node cap
 	dropped   int   // cut by the per-node cap
 	bytes     int64 // size of the report as received
+	size      int64 // estimated bytes held for its processes
 	pods      []string
 }
 
@@ -111,27 +130,34 @@ func (s *Store) Update(r Report) {
 		procs = procs[:s.opts.MaxProcessesPerNode:s.opts.MaxProcessesPerNode]
 	}
 	byPod := map[string][]Process{}
-	for _, p := range procs {
-		byPod[p.PodUID] = append(byPod[p.PodUID], p)
+	var size int64
+	for i := range procs {
+		byPod[procs[i].PodUID] = append(byPod[procs[i].PodUID], procs[i])
+		size += processSize(&procs[i])
 	}
 	uids := make([]string, 0, len(byPod))
 	for uid, ps := range byPod {
 		sort.SliceStable(ps, func(i, j int) bool { return ps[i].RSSBytes > ps[j].RSSBytes })
 		uids = append(uids, uid)
 	}
-	entry := &nodeEntry{received: now, processes: len(procs), dropped: len(r.Processes) - len(procs), bytes: r.Bytes, pods: uids}
+	entry := &nodeEntry{received: now, processes: len(procs), dropped: len(r.Processes) - len(procs), bytes: r.Bytes, size: size, pods: uids}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if old, ok := s.nodes[r.Node]; ok {
-		s.dropPods(r.Node, old)
+		s.drop(r.Node, old)
 	} else if len(s.nodes) >= s.opts.MaxNodes {
 		s.sweep(now)
 		if len(s.nodes) >= s.opts.MaxNodes {
 			s.evictOldest()
 		}
 	}
+	// Make room by bytes too: the nodes silent longest go first.
+	for s.size+size > s.opts.MaxBytes && len(s.nodes) > 0 {
+		s.evictOldest()
+	}
 	s.nodes[r.Node] = entry
+	s.size += size
 	for uid, ps := range byPod {
 		s.pods[uid] = podEntry{node: r.Node, processes: ps}
 	}
@@ -140,13 +166,18 @@ func (s *Store) Update(r Report) {
 	}
 }
 
-// dropPods removes a node's pods from the index; the caller holds the lock.
-// A pod is only removed while this node still owns it.
-func (s *Store) dropPods(node string, e *nodeEntry) {
+// drop removes a node, its pods from the index and its bytes from the
+// total; the caller holds the lock. A pod is only removed while this node
+// still owns it.
+func (s *Store) drop(node string, e *nodeEntry) {
 	for _, uid := range e.pods {
 		if pe, ok := s.pods[uid]; ok && pe.node == node {
 			delete(s.pods, uid)
 		}
+	}
+	if s.nodes[node] == e {
+		delete(s.nodes, node)
+		s.size -= e.size
 	}
 }
 
@@ -156,8 +187,7 @@ func (s *Store) sweep(now time.Time) {
 	s.lastSweep = now
 	for name, e := range s.nodes {
 		if now.Sub(e.received) > s.opts.EvictAfter {
-			s.dropPods(name, e)
-			delete(s.nodes, name)
+			s.drop(name, e)
 		}
 	}
 }
@@ -171,9 +201,15 @@ func (s *Store) evictOldest() {
 		}
 	}
 	if oldest != "" {
-		s.dropPods(oldest, s.nodes[oldest])
-		delete(s.nodes, oldest)
+		s.drop(oldest, s.nodes[oldest])
 	}
+}
+
+// Bytes is the estimated memory the stored processes hold.
+func (s *Store) Bytes() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.size
 }
 
 // Sweep forgets nodes that stopped reporting. Update sweeps once per
