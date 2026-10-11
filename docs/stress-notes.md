@@ -73,6 +73,7 @@ Full write-up: `test/stress/results/after-L3/checkpoint-d.md`.
 | Chaos | **all pass**: spoofed headers, oversized reports, Prometheus down, Postgres down for 2 min (0 lost), API server restart, leader killed (the replacement took the lock in 2.6s), standby-only takeover (5.1s) |
 | Users through SSO, 10 → 200 → 500 | Errors 0% / 0.18% / 0.49%. 0 restarts. About 525 MiB per replica. **0 LISTs to the API server.** Inventory routes at 500 users: **p95 11–23 ms, p99 19–57 ms** |
 | **Audit-backed routes at 500 users** | **fail the target.** `/info` p95 10s; `audit/events` p50 8.5s, p95 30s, 7.7% errors; `audit/summary` p50 7s; diagnostics p95 15s. Cause: the Postgres coverage `count(*)` (834 ms over 3.4M rows) runs uncoordinated on every `/info`, and the 24h summary (1.5s) runs per team scope. Postgres hit 7.3 cores. A fix is in progress |
+| **Re-run after the audit fix** (22:21–22:34 UTC, same ramp) | **pass.** At 500 users, every route has p95 ≤ 23 ms and p99 ≤ 57 ms with 0% errors: `/info` 2/5/12 ms, `audit/events` 8/19/44 ms, `audit/summary` 3/11/22 ms, diagnostics 3/7/19 ms (p50/p95/p99). The only slow call left is the first cluster-wide summary after a restart (3.9 s, once; later callers share it) |
 
 **Smaller findings, being fixed:**
 - static pods are shown with their node as the workload
@@ -82,7 +83,7 @@ Full write-up: `test/stress/results/after-L3/checkpoint-d.md`.
 - a Prometheus outage doesn't show in `/readyz` or `/info`
 
 ### After: full L3 run (Phase 4)
-*Pending the audit fix.* It covers the 2,000-user ramp, a 2h soak at 500 users, every chaos scenario, and the baseline-vs-after report.
+*Next.* It covers the 2,000-user ramp, a 2h soak at 500 users, every chaos scenario, and the baseline-vs-after report.
 
 ## Cautions and critical alerts across the cluster (baseline, 20 snapshots, 16:49–18:30 UTC)
 Full table: `test/stress/results/cautions-baseline/cautions.md`.
