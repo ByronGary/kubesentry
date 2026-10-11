@@ -40,11 +40,14 @@ func (s *Server) metrics() MetricsSource {
 	return s.Metrics
 }
 
-// prometheusInfo is /info's prometheus field.
+// prometheusInfo is /info's prometheus field. Its URL never carries user
+// info: every signed-in user reads it.
 func (s *Server) prometheusInfo() *PrometheusInfo {
 	if s.PrometheusInfo != nil {
 		if p := s.PrometheusInfo(); p != nil {
-			return p
+			out := *p
+			out.URL = prom.Redact(out.URL)
+			return &out
 		}
 	}
 	if s.metrics() != nil {

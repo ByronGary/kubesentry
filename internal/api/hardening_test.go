@@ -585,10 +585,10 @@ func TestProbeNoUnauthenticatedAPIPaths(t *testing.T) {
 	}
 }
 
-// -prometheus-url may carry basic-auth credentials (Go's client sends them);
-// /info hands the URL, as cmd/server builds it from Client.BaseURL, to every
-// signed-in user, whatever they may see.
-func TestProbeInfoHidesPrometheusCredentials(t *testing.T) {
+// -prometheus-url may carry basic-auth credentials; /info hands the URL, as
+// cmd/server builds it from Client.BaseURL, to every signed-in user,
+// whatever they may see. Neither the client's BaseURL nor /info carry them.
+func TestInfoHidesPrometheusCredentials(t *testing.T) {
 	c, err := prom.NewClient("https://kubesentry:s3cret-pass@mimir.example.com/prometheus", prom.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -596,7 +596,16 @@ func TestProbeInfoHidesPrometheusCredentials(t *testing.T) {
 	s := tenantServer(t)
 	s.PrometheusInfo = func() *PrometheusInfo { return &PrometheusInfo{Source: "flag", URL: c.BaseURL()} } // as cmd/server/prometheus.go
 	rec := getAs(t, s.Handler(), "carol", "/api/v1/info", nil)
-	if strings.Contains(rec.Body.String(), "s3cret-pass") {
-		t.Errorf("carol (no grants) reads the Prometheus password from /info: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "s3cret-pass") || strings.Contains(rec.Body.String(), "kubesentry:") {
+		t.Errorf("carol (no grants) reads the Prometheus credentials from /info: %s", rec.Body.String())
+	}
+	// Even a source that hands /info the raw URL is redacted.
+	s.PrometheusInfo = func() *PrometheusInfo {
+		return &PrometheusInfo{Source: "flag", URL: "https://kubesentry:s3cret-pass@mimir.example.com/prometheus"}
+	}
+	var info infoResponse
+	getAs(t, s.Handler(), "carol", "/api/v1/info", &info)
+	if info.Prometheus == nil || info.Prometheus.URL != "https://mimir.example.com/prometheus" {
+		t.Errorf("prometheus info = %+v", info.Prometheus)
 	}
 }

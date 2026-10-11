@@ -131,6 +131,51 @@ func TestContainerMemoryInRestrictsAndChunks(t *testing.T) {
 	}
 }
 
+// User info in the URL is sent as basic auth but never shown.
+func TestURLCredentialsAreSentButNotShown(t *testing.T) {
+	var user, pass string
+	var ok bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok = r.BasicAuth()
+		w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+	}))
+	defer srv.Close()
+	raw := strings.Replace(srv.URL, "http://", "http://kubesentry:s3cret@", 1) + "/prom/"
+	c, err := NewClient(raw, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(c.BaseURL(), "s3cret") || strings.Contains(c.BaseURL(), "kubesentry@") || !c.HasURLCredentials() {
+		t.Errorf("BaseURL = %q, credentials %v", c.BaseURL(), c.HasURLCredentials())
+	}
+	if want := srv.URL + "/prom"; c.BaseURL() != want {
+		t.Errorf("BaseURL = %q, want %q", c.BaseURL(), want)
+	}
+	if _, err := c.Query(context.Background(), "up", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if !ok || user != "kubesentry" || pass != "s3cret" {
+		t.Errorf("basic auth = %q %q %v", user, pass, ok)
+	}
+	// A bearer token wins over URL credentials.
+	c, _ = NewClient(raw, Options{BearerToken: "tok"})
+	ok = false
+	c.Query(context.Background(), "up", time.Now())
+	if ok {
+		t.Error("basic auth sent along with a bearer token")
+	}
+	for in, want := range map[string]string{
+		"https://u:p@h/x": "https://h/x", "https://h/x": "https://h/x", "https://u@h": "https://h",
+	} {
+		if got := Redact(in); got != want {
+			t.Errorf("Redact(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if _, err := NewClient("ftp://u:secret@h", Options{}); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Errorf("bad URL error = %v", err)
+	}
+}
+
 func TestErrorResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)

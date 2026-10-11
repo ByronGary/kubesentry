@@ -40,14 +40,18 @@ const (
 // treated as read-only.
 type Client struct {
 	BearerToken string
-	base        string
-	http        *http.Client
-	maxBody     int64
-	selector    Matchers
-	ksmLimits   bool
-	cache       *Cache
-	obs         Observer
-	now         func() time.Time
+	// basic auth from the URL's user info, which is kept out of base so it
+	// never reaches logs, /info or cache keys.
+	basicUser, basicPass string
+	hasBasic             bool
+	base                 string
+	http                 *http.Client
+	maxBody              int64
+	selector             Matchers
+	ksmLimits            bool
+	cache                *Cache
+	obs                  Observer
+	now                  func() time.Time
 }
 
 // Options configures NewClient. The zero value is a plain uncached client that
@@ -76,21 +80,23 @@ type Options struct {
 // New returns a client with the original behaviour: no cache, no extra
 // matchers, and memory limits from kube-state-metrics.
 func New(baseURL string) *Client {
-	return &Client{
-		base:      strings.TrimRight(baseURL, "/"),
+	c := &Client{
 		http:      &http.Client{Timeout: defaultTimeout},
 		maxBody:   DefaultMaxResponseBytes,
 		ksmLimits: true,
 	}
+	c.setBase(baseURL)
+	return c
 }
 
 // NewClient returns a client for an http(s) base URL, such as
 // http://prometheus.monitoring.svc:9090 or an AMP workspace URL ending in
-// /workspaces/<id>.
+// /workspaces/<id>. User info in the URL (https://user:pass@host) is sent as
+// basic auth but never shown: BaseURL leaves it out.
 func NewClient(baseURL string, opts Options) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("prometheus URL must be http(s)://host[:port][/path], got %q", baseURL)
+		return nil, fmt.Errorf("prometheus URL must be http(s)://host[:port][/path], got %q", Redact(baseURL))
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = defaultTimeout
@@ -98,20 +104,60 @@ func NewClient(baseURL string, opts Options) (*Client, error) {
 	if opts.MaxResponseBytes <= 0 {
 		opts.MaxResponseBytes = DefaultMaxResponseBytes
 	}
-	return &Client{
+	c := &Client{
 		BearerToken: opts.BearerToken,
-		base:        strings.TrimRight(baseURL, "/"),
 		http:        &http.Client{Timeout: opts.Timeout, Transport: opts.Transport},
 		maxBody:     opts.MaxResponseBytes,
 		selector:    opts.Selector,
 		ksmLimits:   opts.KSMLimits,
 		cache:       opts.Cache,
 		obs:         opts.Observer,
-	}, nil
+	}
+	c.setBase(baseURL)
+	return c, nil
 }
 
-// BaseURL is the server the client queries.
+// setBase keeps the base URL without user info, remembering the user info
+// for basic auth.
+func (c *Client) setBase(baseURL string) {
+	c.base = strings.TrimRight(baseURL, "/")
+	u, err := url.Parse(baseURL)
+	if err != nil || u.User == nil {
+		return
+	}
+	c.basicUser = u.User.Username()
+	c.basicPass, _ = u.User.Password()
+	c.hasBasic = true
+	u.User = nil
+	c.base = strings.TrimRight(u.String(), "/")
+}
+
+// BaseURL is the server the client queries, without any user info.
 func (c *Client) BaseURL() string { return c.base }
+
+// HasURLCredentials reports whether the URL carried user info, which the
+// client sends as basic auth.
+func (c *Client) HasURLCredentials() bool { return c.hasBasic }
+
+// Redact returns rawURL without its user info (or the password replaced,
+// when it cannot be parsed), for logs and /info.
+func Redact(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		if at := strings.LastIndex(rawURL, "@"); at >= 0 {
+			if scheme := strings.Index(rawURL, "://"); scheme >= 0 && scheme < at {
+				return rawURL[:scheme+3] + "xxxxx@" + rawURL[at+1:]
+			}
+			return "xxxxx@" + rawURL[at+1:]
+		}
+		return rawURL
+	}
+	if u.User == nil {
+		return rawURL
+	}
+	u.User = nil
+	return u.String()
+}
 
 // Selector is the extra matchers injected into built selectors.
 func (c *Client) Selector() Matchers { return c.selector }
@@ -205,8 +251,11 @@ func (c *Client) fetch(ctx context.Context, kind, path string, params url.Values
 		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if c.BearerToken != "" {
+	switch {
+	case c.BearerToken != "":
 		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+	case c.hasBasic:
+		req.SetBasicAuth(c.basicUser, c.basicPass)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
