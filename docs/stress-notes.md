@@ -54,11 +54,27 @@ This run tested the code tagged `baseline` as shipped: one replica, a 256 MiB me
 - **`/oom` outgrows its read cap at L3.**
 - **The audit store fills fast.** The 50k cap holds about 17 seconds of a 3k/s firehose.
 
-### After: the new build at L3
-*Pending.*
-- **Deploy:** kind switches to the Helm chart, with `oauth2-proxy` over the Unix socket.
-- **Checkpoint D:** association, authorization leaks (`verify authz`), connectivity and a chaos smoke test.
-- **Then the full L3 run:** the 2h soak, Postgres and the CloudWatch path.
+### After: the new build at L3, checkpoint D (2026-10-11, 18:55–19:27 UTC; in progress)
+**Setup:**
+- installed with the Helm chart: 2 replicas, 1 GiB memory limit
+- SSO: oauth2-proxy over a Unix socket, using a test OIDC issuer that mints JWTs per persona
+- Postgres audit store, with CloudWatch read from an in-cluster fake
+- Prometheus found by autodiscovery
+- the agent DaemonSet runs only on the 6 real nodes; KWOK and Fargate nodes are excluded
+
+| Check | Result |
+|---|---|
+| Authorization leaks (15 personas: admins, cluster viewers, team members, a 300-group user, a user with no grants; every list route paged through) | **0 leaks**, 0 problems. 245k items checked; median route time 1–8ms |
+| Association (L3: 9.5k pods, 1,755 Deployments, 1,161 EndpointSlices) | pod→owner, service→pods, pod→node, pod→PVC, CronJob→Job, Ingress→Service and security grouping all **100% / 100%**. Tricky cases **41/42**. The miss was terminating pods counted as live: fixed in 61e3d75, re-run pending |
+| Connectivity | **120/120**, including the ingest listener. Prometheus scrapes both kubesentry replicas |
+| CloudWatch (1M events through the fake) | **every event stored exactly once** (0 missing, 0 duplicated) |
+| Chaos: spoofed identity headers through port-forward | pass: with no TCP web port, forged headers never reach kubesentry |
+| Chaos: oversized agent reports (9 MiB, 25k processes, a gzip bomb) | pass: 413 for each; an unknown encoding gets 415 |
+| Chaos: Prometheus down | pass: pages kept serving (/oom says leak detection is unavailable); metrics were back 21s after restart |
+| Chaos: Postgres down for 2 min under a 1k events/s firehose | pass: 72 backpressure answers (503 + Retry-After), 0 missing, 0 duplicated, `/readyz` reported the degraded store |
+| Chaos: API server restart | pass: 5/5 probes answered, snapshot at most 5s old, fresh again immediately |
+| Chaos: kill the CloudWatch leader | data complete (270k events, 0 missing, 0 duplicated). The scenario flagged a failure because the Deployment's *replacement* pod took the lock in the same second, before the standby's 30s retry. That is a harness expectation issue; a standby-only variant is being added |
+| Users ramp through oauth2-proxy (10 → 200 → 500) | pending |
 
 ## Cautions and critical alerts across the cluster (baseline, 20 snapshots, 16:49–18:30 UTC)
 Full table: `test/stress/results/cautions-baseline/cautions.md`.
@@ -79,6 +95,7 @@ Full table: `test/stress/results/cautions-baseline/cautions.md`.
 | **Node clock** | caution | `NodeClockNotSynchronising` was pending once (WSL clock drift) | On EKS, clock skew breaks token validation and SigV4. Keep the node-exporter rule |
 | **Real node pressure** | caution | Real nodes went down to 24% memory available; load per CPU reached 1.04 | Fine for the load generators. On EKS, node pressure leads to evictions |
 | **Event volume** | caution | Events were the largest object type at L2 (7k). At L3, pods 10k and RoleBindings 3.1k led | Event churn costs etcd and API capacity. kind runs `--event-ttl=30m`; EKS uses 1h |
+| **API server restart: RBAC briefly denies** | caution | Right after the API server restart (after-run chaos), kubesentry's ServiceAccount got about 1s of `forbidden` watch errors while the API server's RBAC caches warmed up. It recovered by itself | Every controller sees this after a control-plane restart. Alert only if `forbidden` persists, and expect a burst during EKS control-plane upgrades |
 | **Planted workload faults** | expected | crashloop (38 restarts), `leaky` (OOMKilled ×6, 88% of its limit), ImagePullBackOff (704 `Failed` events), Unschedulable (107 `FailedScheduling`) | kubesentry must flag all of these. The after run checks it |
 
 **Control plane, overall:**
