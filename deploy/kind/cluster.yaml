@@ -1,0 +1,42 @@
+# Local kind cluster for kubesentry on Kubernetes 1.36.4 (kind v0.33.0 image).
+# hack/kind-up.sh replaces __REPO__ with the repository's absolute path.
+#
+# The API server writes its audit log (policy: deploy/audit-policy.yaml) to
+# /var/log/kubernetes/audit on the control-plane node, where kubesentry tails it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubesentry
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    extraMounts:
+      - hostPath: __REPO__/deploy/audit-policy.yaml
+        containerPath: /etc/kubernetes/audit-policy.yaml
+        readOnly: true
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - name: audit-policy-file
+              value: /etc/kubernetes/audit-policy.yaml
+            - name: audit-log-path
+              value: /var/log/kubernetes/audit/audit.log
+            - name: audit-log-maxsize
+              value: "50"
+            - name: audit-log-maxbackup
+              value: "2"
+          extraVolumes:
+            - name: audit-policy
+              hostPath: /etc/kubernetes/audit-policy.yaml
+              mountPath: /etc/kubernetes/audit-policy.yaml
+              readOnly: true
+              pathType: File
+            - name: audit-logs
+              hostPath: /var/log/kubernetes/audit
+              mountPath: /var/log/kubernetes/audit
+              pathType: DirectoryOrCreate
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed

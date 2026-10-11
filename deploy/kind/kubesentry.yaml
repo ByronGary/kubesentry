@@ -1,0 +1,139 @@
+# kubesentry server for the local kind cluster. Applied by hack/kind-up.sh, which
+# also creates the kubesentry-api and kubesentry-agent token secrets.
+#
+# Dev-cluster settings, not for production:
+#   - The server runs on the control-plane node as uid 0 so it can read the
+#     API server's audit log, which kube-apiserver writes as root with mode 0600.
+#   - It listens on all interfaces so node agents can reach it through the
+#     Service; -api-token (KUBESENTRY_API_TOKEN) keeps the API closed to other pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubesentry
+  labels:
+    # The agent needs hostPID and the server a hostPath; both are outside the baseline profile.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry
+# Read-only. Secrets are deliberately absent: kubesentry never reads them.
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "persistentvolumes", "services", "nodes", "namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubesentry
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubesentry
+subjects:
+  - kind: ServiceAccount
+    name: kubesentry
+    namespace: kubesentry
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one tailer of the audit log at a time
+  selector:
+    matchLabels: {app: kubesentry}
+  template:
+    metadata:
+      labels: {app: kubesentry}
+    spec:
+      serviceAccountName: kubesentry
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: server
+          image: kubesentry:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr=:8080
+            - -prometheus-url=http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090
+            - -audit-log-file=/var/log/kubernetes/audit/audit.log
+            - -audit-from-start
+            - -pvc-min-age=5m
+          env:
+            - name: KUBESENTRY_API_TOKEN
+              valueFrom: {secretKeyRef: {name: kubesentry-api, key: token}}
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom: {secretKeyRef: {name: kubesentry-agent, key: token}}
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+          securityContext:
+            runAsUser: 0 # dev only: reads the root-owned 0600 audit log (see top of file)
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - name: audit-logs
+              mountPath: /var/log/kubernetes/audit
+              readOnly: true
+      volumes:
+        - name: audit-logs
+          hostPath:
+            path: /var/log/kubernetes/audit
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+spec:
+  selector: {app: kubesentry}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

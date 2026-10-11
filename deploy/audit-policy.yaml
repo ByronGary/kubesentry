@@ -1,0 +1,43 @@
+# Example kube-apiserver audit policy for kubesentry.
+# Pass it with --audit-policy-file. Everything is logged at the Metadata level,
+# so request and response bodies (which can contain secrets) are never written.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages:
+  - RequestReceived
+rules:
+  # Drop high-volume noise from system components.
+  - level: None
+    users: ["system:kube-proxy"]
+    verbs: ["watch"]
+    resources:
+      - group: ""
+        resources: ["endpoints", "services", "services/status"]
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get"]
+    resources:
+      - group: ""
+        resources: ["nodes", "nodes/status"]
+  - level: None
+    users:
+      - system:kube-controller-manager
+      - system:kube-scheduler
+    verbs: ["get", "update"]
+    namespaces: ["kube-system"]
+    resources:
+      - group: ""
+        resources: ["endpoints"]
+  - level: None
+    resources:
+      - group: coordination.k8s.io
+        resources: ["leases"]
+  - level: None
+    nonResourceURLs:
+      - /healthz*
+      - /livez*
+      - /readyz*
+      - /version
+      - /metrics
+  # Everything else: who, what, when, from where. No bodies.
+  - level: Metadata

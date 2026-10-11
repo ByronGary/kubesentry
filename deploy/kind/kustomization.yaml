@@ -1,0 +1,22 @@
+# kubesentry server plus the node agent from deploy/agent-daemonset.yaml, pointed at
+# locally built images. The agent manifest lives outside this directory, so build with:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/kind | kubectl apply -f -
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - kubesentry.yaml
+  - ../agent-daemonset.yaml
+images:
+  - name: ghcr.io/example/kubesentry-agent
+    newName: kubesentry-agent
+    newTag: dev
+patches:
+  # In-cluster plain http is fine for a local cluster; the agent logs a warning about it.
+  - target: {kind: DaemonSet, name: kubesentry-agent}
+    patch: |
+      - op: test
+        path: /spec/template/spec/containers/0/env/0/name
+        value: KUBESENTRY_SERVER
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: http://kubesentry.kubesentry.svc:8080

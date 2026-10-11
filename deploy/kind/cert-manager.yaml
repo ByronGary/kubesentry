@@ -1,0 +1,65 @@
+# cert-manager objects for the kind cluster: a self-signed root, a CA
+# ClusterIssuer signed by it, and certificates in three states for the
+# Certificates page. Applied by hack/kind-up.sh after cert-manager is installed.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: demo-root-ca
+  namespace: cert-manager # ClusterIssuers read their secrets from cert-manager's namespace
+spec:
+  isCA: true
+  commonName: kubesentry-demo-root-ca
+  secretName: demo-root-ca
+  duration: 8760h # 1 year
+  privateKey: {algorithm: ECDSA, size: 256}
+  issuerRef: {name: selfsigned, kind: ClusterIssuer}
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: demo-ca
+spec:
+  ca:
+    secretName: demo-root-ca
+---
+# Healthy: 90 days.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: web-tls
+  namespace: demo-apps
+spec:
+  secretName: web-tls
+  dnsNames: [web.demo-apps.example.test]
+  duration: 2160h
+  issuerRef: {name: demo-ca, kind: ClusterIssuer}
+---
+# Valid for 10 days only, so it shows as expiring soon.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: short-lived-tls
+  namespace: demo-apps
+spec:
+  secretName: short-lived-tls
+  dnsNames: [short.demo-apps.example.test]
+  duration: 240h
+  issuerRef: {name: demo-ca, kind: ClusterIssuer}
+---
+# Broken: points at an issuer that does not exist, so it is never issued.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: broken-tls
+  namespace: demo-apps
+spec:
+  secretName: broken-tls
+  dnsNames: [broken.demo-apps.example.test]
+  issuerRef: {name: missing-issuer, kind: Issuer}

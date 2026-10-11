@@ -1,0 +1,62 @@
+# kubesentry node agent: reports the processes inside pods to the server.
+#
+# What it can see: pid, command name, redacted command line, CPU, memory and
+# thread count of processes that run in pods. It does not read environment
+# variables, files or memory, and ignores host processes.
+#
+# hostPID is what lets it see other pods' processes. It does not need to be
+# privileged, run as root, or mount anything from the host.
+#
+# Before applying: create the token secret, and set KUBESENTRY_SERVER.
+#   kubectl create namespace kubesentry
+#   kubectl -n kubesentry create secret generic kubesentry-agent --from-literal=token="$(openssl rand -hex 32)"
+# Start the server with the same value: -agent-token "$TOKEN" (or KUBESENTRY_AGENT_TOKEN).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+spec:
+  selector:
+    matchLabels: {app: kubesentry-agent}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 10%}
+  template:
+    metadata:
+      labels: {app: kubesentry-agent}
+    spec:
+      serviceAccountName: kubesentry-agent
+      automountServiceAccountToken: false
+      hostPID: true
+      tolerations:
+        - operator: Exists          # run on every node, including tainted ones
+      priorityClassName: system-node-critical
+      containers:
+        - name: agent
+          image: ghcr.io/example/kubesentry-agent:latest   # build with: go build ./cmd/agent
+          args: ["-server=$(KUBESENTRY_SERVER)", "-interval=15s"]
+          env:
+            - name: KUBESENTRY_SERVER
+              value: https://kubesentry.kubesentry.svc:8080   # change me; use https outside a trusted network
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom: {secretKeyRef: {name: kubesentry-agent, key: token}}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+            seccompProfile: {type: RuntimeDefault}
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {memory: 128Mi}

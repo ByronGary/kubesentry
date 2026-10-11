@@ -1,0 +1,222 @@
+# Demo workloads so every kubesentry page has something to show on the kind cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-apps
+---
+# Grows by 4 MiB of real (touched) memory every 30 s until the 256Mi limit
+# OOMKills it, then starts over: the sawtooth the leak detector looks for.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leaky
+  namespace: demo-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: leaky}
+  template:
+    metadata:
+      labels: {app: leaky}
+    spec:
+      containers:
+        - name: app
+          image: python:3.13-alpine
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import time
+              hoard = []
+              while True:
+                  hoard.append(b"\x01" * (4 << 20))
+                  print(f"holding {len(hoard) * 4} MiB")
+                  time.sleep(30)
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}
+---
+# The control: allocates 64 MiB once and then stays flat.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steady
+  namespace: demo-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: steady}
+  template:
+    metadata:
+      labels: {app: steady}
+    spec:
+      containers:
+        - name: app
+          image: python:3.13-alpine
+          command: ["python", "-u", "-c"]
+          args:
+            - |
+              import time
+              ballast = b"\x01" * (64 << 20)
+              while True:
+                  time.sleep(3600)
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+---
+# A claim that a run-once pod binds and then leaves behind: Bound, but no live
+# pod mounts it, so it shows up as an unused volume after -pvc-min-age.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orphan-data
+  namespace: demo-apps
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orphan-data-init
+  namespace: demo-apps
+spec:
+  restartPolicy: Never
+  containers:
+    - name: init
+      image: python:3.13-alpine
+      command: ["sh", "-c", "echo seeded > /data/README"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: orphan-data
+---
+# Routing for the Map page: Ingress → Service → Deployment → Pods → Node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: demo-apps
+spec:
+  selector: {app: steady}
+  ports: [{name: http, port: 80, targetPort: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: demo-apps
+spec:
+  tls:
+    - hosts: [web.demo-apps.example.test]
+      secretName: web-tls # issued by cert-manager (deploy/kind/cert-manager.yaml)
+  rules:
+    - host: web.demo-apps.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: web, port: {name: http}}}
+---
+# Exposure findings: a NodePort service and an Ingress without TLS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: leaky-debug
+  namespace: demo-apps
+spec:
+  type: NodePort
+  selector: {app: leaky}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: leaky-public
+  namespace: demo-apps
+spec:
+  rules:
+    - host: leaky.demo-apps.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: {service: {name: leaky-debug, port: {name: http}}}
+---
+# Pod security findings: privileged with an added capability. It only sleeps.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risky-tools
+  namespace: demo-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: risky-tools}
+  template:
+    metadata:
+      labels: {app: risky-tools}
+    spec:
+      containers:
+        - name: tools
+          image: python:3.13-alpine
+          command: ["sleep", "infinity"]
+          securityContext:
+            privileged: true
+            capabilities: {add: ["SYS_ADMIN"]}
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+---
+# RBAC findings. The subjects do not exist; the bindings only show up on the Security page.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: demo-contractor-admin
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: cluster-admin}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: User, name: contractor@example.com}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demo-deployer
+  namespace: demo-apps
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["*"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deployer
+  namespace: demo-apps
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demo-deployer
+  namespace: demo-apps
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: demo-deployer}
+subjects:
+  - {kind: ServiceAccount, name: deployer, namespace: demo-apps}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: demo-secret-reader
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: demo-secret-reader
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: demo-secret-reader}
+subjects:
+  - {apiGroup: rbac.authorization.k8s.io, kind: Group, name: developers}
