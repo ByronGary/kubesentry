@@ -9,10 +9,13 @@ import (
 	"github.com/ByronGary/kubesentry/internal/audit"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/procmon"
+	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
-// NewServer returns an API server wired to synthetic data. ui may be nil. The
-// process data is refreshed in the background until ctx ends.
+// NewServer returns an API server wired to synthetic data. ui may be nil. It
+// serves the same handlers as the real server: a snapshot.Manager builds the
+// views from the demo cluster, and every caller is unrestricted. The views
+// and process data are refreshed in the background until ctx ends.
 func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 	now := time.Now()
 	cluster := NewCluster(now)
@@ -25,20 +28,22 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 		procs.Update(r)
 	}
 	go KeepFresh(ctx, procs, cluster, 10*time.Second)
+
+	policy := detectors.DefaultPolicy()
+	views := &snapshot.Manager{Source: cluster, Policy: policy, MinInterval: 30 * time.Second, MaxDelay: time.Minute}
+	go func() { _ = views.Run(ctx) }()
+
 	return &api.Server{
-		Cluster:   cluster,
-		Processes: procs,
-		Metrics:   NewMetrics(cluster, now),
-		Audit:     ing,
-		Inventory: cluster,
-		Certs:     cluster,
-		UI:        ui,
-		Demo:      true,
-		PVCOptions: detectors.PVCOptions{
-			MinAge:                  24 * time.Hour,
-			PricePerGiBMonth:        map[string]float64{"gp3": 0.08, "io2": 0.125},
-			DefaultPricePerGiBMonth: 0.10,
-		},
-		LeakOptions: detectors.DefaultLeakOptions(),
+		Cluster:       cluster,
+		Views:         views,
+		Policy:        policy,
+		ResponseCache: &api.ResponseCache{MaxBytes: 16 << 20},
+		Processes:     procs,
+		Metrics:       NewMetrics(cluster, now),
+		Audit:         ing,
+		UI:            ui,
+		Demo:          true,
+		PVCOptions:    detectors.PVCOptions{MinAge: 24 * time.Hour},
+		LeakOptions:   policy.Leak,
 	}, nil
 }

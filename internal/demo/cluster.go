@@ -17,27 +17,33 @@ const (
 	day = 24 * time.Hour
 )
 
-// The demo's three EKS worker nodes. The third is the tainted ML node, short
-// on memory because ml-trainer has no memory limit.
+// The demo's EKS nodes, one per zone: a managed node group, a Karpenter
+// spot node (arm64), the tainted GPU node, short on memory because
+// ml-trainer has no memory limit, and a Fargate node running one batch pod.
 const (
 	nodeA = "ip-10-0-12-34.ec2.internal"
 	nodeB = "ip-10-0-45-67.ec2.internal"
 	nodeC = "ip-10-0-78-90.ec2.internal"
+	nodeF = "fargate-ip-10-0-140-21.ec2.internal"
 )
 
-// Cluster is an in-memory ClusterSource, InventorySource and CertSource.
+// Cluster is an in-memory snapshot.Source, and the older ClusterSource,
+// InventorySource and CertSource.
 type Cluster struct {
-	pods       []model.Pod
-	pvcs       []model.PVC
-	workloads  []model.Workload
-	services   []model.Service
-	ingresses  []model.Ingress
-	nodes      []model.Node
-	pvs        []model.PV
-	classes    []model.StorageClass
-	namespaces []model.Namespace
-	rbac       model.RBAC
-	certs      model.CertManager
+	pods        []model.Pod
+	pvcs        []model.PVC
+	workloads   []model.Workload
+	replicaSets []model.ReplicaSet
+	services    []model.Service
+	slices      []model.EndpointSlice
+	ingresses   []model.Ingress
+	nodes       []model.Node
+	pvs         []model.PV
+	classes     []model.StorageClass
+	namespaces  []model.Namespace
+	rbac        model.RBAC
+	certs       model.CertManager
+	info        model.ClusterInfo
 }
 
 func ctr(name string, restarts int32) model.ContainerStatus {
@@ -51,10 +57,20 @@ func oomKilled(c model.ContainerStatus, ago time.Duration, now time.Time) model.
 	return c
 }
 
+// uidOf makes a stable, UUID-shaped UID from an object's identity.
+func uidOf(key string) string {
+	h := hexOf(key)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// hexOf is 32 stable hex digits derived from key, for synthetic IDs.
+func hexOf(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:16])
+}
+
 func pod(ns, name, phase string, claims []string, cs ...model.ContainerStatus) model.Pod {
-	sum := sha256.Sum256([]byte(ns + "/" + name))
-	h := hex.EncodeToString(sum[:16])
-	uid := h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+	uid := uidOf(ns + "/" + name)
 	for i := range cs {
 		id := sha256.Sum256([]byte(ns + "/" + name + "/" + cs[i].Name))
 		cs[i].ContainerID = hex.EncodeToString(id[:])
@@ -146,6 +162,22 @@ func NewCluster(now time.Time) *Cluster {
 	failedBackup.Containers[0].LastTerminatedAt = at(2*h - 4*time.Minute)
 	failedBackup.Containers[0].LastExitCode = 1
 
+	// Crash-looping since its last deploy: the config it needs is missing.
+	recs := pod("prod", "recommendations-6d5f7c8b9-zt4qx", "Running", nil, ctr("api", 14))
+	recs.Containers[0] = crashLooping(recs.Containers[0], "back-off 5m0s restarting failed container=api pod=recommendations-6d5f7c8b9-zt4qx_prod", at(3*time.Minute))
+	// Evicted when its node ran out of memory; the ReplicaSet replaced it.
+	evicted := pod("data", "ml-trainer-6f8c9d7b5-9xq2w", "Failed", nil, ctr("trainer", 0))
+	evicted.Reason = "Evicted"
+	evicted.Message = "The node was low on resource: memory. Threshold quantity: 750Mi, available: 512004Ki. Container trainer was using 9876544Ki, request is 6Gi, has larger consumption of memory."
+	evicted.Containers[0].State, evicted.Containers[0].Reason = "terminated", "ContainerStatusUnknown"
+	// The previous checkout-web ReplicaSet scaling down: terminating, still serving.
+	oldWeb := pod("prod", "checkout-web-5f9c7d6b4-8kq3z", "Running", nil, ctr("web", 0))
+	oldWeb.DeletedAt = now.Add(-20 * time.Second)
+	etl := pod("data", "etl-batch-0", "Pending", []string{"etl-scratch"}, ctr("etl", 0))
+	etl.Unschedulable = `0/4 nodes are available: persistentvolumeclaim "etl-scratch" not found.`
+	trainerRunning := pod("data", "ml-trainer-6f8c9d7b5-r2k7x", "Running", nil, ctr("trainer", 3),
+		model.ContainerStatus{Name: "fetch-model", Init: true, State: "terminated", Reason: "Completed"})
+
 	postgres := asUser(spec("postgres", "postgres:16.4", 500, 2048), 999)
 	postgres.ReadOnlyRootFilesystem, postgres.AllowPrivilegeEscalation = false, nil // left at the image defaults
 	trainer := asRoot(spec("trainer", "registry.example.com/data/ml-trainer:2.3.0", 2000, 0))
@@ -155,9 +187,9 @@ func NewCluster(now time.Time) *Cluster {
 	indexer := asUser(spec("indexer", "registry.example.com/search/indexer:5.1.0", 1000, 0), 1000)
 	indexer.MemoryRequestBytes = 2 * gib // no limit: the creeping memory never hits a ceiling
 	shipper := asRoot(spec("fluent-bit", "fluent/fluent-bit:3.1.9", 100, 128))
-	proxy := asRoot(spec("kube-proxy", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/kube-proxy:v1.31.3-eksbuild.2", 100, 0))
+	proxy := asRoot(spec("kube-proxy", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/kube-proxy:v1.34.1-eksbuild.2", 100, 0))
 	proxy.Privileged = true
-	coredns := asRoot(spec("coredns", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/coredns:v1.11.3-eksbuild.2", 100, 170))
+	coredns := asRoot(spec("coredns", "602401143452.dkr.ecr.us-east-1.amazonaws.com/eks/coredns:v1.12.3-eksbuild.1", 100, 170))
 	coredns.CapabilitiesAdd = []string{"NET_BIND_SERVICE"}
 
 	c := &Cluster{
@@ -174,9 +206,18 @@ func NewCluster(now time.Time) *Cluster {
 				nodeB, labels("app", "search-indexer"), "search-indexer", at(h),
 				indexer),
 			// Unschedulable: its claim etl-scratch does not exist.
-			placed(pod("data", "etl-batch-0", "Pending", []string{"etl-scratch"}, ctr("etl", 0)),
-				"", labels("job-name", "etl-batch"), "etl", at(5*h),
+			placed(etl, "", labels("job-name", "etl-batch"), "etl", at(5*h),
 				spec("etl", "registry.example.com/data/etl:2026.10.1", 1000, 4096)),
+			placed(recs, nodeB, labels("app", "recommendations", "pod-template-hash", "6d5f7c8b9"), "recommendations", at(50*time.Minute),
+				spec("api", "registry.example.com/shop/recommendations:4.0.0", 200, 512)),
+			placed(evicted, nodeC, labels("app", "ml-trainer", "pod-template-hash", "6f8c9d7b5"), "ml-trainer", at(20*h),
+				trainer, initContainer(asRoot(spec("fetch-model", "amazon/aws-cli:2.17.0", 100, 256)))),
+			placed(oldWeb, nodeB, labels("app", "checkout-web", "pod-template-hash", "5f9c7d6b4"), "checkout-web", at(20*day),
+				spec("web", "registry.example.com/shop/checkout-web:2.8.0", 100, 256)),
+			// A batch job on Fargate.
+			placed(pod("data", "feature-backfill-29345690-q9d2m", "Running", nil, ctr("backfill", 0)),
+				nodeF, labels("job-name", "feature-backfill-29345690"), "feature-backfill", at(25*time.Minute),
+				spec("backfill", "registry.example.com/data/feature-backfill:1.3.2", 500, 1024)),
 
 			// Healthy workloads, for a realistic list.
 			placed(pod("prod", "checkout-api-7d9f8b6c4-h5r8t", "Running", nil, ctr("api", 0), ctr("envoy", 0)),
@@ -218,8 +259,8 @@ func NewCluster(now time.Time) *Cluster {
 			withToken(placed(pod("monitoring", "kube-state-metrics-8d7c9f6b4-w9n5v", "Running", nil, ctr("kube-state-metrics", 0)),
 				nodeB, labels("app", "kube-state-metrics", "pod-template-hash", "8d7c9f6b4"), "kube-state-metrics", at(20*day),
 				asUser(spec("kube-state-metrics", "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.13.0", 100, 256), 65534))),
-			withToken(placed(pod("data", "ml-trainer-6f8c9d7b5-r2k7x", "Running", nil, ctr("trainer", 3)),
-				nodeC, labels("app", "ml-trainer", "pod-template-hash", "6f8c9d7b5"), "ml-trainer", at(4*day),
+			withToken(placed(trainerRunning,
+				nodeC, labels("app", "ml-trainer", "pod-template-hash", "6f8c9d7b5"), "ml-trainer", at(2*h),
 				trainer, initContainer(asRoot(spec("fetch-model", "amazon/aws-cli:2.17.0", 100, 256))))),
 
 			// A log shipper on every node, reading the node's logs.
@@ -253,12 +294,21 @@ func NewCluster(now time.Time) *Cluster {
 			pvc("prod", "backup-scratch", "io2", "Bound", 500, 12*day, now),
 			pvc("data", "ml-cache", "gp3", "Bound", 50, 90*day, now),
 			pvc("staging", "test-claim-3", "gp3", "Bound", 5, 2*day, now),
-			pvc("staging", "new-claim", "gp3", "Bound", 1, 3*time.Hour, now), // younger than the minimum age, hidden by default
+			pvc("staging", "new-claim", "gp3", "Bound", 1, 3*time.Hour, now),  // younger than the minimum age, hidden by default
+			pvc("data", "shared-models", "efs-sc", "Bound", 100, 30*day, now), // EFS: billed by usage, no estimate
 			// Waiting for its first pod, which is normal with WaitForFirstConsumer.
 			pvc("data", "feature-store", "gp3", "Pending", 0, 20*time.Minute, now),
 		},
 	}
 	c.addInventory(now)
+	c.link(now)
+	return c
+}
+
+// crashLooping makes a container wait in CrashLoopBackOff after failing.
+func crashLooping(c model.ContainerStatus, msg string, lastFailed time.Time) model.ContainerStatus {
+	c.State, c.Reason, c.Message = "waiting", "CrashLoopBackOff", msg
+	c.LastTerminatedReason, c.LastTerminatedAt, c.LastExitCode = "Error", lastFailed, 1
 	return c
 }
 

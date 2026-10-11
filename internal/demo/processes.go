@@ -3,6 +3,7 @@ package demo
 import (
 	"context"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/procmon"
@@ -49,7 +50,8 @@ func Processes(c *Cluster, now time.Time) []procmon.Report {
 	var order []string
 	pids := map[string]int{}
 	for _, p := range c.pods {
-		if p.Phase != "Running" || p.NodeName == "" {
+		// Fargate runs no DaemonSets, so no agent reports from there.
+		if p.Phase != "Running" || p.NodeName == "" || strings.HasPrefix(p.NodeName, "fargate-") {
 			continue
 		}
 		rep := reports[p.NodeName]
@@ -64,6 +66,9 @@ func Processes(c *Cluster, now time.Time) []procmon.Report {
 			PID: pid, PPID: 1, Name: "pause", Cmdline: "/pause", PodUID: p.UID, RSSBytes: 1 * mebibyte, Threads: 1,
 		})
 		for _, ctr := range p.Containers {
+			if ctr.State != "running" {
+				continue // a finished init container, or one waiting to restart, has no process
+			}
 			script, ok := processesByContainer[p.Namespace+"/"+p.Name+"/"+ctr.Name]
 			if !ok {
 				script = []proc{{ctr.Name, ctr.Name, 90, 25, 6, false}}
