@@ -80,6 +80,33 @@ func TestPrometheusHealth(t *testing.T) {
 	}
 }
 
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// A timeout is a failure; a request its caller cancelled is not.
+func TestPromHealthTimeoutsAndCancels(t *testing.T) {
+	h := &promHealth{}
+	send := func(ctx context.Context) {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://prometheus:9090/api/v1/query", nil)
+		_, _ = healthTransport{base: failingTransport{ctx.Err()}, h: h}.RoundTrip(req)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	send(cancelled)
+	send(cancelled)
+	if err := h.Err(); err != nil {
+		t.Errorf("requests the caller cancelled marked Prometheus down: %v", err)
+	}
+	expired, cancel2 := context.WithTimeout(context.Background(), -time.Second)
+	defer cancel2()
+	send(expired)
+	send(expired)
+	if err := h.Err(); err == nil || !strings.Contains(err.Error(), "no answer in time") {
+		t.Errorf("two timeouts: %v", err)
+	}
+}
+
 func TestPromHealthNeedsTwoFailures(t *testing.T) {
 	h := &promHealth{}
 	h.observe("unreachable: connection refused")

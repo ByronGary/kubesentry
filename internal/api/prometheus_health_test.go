@@ -33,7 +33,7 @@ func TestPrometheusOutageShows(t *testing.T) {
 		t.Errorf("readyz = %d %+v while Prometheus answers", code, r)
 	}
 
-	down = errors.New("2 queries failed in a row; last: HTTP 503 Service Unavailable")
+	down = errors.New("queries fail: HTTP 503 Service Unavailable")
 	info = infoResponse{}
 	get(t, s, "/api/v1/info", &info)
 	if info.Unavailable["prometheus"] != down.Error() {

@@ -82,21 +82,24 @@ func (h *promHealth) observe(reason string) {
 	h.lastErr = reason
 }
 
-// Err is non-nil while Prometheus is down.
+// Err is non-nil while Prometheus is down. The reason stays the same while
+// the failure does (no counts or times), so the UI's dismissed banner stays
+// dismissed.
 func (h *promHealth) Err() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.fails < promDownAfter {
 		return nil
 	}
-	return fmt.Errorf("%d queries failed in a row; last: %s", h.fails, h.lastErr)
+	return fmt.Errorf("queries fail: %s", h.lastErr)
 }
 
 // healthTransport records whether each request reached a Prometheus that
-// answered. Failures are a transport error, a 5xx, 401, 403 or 429; a 4xx
-// for a bad query still counts as an answer. A request its caller cancelled
-// says nothing either way. The reason never includes the URL: queries carry
-// namespace names, and /info shows the reason to every user.
+// answered. Failures are a transport error, a timeout, a 5xx, 401, 403 or
+// 429; a 4xx for a bad query still counts as an answer. A request its
+// caller cancelled says nothing either way. The reason never includes the
+// URL: queries carry namespace names, and /info shows the reason to every
+// user.
 type healthTransport struct {
 	base http.RoundTripper
 	h    *promHealth
@@ -106,7 +109,10 @@ func (t healthTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(r)
 	switch {
 	case err != nil:
-		if r.Context().Err() == nil {
+		switch cerr := r.Context().Err(); {
+		case errors.Is(cerr, context.DeadlineExceeded):
+			t.h.observe("no answer in time")
+		case cerr == nil:
 			var ue *url.Error
 			if errors.As(err, &ue) {
 				err = ue.Err
