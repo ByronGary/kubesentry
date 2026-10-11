@@ -285,4 +285,9 @@ type LeakReport struct {
 	Findings    []LeakFinding `json:"findings"`
 	Candidates  int           `json:"candidates"`
 	Errors      []string      `json:"errors,omitempty"`
+	// Warnings are notices that are not failures, e.g. the candidate cap was hit.
+	Warnings []string `json:"warnings,omitempty"`
+	// LastAttempt is when the latest scan ran; GeneratedAt stays at the last
+	// good scan when a later one fails.
+	LastAttempt time.Time `json:"lastAttempt"`
 }

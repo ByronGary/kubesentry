@@ -21,7 +21,7 @@ export interface Info {
   /** The precomputed view the inventory pages are served from. */
   snapshot?: { version: number; builtAt: string; ageSeconds: number; stale: boolean; error?: string }
   auditStore?: { backend: 'memory' | 'postgres'; oldest?: string; newest?: string; events: number; retentionHours?: number; maxEvents?: number }
-  prometheus?: { source: 'flag' | 'discovered' | 'amp' | 'none'; url?: string; retentionHours?: number }
+  prometheus?: { source: 'flag' | 'discovered' | 'amp' | 'none'; url?: string; retentionHours?: number; flavor?: string; version?: string }
   /** Sources that could not be read, with the reason (e.g. RBAC forbidden). */
   unavailable?: Record<string, string>
 }
@@ -483,8 +483,11 @@ export interface AgentStatus {
   node: string
   lastReport: string
   processes: number
+  /** Size of the last report as received (compressed when the agent gzips). */
   bytes: number
   stale: boolean
+  /** Processes cut by the server's per-node cap in the last report. */
+  dropped?: number
 }
 
 export interface NodesResponse {
