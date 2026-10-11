@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
-	"github.com/ByronGary/kubesentry/internal/model"
+	"github.com/ByronGary/kubesentry/internal/auth"
+	"github.com/ByronGary/kubesentry/internal/metrics"
 	"github.com/ByronGary/kubesentry/internal/procmon"
 )
 
@@ -70,19 +72,16 @@ type processesResponse struct {
 
 // podProcesses lists the processes running in one pod, as last reported by the
 // agent on its node. "available: false" means no agent has seen the pod.
+//
+// The caller needs ViewNamespace to see the pod at all (404 otherwise) and
+// ViewProcesses in its namespace for its processes (403 otherwise).
 func (s *Server) podProcesses(w http.ResponseWriter, r *http.Request) {
-	ns, name := r.PathValue("namespace"), r.PathValue("name")
-	if !validName(ns) || !validName(name) {
-		writeError(w, http.StatusBadRequest, "invalid namespace or pod name")
+	pod, _, ok := s.visiblePod(w, r)
+	if !ok {
 		return
 	}
-	pod, err := s.Cluster.GetPod(r.Context(), ns, name)
-	if errors.Is(err, model.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "pod not found")
-		return
-	}
-	if err != nil {
-		upstreamError(w, "kubernetes", err)
+	if !allowed(r.Context(), s.Authorizer, auth.ViewProcesses, pod.Namespace) {
+		writeError(w, http.StatusForbidden, "you may not see processes in this namespace")
 		return
 	}
 	resp := processesResponse{Processes: []processItem{}}
@@ -116,6 +115,16 @@ func (s *Server) podProcesses(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// countReports feeds kubesentry_agent_reports_total{code}, including
+// reports the token guard refuses.
+func countReports(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		metrics.AgentReports.With(strconv.Itoa(sw.code())).Inc()
+	})
 }
 
 func decodeJSON(r *http.Request, v any) error {

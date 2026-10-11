@@ -64,7 +64,7 @@ func TestContainersCheck(t *testing.T) {
 	// A pod the kubelet gave up on carries its own reason, which beats any
 	// container state.
 	evicted := model.Pod{Namespace: "a", Name: "web-x", Phase: "Failed", Reason: "Evicted",
-		Message: "The node was low on resource: memory. Container web was using 2Gi, which exceeds its request of 512Mi.",
+		Message:    "The node was low on resource: memory. Container web was using 2Gi, which exceeds its request of 512Mi.",
 		Containers: []model.ContainerStatus{{Name: "web", State: "terminated", Reason: "ContainerStatusUnknown"}}}
 	if c := DiagnosePodWith(PodInput{Pod: evicted, Now: podNow}, p)[1]; c.Status != StatusCrit || !strings.HasPrefix(c.Detail, "Evicted: The node was low on resource: memory.") {
 		t.Errorf("evicted containers check = %+v", c)

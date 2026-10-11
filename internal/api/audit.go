@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -11,9 +12,13 @@ import (
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
+	"github.com/ByronGary/kubesentry/internal/auth"
+	"github.com/ByronGary/kubesentry/internal/metrics"
 )
 
 // AuditBackend ingests audit payloads and serves queries over them.
+// *audit.Ingester implements it; its Active store (memory or Postgres) is
+// then queried directly, with paging, scope and error reporting.
 type AuditBackend interface {
 	IngestReader(r io.Reader) (int, error)
 	Query(q audit.Query) []audit.Event
@@ -22,7 +27,6 @@ type AuditBackend interface {
 const (
 	maxAuditBody    = 32 << 20
 	defaultAuditWin = 24 * time.Hour
-	maxAuditLimit   = 1000
 )
 
 var allActors = map[string]bool{"user": true, "serviceaccount": true, "system": true}
@@ -44,48 +48,127 @@ func guard(token string, next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// auditStore is the store queries read: the ingester's active store, or an
+// adapter over an older AuditBackend.
+func (s *Server) auditStore() audit.Store {
+	if a, ok := s.Audit.(interface{ Active() audit.Store }); ok {
+		if st := a.Active(); st != nil {
+			return st
+		}
+	}
+	return backendStore{s.Audit}
+}
+
+// backendStore adapts an AuditBackend that is not an Ingester to audit.Store.
+type backendStore struct{ b AuditBackend }
+
+func (b backendStore) Add(context.Context, []audit.Event) error {
+	return errors.New("audit backend is read-only here")
+}
+
+func (b backendStore) Query(_ context.Context, q audit.Query) ([]audit.Event, error) {
+	return b.b.Query(q), nil
+}
+
+func (b backendStore) Summarize(_ context.Context, q audit.Query) (audit.Summary, error) {
+	q.Limit = 0
+	return audit.Summarize(b.b.Query(q)), nil
+}
+
+func (b backendStore) Coverage(context.Context) (audit.Coverage, error) {
+	return audit.Coverage{Backend: "memory"}, nil
+}
+
 // auditWebhook receives events from the kube-apiserver audit webhook backend,
 // or from a script posting newline-delimited events. It fails closed: without
 // a configured token anyone could inject fake audit records, so it refuses.
+// A store that is busy (Postgres queue full) answers 503 with Retry-After,
+// which the API server's webhook backend retries.
 func (s *Server) auditWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.AuditToken == "" {
 		writeError(w, http.StatusServiceUnavailable, "audit webhook disabled: no audit token configured")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAuditBody)
-	n, err := s.Audit.IngestReader(r.Body)
+	var n int
+	var err error
+	if in, ok := s.Audit.(interface {
+		Ingest(context.Context, io.Reader) (int, error)
+	}); ok {
+		n, err = in.Ingest(r.Context(), r.Body)
+	} else {
+		n, err = s.Audit.IngestReader(r.Body)
+	}
 	if err != nil {
 		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
+		switch {
+		case errors.As(err, &tooBig):
 			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("payload exceeds %d MiB; send smaller batches", maxAuditBody>>20))
-			return
+		case errors.Is(err, audit.ErrBackpressure):
+			w.Header().Set("Retry-After", "5")
+			writeError(w, http.StatusServiceUnavailable, "audit store is busy; retry later")
+		default:
+			writeError(w, http.StatusBadRequest, "invalid audit payload")
 		}
-		writeError(w, http.StatusBadRequest, "invalid audit payload")
 		return
 	}
+	metrics.AuditIngested.With("webhook").Add(float64(n))
 	writeJSON(w, http.StatusOK, map[string]int{"accepted": n})
 }
 
 type auditEventsResponse struct {
-	Count int           `json:"count"`
-	Items []audit.Event `json:"items"`
+	Count    int           `json:"count"`
+	Items    []audit.Event `json:"items"`
+	Continue string        `json:"continue,omitempty"`
 }
 
-// auditEvents lists events, newest first. By default it shows the signal: it
-// hides system components and untagged reads. See audit.Query.
+// auditEvents lists events, newest first, a page at a time, in the
+// namespaces where the caller may read audit events (and cluster-scoped
+// events with ViewClusterAudit). By default it shows the signal: it hides
+// system components and untagged reads. See audit.Query.
 func (s *Server) auditEvents(w http.ResponseWriter, r *http.Request) {
 	q, err := s.parseAuditQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	q.Limit, err = limitParam(r, 100)
+	limit, err := limitParam(r, defaultPageLimit)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	items := s.Audit.Query(q)
-	writeJSON(w, http.StatusOK, auditEventsResponse{Count: len(items), Items: items})
+	q.Before, err = audit.DecodeCursor(r.URL.Query().Get("continue"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.auditScope(r, &q)
+	q.Limit = limit + 1 // one more tells whether there is a next page
+	items, err := s.auditStore().Query(r.Context(), q)
+	if err != nil {
+		upstreamError(w, "audit store", err)
+		return
+	}
+	resp := auditEventsResponse{Items: items}
+	if len(items) > limit {
+		resp.Items = items[:limit]
+		resp.Continue = audit.CursorOf(resp.Items[limit-1]).Encode()
+	}
+	if resp.Items == nil {
+		resp.Items = []audit.Event{}
+	}
+	resp.Count = len(resp.Items)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// auditScope narrows q to what the caller may read.
+func (s *Server) auditScope(r *http.Request, q *audit.Query) {
+	s.prepareAuthz(r)
+	sc := s.scope(r, auth.ViewAudit)
+	if !sc.All {
+		q.Namespaces = sc.Namespaces
+		q.ClusterScoped = s.can(r, auth.ViewClusterAudit)
+	}
 }
 
 type auditSummaryResponse struct {
@@ -109,8 +192,14 @@ func (s *Server) auditSummary(w http.ResponseWriter, r *http.Request) {
 	if params.Get("includeReads") == "" {
 		q.IncludeReads = true
 	}
+	s.auditScope(r, &q)
+	sum, err := s.auditStore().Summarize(r.Context(), q)
+	if err != nil {
+		upstreamError(w, "audit store", err)
+		return
+	}
 	window, _ := durationParam(r, "since", defaultAuditWin, time.Minute, 365*24*time.Hour) // already validated
-	writeJSON(w, http.StatusOK, auditSummaryResponse{Window: window.String(), Summary: audit.Summarize(s.Audit.Query(q))})
+	writeJSON(w, http.StatusOK, auditSummaryResponse{Window: window.String(), Summary: sum})
 }
 
 func (s *Server) parseAuditQuery(r *http.Request) (audit.Query, error) {
@@ -145,16 +234,4 @@ func (s *Server) parseAuditQuery(r *http.Request) (audit.Query, error) {
 		q.IncludeReads = b
 	}
 	return q, nil
-}
-
-func limitParam(r *http.Request, def int) (int, error) {
-	raw := r.URL.Query().Get("limit")
-	if raw == "" {
-		return def, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 1 || n > maxAuditLimit {
-		return 0, fmt.Errorf("limit must be an integer between 1 and %d", maxAuditLimit)
-	}
-	return n, nil
 }

@@ -222,8 +222,8 @@ func TestMapEndpoint(t *testing.T) {
 	if code := get(t, s, "/api/v1/map", &resp); code != 200 {
 		t.Fatalf("status %d", code)
 	}
-	// Default: the first non-system namespace with pods.
-	if resp.Namespace != "a-team" || strings.Join(resp.Namespaces, ",") != "a-team,kube-system,shop" {
+	// Default: the non-system namespace with the most live pods.
+	if resp.Namespace != "shop" || strings.Join(resp.Namespaces, ",") != "a-team,kube-system,shop" {
 		t.Errorf("namespace = %q of %v", resp.Namespace, resp.Namespaces)
 	}
 
@@ -290,14 +290,42 @@ func TestCertificatesEndpoint(t *testing.T) {
 	}
 }
 
+// A source that cannot be read degrades the pages that use it (and /info
+// names it); only a cluster that cannot be read at all fails them.
 func TestInventoryUpstreamErrors(t *testing.T) {
+	paths := []string{"/api/v1/workloads", "/api/v1/nodes", "/api/v1/storage", "/api/v1/map", "/api/v1/security", "/api/v1/pods"}
 	s := newServer(inventoryCluster(), nil)
 	s.Inventory = fakeInventory{err: errors.New("boom")}
-	for _, path := range []string{"/api/v1/workloads", "/api/v1/nodes", "/api/v1/storage", "/api/v1/map"} {
-		if code := get(t, s, path, nil); code != 502 {
-			t.Errorf("%s = %d, want 502", path, code)
+	for _, path := range paths {
+		if code := get(t, s, path, nil); code != 200 {
+			t.Errorf("%s = %d with the inventory down, want 200", path, code)
 		}
 	}
+	var info infoResponse
+	get(t, s, "/api/v1/info", &info)
+	if info.Unavailable["workloads"] != "boom" || info.Unavailable["pods"] != "" {
+		t.Errorf("unavailable = %v", info.Unavailable)
+	}
+
+	s = newServer(failingCluster{}, nil)
+	s.Inventory = fakeInventory{err: errors.New("boom")}
+	for _, path := range paths {
+		if code := get(t, s, path, nil); code != 502 {
+			t.Errorf("%s = %d with everything down, want 502", path, code)
+		}
+	}
+}
+
+// failingCluster fails every read.
+type failingCluster struct{}
+
+func (failingCluster) ListPVCs(context.Context) ([]model.PVC, error) { return nil, errors.New("down") }
+func (failingCluster) ListPods(context.Context) ([]model.Pod, error) { return nil, errors.New("down") }
+func (failingCluster) GetPod(context.Context, string, string) (*model.Pod, error) {
+	return nil, errors.New("down")
+}
+func (failingCluster) GetPVC(context.Context, string, string) (*model.PVC, error) {
+	return nil, errors.New("down")
 }
 
 func TestInventoryRoutesNeedSources(t *testing.T) {

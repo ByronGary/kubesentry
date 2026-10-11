@@ -143,10 +143,14 @@ func TestAuditEventsDefaultViewAndFilters(t *testing.T) {
 
 func TestAuditEventsBadParams(t *testing.T) {
 	s := auditServer(t)
-	for _, q := range []string{"?actors=root", "?limit=0", "?limit=5000", "?limit=x", "?since=tomorrow", "?since=1s", "?includeReads=maybe"} {
+	for _, q := range []string{"?actors=root", "?limit=0", "?limit=-1", "?limit=x", "?since=tomorrow", "?since=1s", "?includeReads=maybe", "?continue=garbage", "?continue=djE6MDp4"} {
 		if code := doReq(t, s, http.MethodGet, "/api/v1/audit/events"+q, "", "", nil); code != http.StatusBadRequest {
 			t.Errorf("%s: status %d, want 400", q, code)
 		}
+	}
+	// A limit above the maximum is clamped, not refused.
+	if code := doReq(t, s, http.MethodGet, "/api/v1/audit/events?limit=5000", "", "", nil); code != http.StatusOK {
+		t.Errorf("limit=5000: status %d, want 200", code)
 	}
 }
 

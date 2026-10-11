@@ -29,28 +29,31 @@ type CertSource interface {
 
 // Response shapes. Mirrored in web/src/types.ts.
 
-// GET /api/v1/workloads[?namespace=]
+// GET /api/v1/workloads[?namespace=&limit=&continue=]
 type workloadsResponse struct {
-	Count int                         `json:"count"`
-	Items []detectors.WorkloadSummary `json:"items"`
+	Count    int                         `json:"count"`
+	Items    []detectors.WorkloadSummary `json:"items"`
+	Continue string                      `json:"continue,omitempty"`
 }
 
-// GET /api/v1/storage
+// GET /api/v1/storage[?limit=&continue=]
 type storageResponse struct {
 	Claims               []detectors.ClaimSummary  `json:"claims"`
 	Volumes              []detectors.VolumeSummary `json:"volumes"`
 	Classes              []detectors.ClassSummary  `json:"classes"`
 	Unused               []detectors.UnusedPVC     `json:"unused"` // same rules as /api/v1/pvcs/unused
 	UnusedMonthlyCostUSD float64                   `json:"unusedMonthlyCostUSD"`
+	Continue             string                    `json:"continue,omitempty"` // pages claims
 }
 
-// GET /api/v1/security
+// GET /api/v1/security[?view=summary][?limit=&continue=]
 type securityResponse struct {
 	// Counts by severity, excluding System findings.
 	Counts     map[string]int               `json:"counts"`
 	Findings   []detectors.SecurityFinding  `json:"findings"`
 	Namespaces []detectors.NamespacePosture `json:"namespaces"`
 	Warnings   []string                     `json:"warnings,omitempty"` // a source that could not be read, e.g. RBAC forbidden
+	Continue   string                       `json:"continue,omitempty"` // pages findings
 }
 
 // GET /api/v1/certificates
@@ -61,8 +64,8 @@ type certificatesResponse struct {
 	Requests     []detectors.RequestSummary `json:"requests"`
 }
 
-// GET /api/v1/map[?namespace=]. Without a namespace the server picks the first
-// non-system namespace (alphabetically) that has pods.
+// GET /api/v1/map[?namespace=]. Without a namespace the server picks the
+// caller's non-system namespace with the most live pods.
 type mapResponse struct {
 	Namespace  string          `json:"namespace"`
 	Namespaces []string        `json:"namespaces"` // every namespace with pods, for the picker
@@ -73,4 +76,10 @@ type mapResponse struct {
 type nodesResponse struct {
 	Count int                     `json:"count"`
 	Items []detectors.NodeSummary `json:"items"`
+}
+
+// GET /api/v1/nodes?summary=true: nodes without their pods.
+type nodesSummaryResponse struct {
+	Count int       `json:"count"`
+	Items []nodeOut `json:"items"`
 }
