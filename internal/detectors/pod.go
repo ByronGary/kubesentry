@@ -164,14 +164,10 @@ func WaitingReason(p *model.Pod) string {
 }
 
 // podLevelReason is the pod's own status.reason and message (Evicted,
-// NodeLost, UnexpectedAdmissionError, ...).
-//
-// INTEGRATION HOOK: model.Pod does not carry status.reason yet. Once it gains
-// a pod-level Reason (and Message), return them here; PodReason,
-// containersCheck and the map's pod status already use this function.
+// NodeLost, UnexpectedAdmissionError, ...). PodReason, containersCheck and
+// the map's pod status use it.
 func podLevelReason(p *model.Pod) (reason, message string) {
-	_ = p
-	return "", ""
+	return p.Reason, p.Message
 }
 
 // PodReason is a short reason a pod is not plainly running: the pod's own

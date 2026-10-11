@@ -65,6 +65,12 @@ func TestConvertPodStateFields(t *testing.T) {
 	if !crash.DeletedAt.Equal(t1.Time) || crash.Ready || !crash.ReadyChanged.Equal(t0.Time) || crash.QOSClass != "Guaranteed" {
 		t.Errorf("crash pod: %+v", crash)
 	}
+	if crash.Reason != "Evicted" || len(crash.Message) != maxMessage || !strings.HasPrefix(longMsg, crash.Message) {
+		t.Errorf("pod-level reason: %q %q", crash.Reason, crash.Message)
+	}
+	if web.Reason != "" || web.Message != "" {
+		t.Errorf("ordinary pod has a reason: %q %q", web.Reason, web.Message)
+	}
 	byName := map[string]model.ContainerStatus{}
 	for _, c := range crash.Containers {
 		byName[c.Name] = c

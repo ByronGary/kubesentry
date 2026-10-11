@@ -6,14 +6,13 @@ import "time"
 // pages. Their JSON shapes are mirrored in web/src/types.ts; change both
 // together. Status fields use the Status* constants from pod.go.
 
-// SystemNamespaces are treated as cluster plumbing: findings in them are
-// marked System and hidden by default in the UI.
-var SystemNamespaces = map[string]bool{
-	"kube-system":        true,
-	"kube-public":        true,
-	"kube-node-lease":    true,
-	"local-path-storage": true,
-}
+// SystemNamespaces are treated as cluster plumbing by the entry points that
+// predate Policy: findings in them are marked System and hidden by default in
+// the UI. It starts as the default policy's set.
+//
+// Deprecated: use Policy.SystemNamespaces (and SystemNamespaceSet, which also
+// applies the namespace label override).
+var SystemNamespaces = DefaultPolicy().SystemNamespaces
 
 // WorkloadSummary is one row on the Workloads page.
 type WorkloadSummary struct {

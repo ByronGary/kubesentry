@@ -9,12 +9,6 @@ import (
 // The policy itself is defined in policy.go (a shared contract file); the
 // helpers that apply it live here.
 
-func init() {
-	// SystemNamespaces (inventory.go) is deprecated: it now starts as the
-	// default policy's set, so code that still reads it agrees with Policy.
-	SystemNamespaces = DefaultPolicy().SystemNamespaces
-}
-
 // compatPolicy backs the entry points that predate Policy: the default policy,
 // with the deprecated SystemNamespaces variable as its namespace set, so code
 // that still adjusts that variable keeps working.
