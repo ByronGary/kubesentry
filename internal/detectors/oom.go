@@ -18,12 +18,14 @@ type OOMEvent struct {
 // FindOOMKills returns containers whose latest recorded termination reason is
 // OOMKilled, newest first. A zero since returns all of them. The Kubernetes API
 // only keeps the last termination per container, so this is "most recent OOM",
-// not a count; the leak detector adds history from Prometheus.
+// not a count; the leak detector adds history from Prometheus. Ordinary init
+// containers are left out (see IsInitOnly); a failing init container shows on
+// the pod page's containers check instead.
 func FindOOMKills(pods []model.Pod, since time.Time) []OOMEvent {
 	out := []OOMEvent{}
 	for _, p := range pods {
 		for _, c := range p.Containers {
-			if c.LastTerminatedReason != "OOMKilled" {
+			if c.LastTerminatedReason != "OOMKilled" || IsInitOnly(c) {
 				continue
 			}
 			if !since.IsZero() && c.LastTerminatedAt.Before(since) {
