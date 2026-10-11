@@ -63,3 +63,34 @@ func TestPagesUseTheUIPollIntervals(t *testing.T) {
 		}
 	}
 }
+
+func TestAfterPagesMatchTheNewUI(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 3))
+	tg := &Targets{Pods: []PodRef{{"a", "p"}, {"b", "q"}}, Namespaces: []string{"a", "b"}}
+	seen := map[string]Hook{}
+	for i := 0; i < 200; i++ {
+		for _, p := range PagesAfter {
+			for _, h := range p.Hooks(tg, r) {
+				seen[h.Route] = h
+			}
+		}
+	}
+	for route, paged := range map[string]bool{"pods": true, "workloads": true, "storage": true, "security": false, "oom": false} {
+		if seen[route].Paged != paged {
+			t.Errorf("%s paged=%v", route, seen[route].Paged)
+		}
+	}
+	if seen["processes"].Needs != "processes" || seen["audit-summary"].Needs != "audit" {
+		t.Error("capability gates missing")
+	}
+	if seen["security"].Path != "/api/v1/security?view=summary" || seen["nodes"].Path != "/api/v1/nodes?summary=true" {
+		t.Errorf("security %q nodes %q", seen["security"].Path, seen["nodes"].Path)
+	}
+	in := tg.Within(map[string]bool{"b": true})
+	if len(in.Pods) != 1 || in.Pods[0].Namespace != "b" || len(in.Namespaces) != 1 {
+		t.Errorf("within %+v", in)
+	}
+	if tg.Within(nil) != tg {
+		t.Error("nil scope must keep everything")
+	}
+}

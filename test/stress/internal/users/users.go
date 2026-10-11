@@ -2,10 +2,13 @@ package users
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,8 +20,14 @@ import (
 
 // Options configure a run.
 type Options struct {
-	Client      *ks.Client
-	Identities  func(i int) ks.Identity // identity of virtual user i
+	Client     *ks.Client
+	Identities func(i int) ks.Identity // identity of virtual user i
+	// Scope, if set, limits user i's pod and map targets to these namespaces
+	// (nil: all), so team members open their own pods.
+	Scope func(i int) map[string]bool
+	// InfoEvery polls /api/v1/info for the whole session (the new UI: 30s);
+	// 0 fetches it once, as the baseline UI did.
+	InfoEvery   time.Duration
 	Stages      []Stage
 	RampUp      time.Duration // spread new users of a stage over this
 	ThinkMin    time.Duration
@@ -207,11 +216,16 @@ var reqSeq atomic.Int64
 var errSuperseded = errors.New("superseded by the next poll")
 
 func (r *runner) request(ctx context.Context, id ks.Identity, route, path string) hist.Outcome {
+	oc, _ := r.requestBody(ctx, id, route, path, false)
+	return oc
+}
+
+func (r *runner) requestBody(ctx context.Context, id ks.Identity, route, path string, keep bool) (hist.Outcome, []byte) {
 	rctx, cancel := context.WithTimeout(ctx, r.o.ReqTimeout)
 	defer cancel()
 	k := reqSeq.Add(1)
 	r.inflight.Store(k, time.Now().UnixNano())
-	resp := r.o.Client.Do(rctx, id, http.MethodGet, path, nil, "", false)
+	resp := r.o.Client.Do(rctx, id, http.MethodGet, path, nil, "", keep)
 	r.inflight.Delete(k)
 	outcome := hist.Classify(resp.Err, ctx.Err())
 	switch {
@@ -224,7 +238,43 @@ func (r *runner) request(ctx context.Context, id ks.Identity, route, path string
 	}
 	r.stage.Load().Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
 	r.all.Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
-	return outcome
+	return outcome, resp.Body
+}
+
+// fetch runs one hook request: a single GET, or for a paged hook every page
+// in turn (limit=h.Limit, following continue). It reports whether the result
+// had a single page (the UI polls paged lists only then).
+func (r *runner) fetch(ctx context.Context, id ks.Identity, h Hook) (hist.Outcome, bool) {
+	if !h.Paged {
+		return r.request(ctx, id, h.Route, h.Path), true
+	}
+	sep := "?"
+	if strings.Contains(h.Path, "?") {
+		sep = "&"
+	}
+	cont := ""
+	for page := 0; ; page++ {
+		p := fmt.Sprintf("%s%slimit=%d", h.Path, sep, h.Limit)
+		if cont != "" {
+			p += "&continue=" + url.QueryEscape(cont)
+		}
+		route := h.Route
+		if page > 0 {
+			route = h.Route + "(next page)"
+		}
+		oc, body := r.requestBody(ctx, id, route, p, true)
+		if oc != hist.OK {
+			return oc, page == 0
+		}
+		var v struct {
+			Continue string `json:"continue"`
+		}
+		_ = json.Unmarshal(body, &v)
+		if v.Continue == "" || page >= 20 { // the UI stops at 20,000 rows
+			return oc, page == 0
+		}
+		cont = v.Continue
+	}
 }
 
 // user is one virtual user's session.
@@ -233,10 +283,49 @@ func (r *runner) user(ctx context.Context, n int) {
 	defer r.active.Add(-1)
 	rnd := rand.New(rand.NewPCG(r.o.Seed, uint64(n)))
 	id := r.o.Identities(n)
-	r.request(ctx, id, "info", "/api/v1/info") // App.tsx, once per session
+	targets := r.o.Targets
+	if r.o.Scope != nil {
+		targets = targets.Within(r.o.Scope(n))
+	}
+	// App.tsx: /info first (the UI gates pages on its capabilities), then
+	// polled every 30s by the new UI for the whole session.
+	caps := map[string]bool{"audit": true, "processes": true}
+	if oc, body := r.requestBody(ctx, id, "info", "/api/v1/info", true); oc == hist.OK {
+		var info struct {
+			Audit        bool            `json:"audit"`
+			Processes    bool            `json:"processes"`
+			Capabilities map[string]bool `json:"capabilities"`
+		}
+		if json.Unmarshal(body, &info) == nil {
+			caps["audit"], caps["processes"] = info.Audit, info.Processes
+			if info.Capabilities != nil {
+				caps["audit"] = info.Audit && (info.Capabilities["audit"] || info.Capabilities["clusterAudit"])
+				caps["processes"] = info.Processes && info.Capabilities["processes"]
+			}
+		}
+	}
+	if r.o.InfoEvery > 0 {
+		go func() {
+			t := time.NewTicker(r.o.InfoEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					r.request(ctx, id, "info", "/api/v1/info")
+				}
+			}
+		}()
+	}
 	for ctx.Err() == nil {
 		page := Pick(r.o.Pages, rnd)
-		hooks := page.Hooks(r.o.Targets, rnd)
+		var hooks []Hook
+		for _, h := range page.Hooks(targets, rnd) {
+			if h.Needs == "" || caps[h.Needs] {
+				hooks = append(hooks, h)
+			}
+		}
 		pctx, leave := context.WithCancel(ctx)
 		loaded := make(chan struct{}, len(hooks))
 		loadStart := time.Now()
@@ -282,14 +371,22 @@ func (r *runner) user(ctx context.Context, n int) {
 func (r *runner) hook(ctx context.Context, id ks.Identity, h Hook, loaded chan<- struct{}) {
 	var cancelPrev context.CancelCauseFunc
 	var signalled atomic.Bool
+	var multiPage atomic.Bool
 	fire := func(bool) {
+		if multiPage.Load() {
+			return // usePaged refreshes only while everything fits in one page
+		}
 		if cancelPrev != nil {
 			cancelPrev(errSuperseded)
 		}
 		rctx, cancel := context.WithCancelCause(ctx)
 		cancelPrev = cancel
 		go func() {
-			if oc := r.request(rctx, id, h.Route, h.Path); oc != hist.Aborted && oc != hist.Superseded && signalled.CompareAndSwap(false, true) {
+			oc, single := r.fetch(rctx, id, h)
+			if !single {
+				multiPage.Store(true)
+			}
+			if oc != hist.Aborted && oc != hist.Superseded && signalled.CompareAndSwap(false, true) {
 				loaded <- struct{}{}
 			}
 		}()

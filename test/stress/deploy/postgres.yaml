@@ -1,0 +1,68 @@
+# Postgres 17 for the after run's audit store (audit.store=postgres). One
+# instance on a real worker (not the load-generator node), local-path storage.
+# hack/stress-up.sh creates the password Secret here and the DSN Secret
+# kubesentry/kubesentry-pg. Test only: no TLS (the chart sets sslmode=disable).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stress-pg
+  labels: {kubesentry.io/stress: "true"}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: stress-pg
+  labels: {app: postgres, kubesentry.io/stress: "true"}
+spec:
+  selector: {app: postgres}
+  ports:
+    - {name: pg, port: 5432, targetPort: pg}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: stress-pg
+  labels: {app: postgres, kubesentry.io/stress: "true"}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres, kubesentry.io/stress: "true"}
+    spec:
+      nodeSelector: {kubernetes.io/hostname: kubesentry-worker2}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: postgres:17
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "shared_buffers=256MB", "-c", "max_connections=200", "-c", "work_mem=8MB", "-c", "maintenance_work_mem=128MB", "-c", "max_wal_size=2GB"]
+          env:
+            - {name: POSTGRES_DB, value: kubesentry}
+            - {name: POSTGRES_USER, value: kubesentry}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: postgres, key: password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports:
+            - {name: pg, containerPort: 5432}
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "kubesentry", "-d", "kubesentry"]}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 200m, memory: 512Mi}
+            limits: {memory: 1536Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels: {kubesentry.io/stress: "true"}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: standard
+        resources:
+          requests: {storage: 10Gi}

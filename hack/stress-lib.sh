@@ -100,17 +100,28 @@ EOF
   [ "${status%%/*}" = 1 ]
 }
 
+# The kustomize manifests label the server app=kubesentry; the Helm chart
+# app.kubernetes.io/component=server. Container "server" either way.
+ks_selector() {
+  if k -n kubesentry get pods -l app=kubesentry -o name 2>/dev/null | grep -q .; then
+    echo app=kubesentry
+  else
+    echo app.kubernetes.io/component=server
+  fi
+}
+
 kubesentry_restarts() {
-  k -n kubesentry get pods -l app=kubesentry -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}' 2>/dev/null |
+  k -n kubesentry get pods -l "$(ks_selector)" -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="server")].restartCount}{"\n"}{end}' 2>/dev/null |
     awk '{s += $1} END {print s + 0}'
 }
 
 kubesentry_last_reason() {
-  k -n kubesentry get pods -l app=kubesentry -o jsonpath='{.items[0].status.containerStatuses[0].lastState.terminated.reason}' 2>/dev/null
+  k -n kubesentry get pods -l "$(ks_selector)" -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="server")].lastState.terminated.reason}{"\n"}{end}' 2>/dev/null |
+    grep -m1 . || true
 }
 
 kubesentry_memory_limit() {
-  k -n kubesentry get deploy kubesentry -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'
+  k -n kubesentry get deploy kubesentry -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].resources.limits.memory}'
 }
 
 # step NAME RUN CMD...: runs CMD and appends a line to results/RUN/steps.tsv.
@@ -140,7 +151,7 @@ step() {
 
 # reload_stress_image rebuilds the harness image and binary after harness changes.
 reload_stress_image() {
-  docker build -q -t kubesentry-stress:dev test/stress >/dev/null &&
+  nice -n 19 docker build -q -t kubesentry-stress:dev -f test/stress/Dockerfile . >/dev/null &&
     kind load docker-image --name "$STRESS_CLUSTER" --nodes "$LOADGEN_NODE" kubesentry-stress:dev >/dev/null &&
     build_stress_bin
 }
@@ -150,7 +161,7 @@ reload_stress_image() {
 wait_kubesentry() {
   local i
   for i in $(seq 1 72); do
-    [ "$(k -n kubesentry get pods -l app=kubesentry -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null)" = true ] && return 0
+    k -n kubesentry get pods -l "$(ks_selector)" -o jsonpath='{range .items[*]}{.status.containerStatuses[?(@.name=="server")].ready}{"\n"}{end}' 2>/dev/null | grep -q true && return 0
     [ "$i" = 1 ] && log "waiting for kubesentry to become ready"
     sleep 5
   done

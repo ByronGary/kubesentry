@@ -49,7 +49,7 @@ type Expectation struct {
 	From     string `json:"from"`     // e.g. Deployment/stress-tricky/web
 	// To names the target: a pod name prefix ("web-"), a node, a claim, or a status.
 	To    string `json:"to"`
-	Count int    `json:"count,omitempty"` // how many pods match To, when it is a prefix
+	Count int    `json:"count,omitempty"` // how many pods match To, when it is a prefix; -1: as many as the cluster's EndpointSlice lists
 	Note  string `json:"note,omitempty"`
 }
 
@@ -128,8 +128,8 @@ var Cases = []Case{
 			{Relation: "pod-owner", From: "", To: "static-web-kubesentry-worker", Count: 1, Note: "mirror pod, owned by the Node: no workload"},
 			{Relation: "pod-node", From: "Pod/stress-tricky/static-web-kubesentry-worker", To: "Node/kubesentry-worker"},
 		}},
-	{ID: "succeeded-selected", Namespace: NS, Description: "Pod done-1 has Succeeded; Service done selects it. The EndpointSlice keeps it as an endpoint that is neither ready nor serving, so it gets no traffic.",
-		Expect: []Expectation{{Relation: "service-pods", From: "Service/stress-tricky/done", To: "done-1", Count: 1, Note: "ready=false, serving=false"}}},
+	{ID: "succeeded-selected", Namespace: NS, Description: "Pod done-1 has Succeeded; Service done selects it. The EndpointSlice controller first keeps it as an endpoint that is neither ready nor serving, and drops it after a resync; either way it gets no traffic.",
+		Expect: []Expectation{{Relation: "service-pods", From: "Service/stress-tricky/done", To: "done-1", Count: -1, Note: "as many as the EndpointSlice lists (1 not ready and not serving, or 0)"}}},
 	{ID: "mid-rollout", Namespace: NS, Description: "Deployment rollout: revision 2 never becomes ready (maxUnavailable 0), so 3 old and 1 new pod coexist.",
 		Expect: []Expectation{
 			{Relation: "pod-owner", From: "Deployment/stress-tricky/rollout", To: "rollout-", Count: 4},

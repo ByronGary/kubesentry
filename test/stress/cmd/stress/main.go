@@ -36,7 +36,9 @@ import (
 	"github.com/ByronGary/kubesentry/test/stress/internal/kc"
 	"github.com/ByronGary/kubesentry/test/stress/internal/ks"
 	"github.com/ByronGary/kubesentry/test/stress/internal/metricsim"
+	"github.com/ByronGary/kubesentry/test/stress/internal/oidc"
 	"github.com/ByronGary/kubesentry/test/stress/internal/out"
+	"github.com/ByronGary/kubesentry/test/stress/internal/personas"
 	"github.com/ByronGary/kubesentry/test/stress/internal/plan"
 	"github.com/ByronGary/kubesentry/test/stress/internal/report"
 	"github.com/ByronGary/kubesentry/test/stress/internal/tricky"
@@ -45,7 +47,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: stress gen|expected|verify|connectivity|users|audit|agents|metrics-sim|report|summary [flags]")
+	fmt.Fprintln(os.Stderr, "usage: stress gen|expected|verify [assoc|authz]|connectivity|users|audit|agents|metrics-sim|report|summary|oidc|oidc-key|personas|cwfake|verify-cloudwatch|chaos [flags]")
 	os.Exit(2)
 }
 
@@ -63,10 +65,14 @@ func main() {
 	case "expected":
 		err = cmdExpected(args)
 	case "verify":
-		if len(args) > 0 && args[0] == "assoc" {
-			args = args[1:]
+		switch {
+		case len(args) > 0 && args[0] == "authz":
+			err = cmdVerifyAuthz(ctx, args[1:])
+		case len(args) > 0 && args[0] == "assoc":
+			err = cmdVerify(ctx, args[1:])
+		default:
+			err = cmdVerify(ctx, args)
 		}
-		err = cmdVerify(ctx, args)
 	case "connectivity":
 		err = cmdConn(ctx, args)
 	case "users":
@@ -81,6 +87,20 @@ func main() {
 		err = cmdReport(ctx, args)
 	case "summary":
 		err = cmdSummary(args)
+	case "oidc":
+		err = cmdOIDC(ctx, args)
+	case "chaos":
+		err = cmdChaos(ctx, args)
+	case "token":
+		err = cmdToken(ctx, args)
+	case "oidc-key":
+		err = cmdOIDCKey(ctx, args)
+	case "personas":
+		err = cmdPersonas(ctx, args)
+	case "cwfake":
+		err = cmdCWFake(ctx, args)
+	case "verify-cloudwatch":
+		err = cmdVerifyCloudWatch(ctx, args)
 	default:
 		usage()
 	}
@@ -96,6 +116,10 @@ type common struct {
 	auditToken string
 	agentToken string
 	timeout    time.Duration
+	ingest     string
+	auth       string
+	asEmail    string
+	asGroups   string
 }
 
 func (c *common) register(fs *flag.FlagSet, qps float64, burst int) {
@@ -106,6 +130,49 @@ func (c *common) register(fs *flag.FlagSet, qps float64, burst int) {
 	fs.StringVar(&c.auditToken, "audit-token", "", "audit webhook token (default $KUBESENTRY_AUDIT_TOKEN, else secret kubesentry/kubesentry-audit)")
 	fs.StringVar(&c.agentToken, "agent-token", "", "agent token (default $KUBESENTRY_AGENT_TOKEN, else secret kubesentry/kubesentry-agent)")
 	fs.DurationVar(&c.timeout, "timeout", 120*time.Second, "per-request timeout")
+	fs.StringVar(&c.ingest, "ingest", "", "base URL for /agent/report and /audit/webhook (default: --base); the chart's is http://kubesentry-ingest.kubesentry.svc:8081")
+	fs.StringVar(&c.auth, "auth", "token", "how the harness authenticates to /api/: token (the shared API token) or jwt (a bearer JWT from the test issuer, through oauth2-proxy)")
+	fs.StringVar(&c.asEmail, "as", "admin0@corp.example", "with --auth=jwt: the email claim")
+	fs.StringVar(&c.asGroups, "as-groups", "stress:admins", "with --auth=jwt: comma-separated groups claim")
+}
+
+// apiID is the identity the harness itself uses on /api/ routes.
+func (c *common) apiID(ctx context.Context, cl *kc.Clients) ks.Identity {
+	if c.auth == "jwt" {
+		id, err := c.jwt(ctx, cl, c.asEmail, splitList(c.asGroups))
+		if err != nil {
+			out.Logf("jwt identity: %v", err)
+		}
+		return id
+	}
+	return ks.Bearer{Token: c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")}
+}
+
+func (c *common) jwt(ctx context.Context, cl *kc.Clients, email string, groups []string) (oidc.Bearer, error) {
+	k, err := oidc.Load(ctx, cl.CS, oidc.Namespace, oidc.SecretName)
+	if err != nil {
+		return oidc.Bearer{Email: email}, err
+	}
+	tok, err := k.Mint(oidc.Issuer, oidc.Audience, oidc.Claims{Email: email, Groups: groups, TTL: 24 * time.Hour}, time.Now())
+	return oidc.Bearer{Email: email, Groups: groups, Token: tok}, err
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (c *common) ingestClient(maxConns int) *ks.Client {
+	base := c.ingest
+	if base == "" {
+		base = c.base
+	}
+	return &ks.Client{Base: strings.TrimRight(base, "/"), HTTP: ks.NewHTTP(0, maxConns)}
 }
 
 func (c *common) token(ctx context.Context, cl *kc.Clients, flagVal, env, secret string) string {
@@ -199,8 +266,7 @@ func cmdVerify(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	tok := c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")
-	res, err := verify.Assoc(ctx, cl.CS, verify.AssocOptions{Client: c.client(16), ID: ks.Bearer{Token: tok}, OutDir: c.outDir, MapNS: *mapNS, Timeout: c.timeout})
+	res, err := verify.Assoc(ctx, cl.CS, verify.AssocOptions{Client: c.client(16), ID: c.apiID(ctx, cl), OutDir: c.outDir, MapNS: *mapNS, Timeout: c.timeout})
 	if err != nil {
 		return err
 	}
@@ -220,15 +286,16 @@ func cmdConn(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("connectivity", flag.ExitOnError)
 	var c common
 	c.register(fs, 20, 40)
-	svc := fs.String("kubesentry-svc", "kubesentry.kubesentry.svc.cluster.local:8080", "kubesentry Service host:port probed from every node")
+	svc := fs.String("kubesentry-svc", "kubesentry.kubesentry.svc.cluster.local:8080", "kubesentry web Service host:port probed from every node (the chart with oauth2-proxy: :4180)")
+	ops := fs.String("ops", "", "kubesentry ops base URL (/readyz, /metrics), e.g. http://kubesentry-ops.kubesentry.svc:9090")
 	prom := fs.String("prometheus", "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090", "Prometheus URL")
 	_ = fs.Parse(args)
 	cl, err := c.kube.Connect()
 	if err != nil {
 		return err
 	}
-	tok := c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")
-	res, err := conn.Run(ctx, cl.CS, conn.Options{Client: c.client(16), APIID: ks.Bearer{Token: tok}, KubesentrySvc: *svc, PrometheusURL: *prom, Timeout: 10 * time.Second})
+	res, err := conn.Run(ctx, cl.CS, conn.Options{Client: c.client(16), APIID: c.apiID(ctx, cl), KubesentrySvc: *svc, PrometheusURL: *prom, Timeout: 10 * time.Second,
+		IngestURL: c.ingest, OpsURL: *ops})
 	if err != nil {
 		return err
 	}
@@ -252,6 +319,9 @@ func cmdUsers(ctx context.Context, args []string) error {
 	abortAfter := fs.Duration("abort-after", 2*time.Minute, "... continuously for this long")
 	name := fs.String("name", "users", "result file name (users.json)")
 	maxPods := fs.Int("target-pods", 3000, "pods sampled for pod pages")
+	ui := fs.String("ui", "baseline", "request mix: baseline (the original UI) or after (paged lists, summaries, /info every 30s)")
+	nPersonas := fs.Int("personas", 100, "with --auth=jwt: personas in the 5/15/80 mix (plus a 300-group user and one with no grants); user i is persona i mod n")
+	level := fs.String("level", "L3", "with --auth=jwt: level whose team namespaces the personas use")
 	_ = fs.Parse(args)
 	st, err := users.ParseStages(*stages)
 	if err != nil {
@@ -261,18 +331,50 @@ func cmdUsers(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	tok := c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")
 	targets, err := podTargets(ctx, cl, *maxPods)
 	if err != nil {
 		return err
 	}
-	res := users.Run(ctx, users.Options{
+	opts := users.Options{
 		Client: c.client(20000),
-		// One shared token today; Phase 2 swaps in per-user identities here.
-		Identities: func(int) ks.Identity { return ks.Bearer{Token: tok} },
-		Stages:     st, RampUp: *rampUp, ThinkMin: *thinkMin, ThinkMax: *thinkMax, PageTimeout: *pageTimeout, ReqTimeout: c.timeout,
+		Stages: st, RampUp: *rampUp, ThinkMin: *thinkMin, ThinkMax: *thinkMax, PageTimeout: *pageTimeout, ReqTimeout: c.timeout,
 		Targets: targets, Pages: users.Pages, AbortP99: *abortP99, AbortErrRate: *abortErr, AbortAfter: *abortAfter, Seed: plan.Seed,
-	})
+	}
+	if *ui == "after" {
+		opts.Pages, opts.InfoEvery = users.PagesAfter, 30*time.Second
+	}
+	if c.auth == "jwt" {
+		l, err := plan.Get(*level)
+		if err != nil {
+			return err
+		}
+		ps := personas.Build(plan.Build(l).Stats.TeamNamespaces, *nPersonas)
+		ids := make([]ks.Identity, len(ps))
+		scopes := make([]map[string]bool, len(ps))
+		for i, p := range ps {
+			id, err := c.jwt(ctx, cl, p.Email, p.Groups)
+			if err != nil {
+				return err
+			}
+			ids[i] = id
+			switch p.Kind {
+			case personas.Admin, personas.Viewer:
+			default:
+				scopes[i] = map[string]bool{}
+				for _, ns := range p.Namespaces {
+					scopes[i][ns] = true
+				}
+			}
+		}
+		opts.Identities = func(i int) ks.Identity { return ids[i%len(ids)] }
+		opts.Scope = func(i int) map[string]bool { return scopes[i%len(scopes)] }
+		out.Logf("users: %d personas (JWT through oauth2-proxy)", len(ps))
+	} else {
+		// One shared token, as the baseline has.
+		tok := c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")
+		opts.Identities = func(int) ks.Identity { return ks.Bearer{Token: tok} }
+	}
+	res := users.Run(ctx, opts)
 	return out.WriteJSON(c.outDir, *name+".json", res)
 }
 
@@ -340,8 +442,8 @@ func cmdAudit(ctx context.Context, args []string) error {
 	}
 	p := plan.Build(l)
 	res := firehose.Run(ctx, firehose.Options{
-		Client: c.client(64), AuditID: ks.Bearer{Label: "audit", Token: c.token(ctx, cl, c.auditToken, "KUBESENTRY_AUDIT_TOKEN", "kubesentry-audit")},
-		APIID: ks.Bearer{Token: c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")},
+		Client: c.client(64), Ingest: c.ingestClient(64), AuditID: ks.Bearer{Label: "audit", Token: c.token(ctx, cl, c.auditToken, "KUBESENTRY_AUDIT_TOKEN", "kubesentry-audit")},
+		APIID: c.apiID(ctx, cl),
 		Total: *events, Rate: *rate, BatchSize: *batch, Workers: *workers, Namespaces: p.Stats.TeamNamespaces,
 		QueryReps: *reps, QueryConc: *conc, Seed: plan.Seed, Timeout: c.timeout, MaxRun: *maxRun,
 	})
@@ -361,14 +463,16 @@ func cmdAgents(ctx context.Context, args []string) error {
 	maxKB := fs.Int("max-kb", 150, "maximum report size")
 	check := fs.Int("check-pods", 100, "fake pods whose processes are fetched afterwards")
 	name := fs.String("name", "agents", "result file name")
+	fanout := fs.String("fanout", "", "headless ingest Service to post every report to each replica, as the chart's agents do (e.g. kubesentry-ingest-headless.kubesentry.svc)")
+	gz := fs.Bool("gzip", false, "gzip report bodies (the new agent's default)")
 	_ = fs.Parse(args)
 	cl, err := c.kube.Connect()
 	if err != nil {
 		return err
 	}
 	res, err := agents.Run(ctx, cl.CS, agents.Options{
-		Client: c.client(2000), ID: ks.Bearer{Label: "agent", Token: c.token(ctx, cl, c.agentToken, "KUBESENTRY_AGENT_TOKEN", "kubesentry-agent")},
-		APIID:  ks.Bearer{Token: c.token(ctx, cl, c.apiToken, "KUBESENTRY_API_TOKEN", "kubesentry-api")},
+		Client: c.client(2000), Ingest: c.ingestClient(2000), ID: ks.Bearer{Label: "agent", Token: c.token(ctx, cl, c.agentToken, "KUBESENTRY_AGENT_TOKEN", "kubesentry-agent")},
+		APIID: c.apiID(ctx, cl), Fanout: *fanout, Gzip: *gz,
 		Agents: *n, Interval: *interval, Jitter: *jitter, Surge: *surge, Duration: *dur,
 		MinBytes: *minKB << 10, MaxBytes: *maxKB << 10, Timeout: c.timeout, CheckPods: *check, Seed: plan.Seed,
 	})

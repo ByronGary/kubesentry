@@ -1,0 +1,9 @@
+# Build context is the repository root; send only what the harness compiles.
+*
+!go.mod
+!go.sum
+!internal
+!test/stress/go.mod
+!test/stress/go.sum
+!test/stress/cmd
+!test/stress/internal

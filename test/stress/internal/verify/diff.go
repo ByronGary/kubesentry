@@ -167,6 +167,27 @@ func kindOf(id string) string {
 // Deployment collapses to the Deployment); Service→Workload edges expand to
 // the workload's pods on the same map.
 func (o *Observed) AddMap(m *ks.MapResponse) {
+	// A Controller node stands for an owner of another kind (a Rollout, a
+	// custom resource); compare it under that kind.
+	real := map[string]string{}
+	for _, n := range m.Graph.Nodes {
+		if n.Kind == "Controller" && n.OwnerKind != "" {
+			real[n.ID] = n.OwnerKind + "/" + n.Namespace + "/" + n.Name
+		}
+	}
+	if len(real) > 0 {
+		edges := make([]ks.GraphEdge, len(m.Graph.Edges))
+		for i, e := range m.Graph.Edges {
+			if r, ok := real[e.From]; ok {
+				e.From = r
+			}
+			if r, ok := real[e.To]; ok {
+				e.To = r
+			}
+			edges[i] = e
+		}
+		m.Graph.Edges = edges
+	}
 	owner := map[string]string{} // ReplicaSet → Deployment
 	for _, e := range m.Graph.Edges {
 		if kindOf(e.From) == "Deployment" && kindOf(e.To) == "ReplicaSet" {

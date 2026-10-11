@@ -118,18 +118,33 @@ func Assoc(ctx context.Context, cs kubernetes.Interface, o AssocOptions) (*Assoc
 		}
 		obs.AddMap(&m)
 	}
-	var wl ks.WorkloadsResponse
-	if call("/api/v1/workloads", &wl) == nil {
-		obs.AddWorkloads(&wl)
+	// List routes page (limit/continue) on the new build; the baseline
+	// ignores the parameters and answers everything at once.
+	paged := func(path string, run func() (int, time.Duration, int64, error)) {
+		t := time.Now()
+		pages, _, bytes, err := run()
+		ct := CallTiming{Path: fmt.Sprintf("%s (%d pages)", path, pages), Ms: out.Ms(time.Since(t)), Bytes: bytes, Status: 200, Started: t.UTC().Format(time.RFC3339)}
+		if err != nil {
+			ct.Error, ct.Status = err.Error(), 0
+			res.Errors = append(res.Errors, err.Error())
+		}
+		res.Calls = append(res.Calls, ct)
+		out.Logf("verify: GET %s: %d pages, %d bytes, %s", path, pages, bytes, time.Since(t).Round(time.Millisecond))
 	}
+	paged("/api/v1/workloads", func() (int, time.Duration, int64, error) {
+		cctx, cancel := context.WithTimeout(ctx, o.Timeout)
+		defer cancel()
+		return ks.GetAll(cctx, o.Client, o.ID, "/api/v1/workloads", 1000, func(w *ks.WorkloadsResponse) { obs.AddWorkloads(w) })
+	})
 	var nodes ks.NodesResponse
 	if call("/api/v1/nodes", &nodes) == nil {
 		obs.AddNodes(&nodes)
 	}
-	var sec ks.SecurityResponse
-	if call("/api/v1/security", &sec) == nil {
-		obs.AddSecurity(&sec)
-	}
+	paged("/api/v1/security", func() (int, time.Duration, int64, error) {
+		cctx, cancel := context.WithTimeout(ctx, o.Timeout)
+		defer cancel()
+		return ks.GetAll(cctx, o.Client, o.ID, "/api/v1/security", 1000, func(s *ks.SecurityResponse) { obs.AddSecurity(s) })
+	})
 
 	out.Logf("verify: computing ground truth from the API server (after)")
 	t, err := truth.Compute(ctx, cs)
@@ -277,8 +292,13 @@ func checkCases(t *truth.Truth, obs *Observed) []CaseCheck {
 			case truth.ServicePods:
 				cc.Want = fmt.Sprintf("%d pods", e.Count)
 				tv, ov := edgesFrom(t.Relations[truth.ServicePods], e.From), edgesFrom(obs.Rel("map", truth.ServicePods), e.From)
-				cc.Truth, cc.TruthOK = fmt.Sprint(tv), tv == e.Count
-				cc.Kubesentry, cc.OK = fmt.Sprint(ov), ov == e.Count
+				want := e.Count
+				if want < 0 { // whatever the EndpointSlice lists
+					want = tv
+					cc.Want = fmt.Sprintf("as the EndpointSlice: %d pods", tv)
+				}
+				cc.Truth, cc.TruthOK = fmt.Sprint(tv), tv == want
+				cc.Kubesentry, cc.OK = fmt.Sprint(ov), ov == want
 				if eps := t.Endpoints[e.From]; len(eps) > 0 {
 					var ready, notReady, term int
 					for _, ep := range eps {

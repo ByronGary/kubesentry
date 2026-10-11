@@ -1,0 +1,57 @@
+# Test OpenID Connect issuer (stress oidc): discovery and JWKS only, for
+# oauth2-proxy to verify the bearer JWTs the harness mints per virtual user.
+# HTTPS with a self-signed certificate (the chart only accepts https issuers);
+# oauth2-proxy runs with --ssl-insecure-skip-verify in the stress overlay.
+# The signing key Secret (oidc-signing-key) is created by hack/stress-up.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stress-oidc
+  labels: {kubesentry.io/stress: "true"}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oidc
+  namespace: stress-oidc
+  labels: {app: oidc, kubesentry.io/stress: "true"}
+spec:
+  selector: {app: oidc}
+  ports:
+    - {name: https, port: 443, targetPort: https}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oidc
+  namespace: stress-oidc
+  labels: {app: oidc, kubesentry.io/stress: "true"}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: oidc}
+  template:
+    metadata:
+      labels: {app: oidc, kubesentry.io/stress: "true"}
+    spec:
+      nodeSelector: {kubesentry.io/role: loadgen}
+      tolerations:
+        - {key: kubesentry.io/loadgen, operator: Exists, effect: NoSchedule}
+      automountServiceAccountToken: false
+      containers:
+        - name: oidc
+          image: kubesentry-stress:dev
+          imagePullPolicy: Never
+          args: ["oidc", "--listen=:8443", "--key-file=/etc/oidc/key.pem"]
+          ports:
+            - {name: https, containerPort: 8443}
+          readinessProbe:
+            httpGet: {path: /healthz, port: https, scheme: HTTPS}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {memory: 64Mi}
+          volumeMounts:
+            - {name: key, mountPath: /etc/oidc, readOnly: true}
+      volumes:
+        - name: key
+          secret: {secretName: oidc-signing-key}

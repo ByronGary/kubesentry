@@ -1,0 +1,88 @@
+# Stress overlay for the "after" run, on top of deploy/kind/values-kind.yaml:
+#   helm upgrade --install kubesentry charts/kubesentry -n kubesentry \
+#     -f deploy/kind/values-kind.yaml -f test/stress/deploy/values-after.yaml
+# The enterprise configuration under test: two replicas, 1Gi, Postgres audit
+# store, SSO through the oauth2-proxy sidecar (bearer JWTs from the harness's
+# test issuer), agents fanning out to both replicas, Prometheus by discovery,
+# and the CloudWatch reader against cwfake.
+replicas: 2
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# Both replicas run on the control-plane node (the audit log lives there).
+topologySpread:
+  enabled: false
+pdb:
+  enabled: true
+  minAvailable: 1
+
+auth:
+  mode: proxy
+
+oauth2Proxy:
+  enabled: true
+  provider: oidc
+  issuerURL: https://oidc.stress-oidc.svc.cluster.local
+  clientID: kubesentry
+  existingSecret: kubesentry-oauth2-proxy
+  redirectURL: http://localhost:4180/oauth2/callback
+  cookie:
+    secure: false
+  extraArgs:
+    # Virtual users send ID tokens as bearer tokens: verified against the
+    # issuer's JWKS, then passed on as X-Forwarded-Email / X-Forwarded-Groups.
+    - --skip-jwt-bearer-tokens=true
+    - --extra-jwt-issuers=https://oidc.stress-oidc.svc.cluster.local=kubesentry
+    # The test issuer's certificate is self-signed.
+    - --ssl-insecure-skip-verify=true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      memory: 256Mi
+
+prometheus:
+  autodiscover: true
+
+audit:
+  store: postgres
+  postgres:
+    existingSecret: kubesentry-pg
+    dsnKey: dsn
+    sslmode: disable
+  sources:
+    webhook:
+      enabled: true
+    file:
+      path: /var/log/kubernetes/audit/audit.log
+      # Two replicas tail the same file; start at the end instead of replaying it twice.
+      fromStart: false
+      hostPathDir: /var/log/kubernetes/audit
+    cloudwatch:
+      enabled: true
+      logGroup: /aws/eks/kind-kubesentry/cluster
+      endpoint: http://cwfake.stress-cw.svc.cluster.local:8080
+      start: 6h
+
+eks:
+  clusterName: kind-kubesentry
+  region: us-east-1
+
+# The AWS SDK signs requests even to an endpoint override: give it dummy keys.
+extraEnv:
+  - {name: AWS_ACCESS_KEY_ID, value: stressfake}
+  - {name: AWS_SECRET_ACCESS_KEY, value: stressfake}
+
+agent:
+  fanout: true

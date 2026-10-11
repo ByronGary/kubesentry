@@ -28,6 +28,13 @@ kubelet:
       - action: replace
         sourceLabels: [__metrics_path__]
         targetLabel: metrics_path
+kubeProxy:
+  serviceMonitor:
+    # kube-proxy runs (as a fake pod) on every KWOK node; there is nothing to scrape there.
+    relabelings:
+      - action: drop
+        sourceLabels: [__address__]
+        regex: '172\.19\.10[0-3]\..*'
 prometheus-node-exporter:
   affinity:
     nodeAffinity:

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -101,6 +102,7 @@ func NewHTTP(timeout time.Duration, maxConns int) *http.Client {
 
 // Response is a raw response with timing.
 type Response struct {
+	Header  http.Header
 	Status  int
 	Bytes   int64
 	Elapsed time.Duration
@@ -111,16 +113,29 @@ type Response struct {
 // Do performs one request and reads the whole body (counting bytes); it keeps
 // the body only when keepBody is set.
 func (c *Client) Do(ctx context.Context, id Identity, method, path string, body []byte, contentType string, keepBody bool) Response {
+	h := map[string]string{}
+	if contentType != "" {
+		h["Content-Type"] = contentType
+	}
+	return c.DoH(ctx, id, method, path, body, h, keepBody)
+}
+
+// DoH is Do with extra headers; path may also be an absolute URL.
+func (c *Client) DoH(ctx context.Context, id Identity, method, path string, body []byte, headers map[string]string, keepBody bool) Response {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, rd)
+	u := c.Base + path
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		u = path
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
 		return Response{Err: err}
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	req.Header.Set("Accept", "application/json")
 	if id != nil {
@@ -132,7 +147,7 @@ func (c *Client) Do(ctx context.Context, id Identity, method, path string, body 
 		return Response{Err: err, Elapsed: time.Since(start)}
 	}
 	defer resp.Body.Close()
-	r := Response{Status: resp.StatusCode}
+	r := Response{Status: resp.StatusCode, Header: resp.Header}
 	if keepBody {
 		var buf bytes.Buffer
 		r.Bytes, err = io.Copy(&buf, resp.Body)
@@ -145,9 +160,26 @@ func (c *Client) Do(ctx context.Context, id Identity, method, path string, body 
 	return r
 }
 
-// GetJSON fetches path and decodes it into v.
+// GetJSON fetches path and decodes it into v. A 429 (the per-identity rate
+// limit) is retried after its Retry-After, up to ten times: the verifiers
+// measure correctness, not throughput.
 func (c *Client) GetJSON(ctx context.Context, id Identity, path string, v any) (Response, error) {
 	r := c.Do(ctx, id, http.MethodGet, path, nil, "", true)
+	for attempt := 0; attempt < 10 && r.Err == nil && r.Status == http.StatusTooManyRequests; attempt++ {
+		wait := time.Second
+		if s := r.Header.Get("Retry-After"); s != "" {
+			var n int
+			if _, err := fmt.Sscan(s, &n); err == nil && n > 0 {
+				wait = time.Duration(n) * time.Second
+			}
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return r, ctx.Err()
+		}
+		r = c.Do(ctx, id, http.MethodGet, path, nil, "", true)
+	}
 	if r.Err != nil {
 		return r, r.Err
 	}
@@ -183,17 +215,27 @@ type GraphNode struct {
 	Namespace string `json:"namespace,omitempty"`
 	Status    string `json:"status"`
 	Detail    string `json:"detail"`
+	OwnerKind string `json:"ownerKind,omitempty"` // the real kind behind a Controller node
 }
 
 type GraphEdge struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+	How         string `json:"how,omitempty"`
+	Ready       int    `json:"ready,omitempty"`
+	NotReady    int    `json:"notReady,omitempty"`
+	Terminating int    `json:"terminating,omitempty"`
 }
 
 type MapResponse struct {
-	Namespace  string   `json:"namespace"`
-	Namespaces []string `json:"namespaces"`
-	Graph      struct {
+	Namespace      string   `json:"namespace"`
+	Namespaces     []string `json:"namespaces"`
+	NamespaceStats []struct {
+		Name   string `json:"name"`
+		Pods   int    `json:"pods"`
+		System bool   `json:"system"`
+	} `json:"namespaceStats,omitempty"`
+	Graph struct {
 		Nodes []GraphNode `json:"nodes"`
 		Edges []GraphEdge `json:"edges"`
 	} `json:"graph"`
@@ -208,8 +250,9 @@ type WorkloadSummary struct {
 }
 
 type WorkloadsResponse struct {
-	Count int               `json:"count"`
-	Items []WorkloadSummary `json:"items"`
+	Count    int               `json:"count"`
+	Items    []WorkloadSummary `json:"items"`
+	Continue string            `json:"continue,omitempty"`
 }
 
 type NodePod struct {
@@ -218,11 +261,16 @@ type NodePod struct {
 	Phase     string `json:"phase"`
 	Status    string `json:"status"`
 	Workload  string `json:"workload,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 type NodeSummary struct {
-	Name string    `json:"name"`
-	Pods []NodePod `json:"pods"`
+	Name                 string    `json:"name"`
+	Status               string    `json:"status"`
+	Pods                 []NodePod `json:"pods"`
+	PodCount             *int      `json:"podCount,omitempty"`
+	CPURequestedMilli    int64     `json:"cpuRequestedMilli"`
+	MemoryRequestedBytes int64     `json:"memoryRequestedBytes"`
 }
 
 type NodesResponse struct {
@@ -242,9 +290,13 @@ type SecurityFinding struct {
 }
 
 type SecurityResponse struct {
-	Counts   map[string]int    `json:"counts"`
-	Findings []SecurityFinding `json:"findings"`
-	Warnings []string          `json:"warnings,omitempty"`
+	Counts     map[string]int    `json:"counts"`
+	Findings   []SecurityFinding `json:"findings"`
+	Namespaces []struct {
+		Name string `json:"name"`
+	} `json:"namespaces"`
+	Warnings []string `json:"warnings,omitempty"`
+	Continue string   `json:"continue,omitempty"`
 }
 
 type ProcessesResponse struct {
@@ -278,5 +330,75 @@ type PodsResponse struct {
 		Namespace string `json:"namespace"`
 		Name      string `json:"name"`
 		Phase     string `json:"phase"`
+		Workload  string `json:"workload,omitempty"`
+		Node      string `json:"node,omitempty"`
+		Ready     *bool  `json:"ready,omitempty"`
+		Reason    string `json:"reason,omitempty"`
 	} `json:"items"`
+	Continue string `json:"continue,omitempty"`
+}
+
+// Info is the full /api/v1/info, as far as the harness reads it.
+type InfoFull struct {
+	Info
+	Identity *struct {
+		User   string   `json:"user"`
+		Groups []string `json:"groups"`
+		Source string   `json:"source"`
+	} `json:"identity,omitempty"`
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+	Snapshot     *struct {
+		Version    int64   `json:"version"`
+		AgeSeconds float64 `json:"ageSeconds"`
+		Stale      bool    `json:"stale"`
+	} `json:"snapshot,omitempty"`
+	AuditStore *struct {
+		Backend string `json:"backend"`
+		Events  int64  `json:"events"`
+	} `json:"auditStore,omitempty"`
+	Prometheus *struct {
+		Source string `json:"source"`
+		URL    string `json:"url"`
+	} `json:"prometheus,omitempty"`
+	Namespaces  *int              `json:"namespaces,omitempty"`
+	Unavailable map[string]string `json:"unavailable,omitempty"`
+}
+
+// Paged is any response with a continue token.
+type Paged interface{ Next() string }
+
+func (r *PodsResponse) Next() string      { return r.Continue }
+func (r *WorkloadsResponse) Next() string { return r.Continue }
+func (r *SecurityResponse) Next() string  { return r.Continue }
+
+// GetAll follows continue tokens with limit, calling each for every page.
+// It returns the number of pages and the total response time and bytes.
+func GetAll[T any, PT interface {
+	*T
+	Paged
+}](ctx context.Context, c *Client, id Identity, path string, limit int, each func(PT)) (pages int, elapsed time.Duration, bytes int64, err error) {
+	cont := ""
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	for {
+		p := fmt.Sprintf("%s%slimit=%d", path, sep, limit)
+		if cont != "" {
+			p += "&continue=" + url.QueryEscape(cont)
+		}
+		var v T
+		r, e := c.GetJSON(ctx, id, p, PT(&v))
+		elapsed += r.Elapsed
+		bytes += r.Bytes
+		if e != nil {
+			return pages, elapsed, bytes, e
+		}
+		pages++
+		each(PT(&v))
+		cont = PT(&v).Next()
+		if cont == "" || pages > 10000 {
+			return pages, elapsed, bytes, nil
+		}
+	}
 }

@@ -1,0 +1,56 @@
+# Fake CloudWatch Logs (internal/cloudwatch/cwfake) serving EKS kube-apiserver
+# audit events to kubesentry's CloudWatch reader (-cloudwatch-endpoint).
+# hack/stress-up.sh sets START (a fixed time, so restarts serve the same events).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: stress-cw
+  labels: {kubesentry.io/stress: "true"}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cwfake
+  namespace: stress-cw
+  labels: {app: cwfake, kubesentry.io/stress: "true"}
+spec:
+  selector: {app: cwfake}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cwfake
+  namespace: stress-cw
+  labels: {app: cwfake, kubesentry.io/stress: "true"}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cwfake}
+  template:
+    metadata:
+      labels: {app: cwfake, kubesentry.io/stress: "true"}
+    spec:
+      nodeSelector: {kubesentry.io/role: loadgen}
+      tolerations:
+        - {key: kubesentry.io/loadgen, operator: Exists, effect: NoSchedule}
+      automountServiceAccountToken: false
+      containers:
+        - name: cwfake
+          image: kubesentry-stress:dev
+          imagePullPolicy: Never
+          args: ["cwfake", "--listen=:8080", "--log-group=/aws/eks/kind-kubesentry/cluster", "--events=$(EVENTS)", "--rate=$(RATE)", "--start=$(START)", "--duplicates=0.005", "--late=0.01", "--seed=$(SEED)"]
+          env:
+            - {name: EVENTS, value: "1000000"}
+            - {name: RATE, value: "500"}
+            - {name: START, value: "2026-10-11T00:00:00Z"}
+            # EVENTS=0 plays an endless live tail from START.
+            - {name: SEED, value: "2026"}
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {memory: 256Mi}

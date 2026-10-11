@@ -41,6 +41,10 @@ type Options struct {
 	KubesentrySvc string // host:port of the kubesentry Service, by DNS name
 	PrometheusURL string
 	Timeout       time.Duration
+	// IngestURL (e.g. http://kubesentry-ingest.kubesentry.svc:8081) is probed
+	// from every node too; OpsURL gives /readyz and /metrics. Both optional.
+	IngestURL string
+	OpsURL    string
 }
 
 // Cell is one source → target probe.
@@ -64,6 +68,27 @@ type Result struct {
 	ByCheck    map[string][2]int `json:"byCheck"` // check → [passed, total]
 	Prometheus PromCheck         `json:"prometheus"`
 	Agents     []AgentCheck      `json:"agents"`
+	Web        *WebCheck         `json:"web,omitempty"`
+}
+
+// WebCheck is the authenticated path through the web Service (oauth2-proxy →
+// Unix socket → kubesentry on the chart) and the ops listener.
+type WebCheck struct {
+	InfoStatus       int             `json:"infoStatus"`
+	IdentitySource   string          `json:"identitySource"`
+	IdentityUser     string          `json:"identityUser"`
+	Groups           []string        `json:"groups"`
+	Capabilities     map[string]bool `json:"capabilities"`
+	AnonymousStatus  int             `json:"anonymousStatus"`  // no credentials: want 401
+	SpoofedStatus    int             `json:"spoofedStatus"`    // forged X-Forwarded-Email without a token: want 401
+	ReadyzStatus     int             `json:"readyzStatus"`     // ops /readyz
+	Readyz           string          `json:"readyz,omitempty"` // body
+	MetricsSeries    int             `json:"kubesentryMetricLines"`
+	SnapshotAge      float64         `json:"snapshotAgeSeconds"`
+	AuditBackend     string          `json:"auditBackend"`
+	PrometheusSource string          `json:"prometheusSource"`
+	OK               bool            `json:"ok"`
+	Problems         []string        `json:"problems,omitempty"`
 }
 
 // PromCheck is kubesentry → Prometheus, and Prometheus' own targets.
@@ -251,6 +276,20 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 	ksHost, ksPortS, _ := strings.Cut(o.KubesentrySvc, ":")
 	ksPort := 8080
 	fmt.Sscan(ksPortS, &ksPort)
+	// The chart puts oauth2-proxy on the web port (4180): probe its /ping.
+	ksPath := "healthz"
+	if ksPort == 4180 {
+		ksPath = "ping"
+	}
+	var inHost string
+	inPort := 8081
+	if o.IngestURL != "" {
+		hp := strings.TrimPrefix(strings.TrimPrefix(o.IngestURL, "http://"), "https://")
+		hp, _, _ = strings.Cut(hp, "/")
+		var ps string
+		inHost, ps, _ = strings.Cut(hp, ":")
+		fmt.Sscan(ps, &inPort)
+	}
 	for _, s := range srcs {
 		for _, node := range res.Nodes {
 			t := podByNode[node]
@@ -260,7 +299,12 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 		wg.Add(3)
 		go probe(s, "pod→ClusterIP", "mesh ClusterIP", svc.Spec.ClusterIP, 8080, "hostname", func(r string) bool { return strings.HasPrefix(r, "mesh-") })
 		go probe(s, "DNS→Service", "mesh.stress-conn.svc.cluster.local", "mesh."+NS+".svc.cluster.local", 8080, "hostname", func(r string) bool { return strings.HasPrefix(r, "mesh-") })
-		go probe(s, "→kubesentry", o.KubesentrySvc, ksHost, ksPort, "healthz", func(r string) bool { return strings.Contains(r, "ok") })
+		go probe(s, "→kubesentry", o.KubesentrySvc, ksHost, ksPort, ksPath, func(r string) bool { return strings.Contains(strings.ToLower(r), "ok") })
+		if inHost != "" {
+			// Any HTTP answer proves the ingest Service reaches a replica (GET is not allowed there).
+			wg.Add(1)
+			go probe(s, "→ingest", inHost+":"+fmt.Sprint(inPort), inHost, inPort, "agent/report", func(r string) bool { return r != "" })
+		}
 	}
 	wg.Wait()
 	sort.Slice(res.Cells, func(i, j int) bool {
@@ -269,6 +313,7 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 	})
 
 	res.Prometheus = promCheck(ctx, o, hc)
+	res.Web = webCheck(ctx, o, hc)
 	res.Agents = agentCheck(ctx, o, podByNode, res.Nodes)
 	out.Logf("connectivity: %d passed, %d failed; prometheus metrics=%v oom=%v; agents fresh %d/%d", res.Passed, res.Failed,
 		res.Prometheus.InfoMetrics, res.Prometheus.OOMOK, countOK(res.Agents), len(res.Agents))
@@ -352,6 +397,68 @@ func promCheck(ctx context.Context, o Options, hc *http.Client) PromCheck {
 	return pc
 }
 
+func webCheck(ctx context.Context, o Options, hc *http.Client) *WebCheck {
+	w := &WebCheck{}
+	var info ks.InfoFull
+	r, err := o.Client.GetJSON(ctx, o.APIID, "/api/v1/info", &info)
+	w.InfoStatus = r.Status
+	if err != nil {
+		w.Problems = append(w.Problems, "info: "+err.Error())
+	} else {
+		if info.Identity != nil {
+			w.IdentitySource, w.IdentityUser, w.Groups = info.Identity.Source, info.Identity.User, info.Identity.Groups
+		}
+		w.Capabilities = info.Capabilities
+		if info.Snapshot != nil {
+			w.SnapshotAge = info.Snapshot.AgeSeconds
+		}
+		if info.AuditStore != nil {
+			w.AuditBackend = info.AuditStore.Backend
+		}
+		if info.Prometheus != nil {
+			w.PrometheusSource = info.Prometheus.Source
+		}
+	}
+	w.AnonymousStatus = o.Client.Do(ctx, nil, http.MethodGet, "/api/v1/info", nil, "", false).Status
+	w.SpoofedStatus = o.Client.DoH(ctx, nil, http.MethodGet, "/api/v1/info", nil,
+		map[string]string{"X-Forwarded-Email": "admin0@corp.example", "X-Forwarded-Groups": "stress:admins,system:masters", "X-Forwarded-User": "admin0"}, false).Status
+	if o.OpsURL != "" {
+		if resp, err := hc.Get(o.OpsURL + "/readyz"); err == nil {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			w.ReadyzStatus, w.Readyz = resp.StatusCode, strings.TrimSpace(string(b))
+		} else {
+			w.Problems = append(w.Problems, "readyz: "+err.Error())
+		}
+		if resp, err := hc.Get(o.OpsURL + "/metrics"); err == nil {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+			resp.Body.Close()
+			for _, l := range strings.Split(string(b), "\n") {
+				if strings.HasPrefix(l, "kubesentry_") {
+					w.MetricsSeries++
+				}
+			}
+		}
+	}
+	switch {
+	case w.InfoStatus != 200:
+		w.Problems = append(w.Problems, fmt.Sprintf("info HTTP %d", w.InfoStatus))
+	case o.OpsURL != "" && w.IdentitySource != "proxy":
+		w.Problems = append(w.Problems, "identity source "+w.IdentitySource+", want proxy")
+	}
+	if w.AnonymousStatus != 401 {
+		w.Problems = append(w.Problems, fmt.Sprintf("no credentials answered %d", w.AnonymousStatus))
+	}
+	if w.SpoofedStatus != 401 {
+		w.Problems = append(w.Problems, fmt.Sprintf("forged identity headers answered %d", w.SpoofedStatus))
+	}
+	if o.OpsURL != "" && w.ReadyzStatus != 200 {
+		w.Problems = append(w.Problems, fmt.Sprintf("readyz %d", w.ReadyzStatus))
+	}
+	w.OK = len(w.Problems) == 0
+	return w
+}
+
 // agentCheck asks kubesentry for the processes of the mesh pod on each real
 // node; the real agent on that node must have reported them recently.
 func agentCheck(ctx context.Context, o Options, podByNode map[string]corev1.Pod, nodes []string) []AgentCheck {
@@ -398,11 +505,11 @@ func (r *Result) Markdown() string {
 	for _, n := range r.Nodes {
 		fmt.Fprintf(&b, " %s |", strings.TrimPrefix(n, "kubesentry-"))
 	}
-	fmt.Fprintf(&b, " ClusterIP | DNS | kubesentry |\n|---|")
+	fmt.Fprintf(&b, " ClusterIP | DNS | kubesentry | ingest |\n|---|")
 	for range r.Nodes {
 		b.WriteString("---|")
 	}
-	b.WriteString("---|---|---|\n")
+	b.WriteString("---|---|---|---|\n")
 	type key struct{ from, net string }
 	rows := map[key]map[string]Cell{}
 	var keys []key
@@ -420,6 +527,8 @@ func (r *Result) Markdown() string {
 			col = "DNS"
 		case "→kubesentry":
 			col = "kubesentry"
+		case "→ingest":
+			col = "ingest"
 		}
 		rows[k][col] = c
 	}
@@ -435,7 +544,7 @@ func (r *Result) Markdown() string {
 	}
 	for _, k := range keys {
 		fmt.Fprintf(&b, "| %s (%s) |", strings.TrimPrefix(k.from, "kubesentry-"), k.net)
-		for _, n := range append(append([]string{}, r.Nodes...), "ClusterIP", "DNS", "kubesentry") {
+		for _, n := range append(append([]string{}, r.Nodes...), "ClusterIP", "DNS", "kubesentry", "ingest") {
 			c, ok := rows[k][n]
 			fmt.Fprintf(&b, " %s |", cell(c, ok))
 		}
@@ -455,6 +564,10 @@ func (r *Result) Markdown() string {
 		p.InfoMetrics, p.OOMOK, p.OOMWarnings, p.OOMMs, p.OOMBytes, p.OOMError, p.TargetsUp, p.TargetsDown, p.SimulatedSeries)
 	for _, d := range p.DownSample {
 		fmt.Fprintf(&b, "  - down: %s\n", d)
+	}
+	if w := r.Web; w != nil {
+		fmt.Fprintf(&b, "\n## Web path and ops listener\n\n- /api/v1/info as the harness identity: HTTP %d, identity %s (%s, groups %v), capabilities %v\n- no credentials: HTTP %d (want 401); forged X-Forwarded-Email without a token: HTTP %d (want 401)\n- ops /readyz: HTTP %d %s\n- kubesentry_* metric lines: %d; snapshot age %.1fs; audit store %s; Prometheus %s\n- verdict: %v %v\n",
+			w.InfoStatus, w.IdentityUser, w.IdentitySource, w.Groups, w.Capabilities, w.AnonymousStatus, w.SpoofedStatus, w.ReadyzStatus, w.Readyz, w.MetricsSeries, w.SnapshotAge, w.AuditBackend, w.PrometheusSource, w.OK, w.Problems)
 	}
 	fmt.Fprintf(&b, "\n## Agent freshness (real nodes)\n\n| Node | Pod | available | stale | reported by | processes | ok |\n|---|---|---|---|---|---:|---|\n")
 	for _, a := range r.Agents {

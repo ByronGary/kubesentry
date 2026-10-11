@@ -296,9 +296,18 @@ func (g *Gen) fresh(now time.Time) Event {
 
 // Batch returns n events as an EventList body.
 func (g *Gen) Batch(n int, now time.Time) ([]byte, error) {
+	b, _, err := g.BatchIDs(n, now)
+	return b, err
+}
+
+// BatchIDs is Batch, also returning the auditIDs in it.
+func (g *Gen) BatchIDs(n int, now time.Time) ([]byte, []string, error) {
 	l := EventList{Kind: "EventList", APIVersion: "audit.k8s.io/v1", Metadata: map[string]string{}, Items: make([]Event, n)}
+	ids := make([]string, n)
 	for i := range l.Items {
 		l.Items[i] = g.Next(now)
+		ids[i] = l.Items[i].AuditID
 	}
-	return json.Marshal(l)
+	b, err := json.Marshal(l)
+	return b, ids, err
 }

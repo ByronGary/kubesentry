@@ -137,6 +137,8 @@ var components = map[string]string{
 	"kwok":               `namespace="kube-system",container="kwok-controller"`,
 	"controller-manager": `namespace="kube-system",container="kube-controller-manager"`,
 	"stress-load":        `namespace="stress-load"`,
+	"oauth2-proxy":       `namespace="kubesentry",container="oauth2-proxy"`,
+	"postgres":           `namespace="stress-pg",container="postgres"`,
 }
 
 // Build gathers everything for a run directory.
@@ -360,16 +362,21 @@ func (r *Report) Markdown() string {
 		fmt.Fprintf(&b, "- After settling: %d nodes (%d fake, %d ready), %d pods %v; generator: %d created, %d existed, %d failed; phases %v\n\n",
 			g.Settle.Nodes, g.Settle.FakeNodes, g.Settle.FakeNodesReady, g.Settle.Pods, g.Settle.PodsByPhase, g.Created, g.Existed, g.Failed, g.PhaseSeconds)
 	}
-	fmt.Fprintf(&b, "## Steps and resource use\n\n| Step | Status | Duration | kubesentry mem avg/max MiB | kubesentry CPU avg/max | restarts | last termination | kubesentry API req/s avg (peak min) | apiserver mem max MiB | apiserver CPU max | etcd mem max | Prometheus mem max | host avail min MiB |\n|---|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---:|\n")
+	fmt.Fprintf(&b, "## Steps and resource use\n\n| Step | Status | Duration | kubesentry mem avg/max MiB | kubesentry CPU avg/max | restarts | last termination | kubesentry API req/s avg (peak min) | apiserver mem max MiB | apiserver CPU max | etcd mem max | Prometheus mem max | Postgres mem / CPU max | oauth2-proxy CPU max | host avail min MiB |\n|---|---|---:|---|---|---:|---|---|---:|---:|---:|---:|---|---:|---:|\n")
 	for _, s := range r.Steps {
 		k := s.Usage["kubesentry"]
 		api := "-"
 		if s.KubesentryAPI != nil {
 			api = fmt.Sprintf("%.2f (%.2f)", s.KubesentryAPI.PerSecond, s.KubesentryAPI.PeakPerSec)
 		}
-		fmt.Fprintf(&b, "| %s | %s | %.0fs | %.0f / %.0f | %.2f / %.2f | %d | %s | %s | %.0f | %.2f | %.0f | %.0f | %.0f |\n",
+		pg := "-"
+		if u := s.Usage["postgres"]; u.MemMiB.N > 0 {
+			pg = fmt.Sprintf("%.0f / %.2f", u.MemMiB.Max, u.CPU.Max)
+		}
+		fmt.Fprintf(&b, "| %s | %s | %.0fs | %.0f / %.0f | %.2f / %.2f | %d | %s | %s | %.0f | %.2f | %.0f | %.0f | %s | %.2f | %.0f |\n",
 			s.Name, s.Status, s.Seconds, k.MemMiB.Avg, k.MemMiB.Max, k.CPU.Avg, k.CPU.Max, s.Restarts, s.LastReason, api,
-			s.Usage["kube-apiserver"].MemMiB.Max, s.Usage["kube-apiserver"].CPU.Max, s.Usage["etcd"].MemMiB.Max, s.Usage["prometheus"].MemMiB.Max, s.HostAvailMinMiB)
+			s.Usage["kube-apiserver"].MemMiB.Max, s.Usage["kube-apiserver"].CPU.Max, s.Usage["etcd"].MemMiB.Max, s.Usage["prometheus"].MemMiB.Max,
+			pg, s.Usage["oauth2-proxy"].CPU.Max, s.HostAvailMinMiB)
 	}
 	for _, s := range r.Steps {
 		if s.KubesentryAPI == nil || s.KubesentryAPI.Requests == 0 {

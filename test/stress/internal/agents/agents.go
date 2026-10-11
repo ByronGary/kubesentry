@@ -3,10 +3,13 @@
 package agents
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -47,6 +50,9 @@ type Report struct {
 // Options configure a run.
 type Options struct {
 	Client    *ks.Client
+	Ingest    *ks.Client  // where /agent/report is (default Client)
+	Fanout    string      // headless Service: post each report to every replica, like -server-fanout
+	Gzip      bool        // Content-Encoding: gzip, like the new agent's default
 	ID        ks.Identity // agent token
 	APIID     ks.Identity // API token for the freshness check
 	Agents    int
@@ -87,6 +93,51 @@ type Result struct {
 	CheckedPods  int                `json:"checkedPods"`
 	PostsPerSec  float64            `json:"postsPerSecond"`
 	MBytesPerSec float64            `json:"mbytesPerSecond"`
+	Targets      int                `json:"replicaTargets"` // replicas each report went to
+	Gzip         bool               `json:"gzip"`
+}
+
+// fanout resolves a headless Service to one URL per replica, refreshed
+// every 30 seconds, as the agent's -server-fanout does.
+type fanout struct {
+	host, scheme, port string
+	base               string
+	mu                 sync.Mutex
+	cached             []string
+	at                 time.Time
+}
+
+func newFanout(host, base string) *fanout {
+	f := &fanout{host: host, base: base, scheme: "http", port: "8081"}
+	if u, err := url.Parse(base); err == nil {
+		f.scheme = u.Scheme
+		if p := u.Port(); p != "" {
+			f.port = p
+		}
+	}
+	return f
+}
+
+func (f *fanout) urls() []string {
+	if f.host == "" {
+		return []string{f.base}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if time.Since(f.at) < 30*time.Second && len(f.cached) > 0 {
+		return f.cached
+	}
+	ips, err := net.LookupHost(f.host)
+	if err != nil || len(ips) == 0 {
+		return []string{f.base}
+	}
+	sort.Strings(ips)
+	f.cached = f.cached[:0]
+	for _, ip := range ips {
+		f.cached = append(f.cached, f.scheme+"://"+net.JoinHostPort(ip, f.port))
+	}
+	f.at = time.Now()
+	return f.cached
 }
 
 type agent struct {
@@ -197,7 +248,7 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 		}
 		opts.Continue = l.Continue
 	}
-	res := &Result{Started: time.Now().UTC(), Agents: o.Agents, Interval: o.Interval.String(), Mode: "staggered"}
+	res := &Result{Started: time.Now().UTC(), Agents: o.Agents, Interval: o.Interval.String(), Mode: "staggered", Gzip: o.Gzip}
 	if o.Surge {
 		res.Mode = "surge"
 	} else if o.Jitter > 0 {
@@ -222,6 +273,13 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 		}
 		target := o.MinBytes + r.IntN(o.MaxBytes-o.MinBytes+1)
 		body, procs := buildReport(r, name, byNode[real], target)
+		if o.Gzip {
+			var zb bytes.Buffer
+			zw := gzip.NewWriter(&zb)
+			_, _ = zw.Write(body)
+			_ = zw.Close()
+			body = zb.Bytes()
+		}
 		agents[i] = &agent{node: name, body: body, pods: byNode[real]}
 		sizes.Add(float64(len(body)) / 1024)
 		res.Processes += procs
@@ -234,8 +292,16 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 	out.Logf("agents: %d agents (%d real node names), %d pods covered, %d processes per round, report KB p50 %.0f max %.0f",
 		o.Agents, res.RealNodes, res.PodsCovered, res.Processes, res.ReportBytes.P50, res.ReportBytes.Max)
 
+	if o.Ingest == nil {
+		o.Ingest = o.Client
+	}
+	headers := map[string]string{"Content-Type": "application/json"}
+	if o.Gzip {
+		headers["Content-Encoding"] = "gzip"
+	}
+	targets := newFanout(o.Fanout, o.Ingest.Base)
 	rec := hist.NewRecorder()
-	var bytes atomic.Int64
+	var sent atomic.Int64
 	runCtx, cancel := context.WithTimeout(ctx, o.Duration)
 	defer cancel()
 	start := time.Now()
@@ -257,15 +323,17 @@ func Run(ctx context.Context, cs kubernetes.Interface, o Options) (*Result, erro
 				case <-runCtx.Done():
 					return
 				}
-				rctx, c := context.WithTimeout(runCtx, o.Timeout)
-				resp := o.Client.Do(rctx, o.ID, http.MethodPost, "/agent/report", a.body, "application/json", false)
-				c()
-				oc := hist.Classify(resp.Err, runCtx.Err())
-				if oc == hist.Aborted && runCtx.Err() != nil {
-					return
+				for _, target := range targets.urls() {
+					rctx, c := context.WithTimeout(runCtx, o.Timeout)
+					resp := o.Ingest.DoH(rctx, o.ID, http.MethodPost, target+"/agent/report", a.body, headers, false)
+					c()
+					oc := hist.Classify(resp.Err, runCtx.Err())
+					if oc == hist.Aborted && runCtx.Err() != nil {
+						return
+					}
+					rec.Record("POST /agent/report", resp.Status, int64(len(a.body)), resp.Elapsed, oc, resp.Err)
+					sent.Add(int64(len(a.body)))
 				}
-				rec.Record("POST /agent/report", resp.Status, int64(len(a.body)), resp.Elapsed, oc, resp.Err)
-				bytes.Add(int64(len(a.body)))
 				d := o.Interval
 				if o.Jitter > 0 && !o.Surge {
 					d += time.Duration((ar.Float64()*2 - 1) * o.Jitter * float64(o.Interval))
@@ -311,7 +379,8 @@ loop:
 		}
 		res.PostsPerSec = float64(p.Requests) / res.Seconds
 	}
-	res.MBytesPerSec = float64(bytes.Load()) / res.Seconds / (1 << 20)
+	res.MBytesPerSec = float64(sent.Load()) / res.Seconds / (1 << 20)
+	res.Targets = len(targets.urls())
 
 	// Freshness: are the simulated pods' processes served, and fresh?
 	var pods []*corev1.Pod

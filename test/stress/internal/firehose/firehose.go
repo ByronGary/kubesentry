@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +19,7 @@ import (
 // Options configure a firehose run.
 type Options struct {
 	Client     *ks.Client
+	Ingest     *ks.Client  // where /audit/webhook is (default Client)
 	AuditID    ks.Identity // webhook token
 	APIID      ks.Identity // API token for queries
 	Total      int
@@ -28,6 +32,11 @@ type Options struct {
 	Seed       uint64
 	Timeout    time.Duration
 	MaxRun     time.Duration // stop sending after this long
+	// IDsFile, if set, receives every distinct auditID that was accepted, one
+	// per line, for checking the store afterwards (no loss, no duplicates).
+	IDsFile    string
+	MaxRetries int  // retries of a batch answered 503/429 with Retry-After (default 30)
+	NoQueries  bool // only ingest: no Findings query during, no query phase after
 }
 
 // Result is audit.json.
@@ -48,6 +57,10 @@ type Result struct {
 	Queries        []hist.RouteReport `json:"queriesAfter"`
 	StoreView      map[string]int     `json:"storeView"` // counts returned by the queries after ingest
 	Stopped        string             `json:"stopped,omitempty"`
+	Backpressure   int64              `json:"backpressureResponses"` // 503 or 429 with Retry-After, retried
+	Retried        int64              `json:"retriedBatches"`
+	GaveUp         int64              `json:"gaveUpBatches"`
+	DistinctIDs    int                `json:"distinctAcceptedIDs,omitempty"`
 }
 
 // Queries run after the ingest, with a route name each.
@@ -72,7 +85,17 @@ func Run(ctx context.Context, o Options) *Result {
 	type batch struct {
 		body []byte
 		n    int
+		ids  []string
 	}
+	if o.Ingest == nil {
+		o.Ingest = o.Client
+	}
+	if o.MaxRetries == 0 {
+		o.MaxRetries = 30
+	}
+	var idsMu sync.Mutex
+	acceptedIDs := map[string]struct{}{}
+	var backpressure, retried, gaveUp atomic.Int64
 	batches := make(chan batch, 8)
 	sendCtx, stopSend := context.WithCancel(ctx)
 	defer stopSend()
@@ -89,7 +112,7 @@ func Run(ctx context.Context, o Options) *Result {
 		sent := 0
 		for sent < o.Total {
 			n := min(o.BatchSize, o.Total-sent)
-			body, err := gen.Batch(n, time.Now())
+			body, ids, err := gen.BatchIDs(n, time.Now())
 			if err != nil {
 				out.Logf("audit: marshal: %v", err)
 				return
@@ -103,7 +126,7 @@ func Run(ctx context.Context, o Options) *Result {
 				}
 			}
 			select {
-			case batches <- batch{body, n}:
+			case batches <- batch{body, n, ids}:
 			case <-sendCtx.Done():
 				return
 			}
@@ -118,18 +141,47 @@ func Run(ctx context.Context, o Options) *Result {
 		go func() {
 			defer wg.Done()
 			for b := range batches {
-				rctx, cancel := context.WithTimeout(ctx, o.Timeout)
-				r := o.Client.Do(rctx, o.AuditID, http.MethodPost, "/audit/webhook", b.body, "application/json", true)
-				cancel()
-				oc := hist.Classify(r.Err, ctx.Err())
-				ingest.Record("POST /audit/webhook", r.Status, int64(len(b.body)), r.Elapsed, oc, r.Err)
+				var r ks.Response
+				for attempt := 0; ; attempt++ {
+					rctx, cancel := context.WithTimeout(ctx, o.Timeout)
+					r = o.Ingest.Do(rctx, o.AuditID, http.MethodPost, "/audit/webhook", b.body, "application/json", true)
+					cancel()
+					oc := hist.Classify(r.Err, ctx.Err())
+					ingest.Record("POST /audit/webhook", r.Status, int64(len(b.body)), r.Elapsed, oc, r.Err)
+					bytes.Add(int64(len(b.body)))
+					// Backpressure: the store's queue is full (e.g. Postgres is
+					// down). Wait as told and send the same batch again.
+					if r.Err == nil && (r.Status == http.StatusServiceUnavailable || r.Status == http.StatusTooManyRequests) && r.Header.Get("Retry-After") != "" {
+						backpressure.Add(1)
+						if attempt >= o.MaxRetries || ctx.Err() != nil {
+							gaveUp.Add(1)
+							break
+						}
+						if attempt == 0 {
+							retried.Add(1)
+						}
+						wait, _ := strconv.Atoi(r.Header.Get("Retry-After"))
+						select {
+						case <-time.After(time.Duration(max(1, wait)) * time.Second):
+						case <-ctx.Done():
+						}
+						continue
+					}
+					break
+				}
 				sentEv.Add(int64(b.n))
-				bytes.Add(int64(len(b.body)))
 				var acc struct {
 					Accepted int `json:"accepted"`
 				}
 				if r.Err == nil && r.Status == http.StatusOK && json.Unmarshal(r.Body, &acc) == nil {
 					accepted.Add(int64(acc.Accepted))
+					if o.IDsFile != "" {
+						idsMu.Lock()
+						for _, id := range b.ids {
+							acceptedIDs[id] = struct{}{}
+						}
+						idsMu.Unlock()
+					}
 				} else {
 					failed.Add(1)
 				}
@@ -141,6 +193,10 @@ func Run(ctx context.Context, o Options) *Result {
 	duringDone := make(chan struct{})
 	go func() {
 		defer close(duringDone)
+		if o.NoQueries {
+			<-sendCtx.Done()
+			return
+		}
 		t := time.NewTicker(2 * time.Second)
 		defer t.Stop()
 		for {
@@ -180,10 +236,25 @@ loop:
 	res.Seconds = time.Since(start).Seconds()
 	res.SentEvents, res.AcceptedEvents, res.FailedBatches, res.PayloadBytes = sentEv.Load(), accepted.Load(), failed.Load(), bytes.Load()
 	res.AchievedRate = float64(res.AcceptedEvents) / res.Seconds
+	res.Backpressure, res.Retried, res.GaveUp = backpressure.Load(), retried.Load(), gaveUp.Load()
+	if o.IDsFile != "" {
+		var sb strings.Builder
+		for id := range acceptedIDs {
+			sb.WriteString(id)
+			sb.WriteByte('\n')
+		}
+		res.DistinctIDs = len(acceptedIDs)
+		if err := os.WriteFile(o.IDsFile, []byte(sb.String()), 0o644); err != nil {
+			out.Logf("audit: write ids: %v", err)
+		}
+	}
 	res.EventMix = gen.Counts
 	res.Ingest, res.DuringIngest = ingest.Report(), during.Report()
 	out.Logf("audit: done: %d accepted of %d sent in %.0fs (%.0f/s)", res.AcceptedEvents, res.SentEvents, res.Seconds, res.AchievedRate)
 
+	if o.NoQueries {
+		return res
+	}
 	// Query latency with the store full.
 	qrec := hist.NewRecorder()
 	res.StoreView = map[string]int{}
