@@ -8,13 +8,14 @@ Open-source, standalone Kubernetes dashboard. Four features that Headlamp lacks:
 3. `go run ./cmd/demo` shows every feature with synthetic data, no cluster needed.
 
 ## Status
-Done: architecture map (app topology + node view), workloads, storage, security posture (pod security, RBAC, PSA labels, exposure), cert-manager page (2026-10); PVC, OOM, leak detectors; Prometheus client; audit ingestion (webhook, file tail, bulk import, journal); JSON API; embedded React UI (Findings, Pods, pod page, Memory, Volumes, Activity); demo mode; process agent (`cmd/agent`, `internal/procmon`, DaemonSet manifest).
-Next, in rough order: process history and per-process memory trend (name the leaking child process in leak findings); alerting on tagged audit events; native CloudWatch polling for EKS; persistent store (SQLite/Postgres); shared informers instead of per-request LISTs; real container image and Helm chart; CI.
+Done: architecture map (app topology + node view), workloads, storage, security posture (pod security, RBAC, PSA labels, exposure), cert-manager page (2026-10); PVC, OOM, leak detectors; Prometheus client; audit ingestion (webhook, file tail, bulk import, journal); JSON API; embedded React UI (Findings, Pods, pod page, Memory, Volumes, Activity); demo mode; process agent (`cmd/agent`, `internal/procmon`, DaemonSet manifest). Enterprise hardening (2026-10, see `docs/contracts.md`): informer cache and debounced snapshot views (`internal/snapshot`), ownerRef/EndpointSlice association, SSO proxy auth with per-user scope by SubjectAccessReview, keyset paging, response cache, web/ingest/ops listeners, Postgres audit store, CloudWatch reader, Prometheus discovery/cache/leak scanner/AMP SigV4, Helm chart, multi-arch images.
+Next, in rough order: the enterprise-scale stress run and its fixes; process history and per-process memory trend (name the leaking child process in leak findings); alerting on tagged audit events; EKS access entries; CI.
 
 ## Conventions
 - Module path is `github.com/ByronGary/kubesentry` (repo https://github.com/ByronGary/kubesentry).
 - Commits in this project carry no Claude co-author or "Generated with Claude" trailer.
-- Only `internal/kube` imports client-go. Everything else is stdlib, so tests need no cluster. Keep it that way.
+- Only `internal/kube` imports client-go, only `internal/pgstore` pgx, only `internal/cloudwatch` and `internal/awsauth` the AWS SDK. Everything else is stdlib, so tests need no cluster. Keep it that way.
+- Handlers serve the snapshot view filtered by the caller's scope (`internal/api/views.go`); they never list the cluster or run detectors per request. Derive per-view data with `View.Memo`, never mutate a view, and list every capability a cached route depends on in `cachedRoutes`. The authorization leak test (`TestNoAuthorizationLeaks`) must cover any new list route.
 - Detectors work on plain `internal/model` types.
 - Endpoints that accept pushed data (`/audit/webhook`, `/agent/report`) fail closed with 503 until their token is set. `/api/` routes use `-api-token`. Default listen is 127.0.0.1.
 - Names reaching PromQL are validated (DNS-1123) and quoted. Audit bodies are never decoded. Agent never reads environ and redacts command lines.
