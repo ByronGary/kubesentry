@@ -112,7 +112,7 @@ Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare hos
 ## Postgres schema (`internal/pgstore/migrations/0001_audit.sql`)
 ```sql
 CREATE TABLE IF NOT EXISTS audit_events (
-  audit_id text NOT NULL, time timestamptz NOT NULL, stage_rank smallint NOT NULL, stage text NOT NULL,
+  audit_id text COLLATE "C" NOT NULL, time timestamptz NOT NULL, stage_rank smallint NOT NULL, stage text NOT NULL,
   verb text NOT NULL, username text NOT NULL, actor_kind text NOT NULL, groups text[], arn text,
   session_name text, impersonated_user text, source_ips text[], user_agent text, api_group text,
   resource text, subresource text, namespace text NOT NULL DEFAULT '', name text, request_uri text,
@@ -124,11 +124,11 @@ CREATE INDEX IF NOT EXISTS audit_events_time ON audit_events (time DESC, audit_i
 CREATE INDEX IF NOT EXISTS audit_events_user ON audit_events (username, time DESC);
 CREATE INDEX IF NOT EXISTS audit_events_obj ON audit_events (namespace, resource, name, time DESC);
 CREATE INDEX IF NOT EXISTS audit_events_tags ON audit_events USING gin (tags);
-CREATE INDEX IF NOT EXISTS audit_events_default_view ON audit_events (time DESC)
-  WHERE actor_kind <> 'system' AND (NOT is_read OR tags <> '{}');
+CREATE INDEX IF NOT EXISTS audit_events_default_view ON audit_events (time DESC, audit_id DESC)
+  WHERE (actor_kind <> 'system' OR tags <> '{}') AND (NOT is_read OR tags <> '{}');
 CREATE TABLE IF NOT EXISTS audit_events_default PARTITION OF audit_events DEFAULT;
 CREATE TABLE IF NOT EXISTS ingest_checkpoints (
   source text PRIMARY KEY, position jsonb NOT NULL, owner text, updated_at timestamptz NOT NULL DEFAULT now()
 );
 ```
-Daily partitions `audit_events_YYYYMMDD` are created ahead and dropped after `-audit-retention` by the advisory-lock holder.
+`audit_id` uses `COLLATE "C"` so ordering and the keyset cursor compare bytes exactly as the memory store does, whatever the database locale. The default-view index carries the default view's exact predicate (system actors hidden unless tagged, reads hidden unless tagged) so the planner can use it. Daily partitions `audit_events_YYYYMMDD` are created ahead and dropped after `-audit-retention` by the advisory-lock holder.
