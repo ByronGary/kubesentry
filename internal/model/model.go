@@ -44,6 +44,17 @@ type Pod struct {
 	// pod counts as true, because the service account default is not looked up.
 	AutomountToken bool
 	Specs          []ContainerSpec // containers, then init containers, from the pod spec
+
+	// Owners are the pod's ownerReferences; the controller one has Controller set.
+	Owners []OwnerRef
+	// Ready is the pod's Ready condition; ReadyChanged is when it last flipped.
+	Ready        bool
+	ReadyChanged time.Time
+	// Unschedulable carries the scheduler's message while PodScheduled is False.
+	Unschedulable string
+	DeletedAt     time.Time // deletionTimestamp; zero unless the pod is terminating
+	PodIP         string
+	QOSClass      string // Guaranteed, Burstable or BestEffort
 }
 
 // ContainerSpec is the security- and resource-relevant part of one container's
@@ -65,7 +76,8 @@ type ContainerSpec struct {
 	MemoryLimitBytes         int64
 }
 
-// ContainerStatus is the most recent termination info for one container.
+// ContainerStatus is the current state and most recent termination info for
+// one container.
 type ContainerStatus struct {
 	Name                 string
 	ContainerID          string // runtime ID without the "containerd://" style prefix
@@ -73,6 +85,26 @@ type ContainerStatus struct {
 	LastTerminatedReason string // e.g. "OOMKilled", "Error", "Completed"
 	LastTerminatedAt     time.Time
 	LastExitCode         int32
+
+	Init    bool // an init container or native sidecar
+	Ready   bool
+	Started bool
+	// State is "running", "waiting" or "terminated"; Reason and Message explain
+	// waiting and terminated states (CrashLoopBackOff, ImagePullBackOff, ...).
+	State   string
+	Reason  string
+	Message string
+	// MemoryLimitBytes is the limit the kubelet applied (status.resources), which
+	// follows in-place resizes; 0 when unknown.
+	MemoryLimitBytes int64
+}
+
+// OwnerRef is one ownerReference.
+type OwnerRef struct {
+	Kind       string
+	Name       string
+	UID        string
+	Controller bool
 }
 
 // ContainerKey identifies one container of one pod.

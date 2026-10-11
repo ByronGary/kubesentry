@@ -33,6 +33,8 @@ type Workload struct {
 	Kind      string // "Deployment", "StatefulSet", "DaemonSet", "Job" or "CronJob"
 	Namespace string
 	Name      string
+	UID       string
+	Owners    []OwnerRef // e.g. a Job's CronJob
 	Created   time.Time
 	Selector  *LabelSelector // nil for CronJob
 	Images    []string       // from the pod template, containers then init containers
@@ -65,7 +67,13 @@ type Service struct {
 	Ports               []ServicePort
 	ExternalIPs         []string
 	LoadBalancerIngress []string // IPs or hostnames
-	Created             time.Time
+	LoadBalancerClass   string
+	SourceRanges        []string // spec.loadBalancerSourceRanges
+	PublishNotReady     bool     // spec.publishNotReadyAddresses
+	// Annotations keeps only the keys kubesentry reads (AWS load balancer scheme
+	// and type); see internal/kube for the allowlist.
+	Annotations map[string]string
+	Created     time.Time
 }
 
 // ServicePort is one port of a Service.
@@ -85,7 +93,10 @@ type Ingress struct {
 	Rules          []IngressRule
 	DefaultBackend string // service name, "" when unset
 	TLS            []IngressTLS
-	Created        time.Time
+	// Annotations keeps only the keys kubesentry reads (ALB scheme, certificate
+	// ARN, listen ports); see internal/kube for the allowlist.
+	Annotations map[string]string
+	Created     time.Time
 }
 
 // IngressRule is one host/path routed to a service.
@@ -116,7 +127,13 @@ type Node struct {
 	PodsAllocatable        int64
 	Conditions             []Condition
 	Taints                 []string // "key=value:Effect"
-	Created                time.Time
+	// Labels keeps only placement labels (zone, region, instance type, arch, os,
+	// node group, Karpenter pool, capacity type, compute type, node roles) plus
+	// any keys added with -node-label-keys-add.
+	Labels     map[string]string
+	ProviderID string // e.g. aws:///us-east-1a/i-0abc...
+	InternalIP string
+	Created    time.Time
 }
 
 // PV is a PersistentVolume.
@@ -130,6 +147,8 @@ type PV struct {
 	ClaimNamespace string
 	ClaimName      string
 	Source         string // "csi:<driver>", "hostPath", "local", "nfs", ...
+	Driver         string // CSI driver, or the in-tree plugin (e.g. kubernetes.io/aws-ebs)
+	VolumeHandle   string // e.g. an EBS vol-... ID
 	Created        time.Time
 }
 
@@ -140,8 +159,11 @@ type StorageClass struct {
 	ReclaimPolicy  string
 	BindingMode    string // Immediate or WaitForFirstConsumer
 	AllowExpansion bool
-	Default        bool // carries the is-default-class annotation
-	Created        time.Time
+	Default        bool              // carries the is-default-class annotation
+	Parameters     map[string]string // e.g. type=gp3, iops, throughput
+	// PriceAnnotation is the kubesentry.io/price-per-gib-month annotation, "" when unset.
+	PriceAnnotation string
+	Created         time.Time
 }
 
 // Namespace is a core/v1 Namespace.
@@ -215,6 +237,8 @@ type Certificate struct {
 	NotBefore   time.Time // zero until issued
 	NotAfter    time.Time
 	RenewalTime time.Time
+	Duration    time.Duration // spec.duration; 0 means cert-manager's default (90 days)
+	RenewBefore time.Duration // spec.renewBefore; 0 means the default (a third of the duration)
 	Created     time.Time
 }
 
@@ -244,4 +268,83 @@ type CertificateRequest struct {
 	Approved    bool
 	Denied      bool
 	Created     time.Time
+}
+
+// ReplicaSet is kept only to resolve Pod → ReplicaSet → Deployment.
+type ReplicaSet struct {
+	Namespace string
+	Name      string
+	UID       string
+	Owners    []OwnerRef
+	Desired   int32
+	Ready     int32
+	Created   time.Time
+}
+
+// EndpointSlice is a discovery.k8s.io/v1 EndpointSlice, the ground truth for
+// which pods back a Service and whether they receive traffic.
+type EndpointSlice struct {
+	Namespace string
+	Name      string
+	Service   string // kubernetes.io/service-name label
+	ManagedBy string // endpointslice.kubernetes.io/managed-by label
+	Endpoints []Endpoint
+}
+
+// Endpoint is one address of an EndpointSlice.
+type Endpoint struct {
+	Addresses   []string
+	Ready       bool
+	Serving     bool
+	Terminating bool
+	NodeName    string
+	TargetKind  string // usually "Pod"
+	TargetName  string
+	TargetUID   string
+}
+
+// AWSAuth is the parsed kube-system/aws-auth ConfigMap (EKS authentication
+// mappings from IAM roles and users to Kubernetes users and groups).
+type AWSAuth struct {
+	MapRoles []AWSAuthMapping
+	MapUsers []AWSAuthMapping
+}
+
+// AWSAuthMapping maps one IAM role or user.
+type AWSAuthMapping struct {
+	ARN      string // rolearn or userarn
+	Username string
+	Groups   []string
+}
+
+// ClusterInfo identifies the cluster kubesentry is looking at.
+type ClusterInfo struct {
+	Name     string // from -cluster-name; "" when not set
+	Version  string // API server git version from discovery
+	Platform string // "eks", "kind", ... derived from the version and node provider IDs
+	Provider string // providerID scheme of most nodes, e.g. "aws", "kind"
+	Region   string // most common topology.kubernetes.io/region across nodes
+}
+
+// Inventory is a consistent read of everything the inventory pages need. A
+// source that could not be read (for example RBAC is forbidden) is listed in
+// Unavailable with the reason, and its slice is empty.
+type Inventory struct {
+	Pods           []Pod
+	PVCs           []PVC
+	PVs            []PV
+	StorageClasses []StorageClass
+	Workloads      []Workload
+	ReplicaSets    []ReplicaSet
+	Services       []Service
+	EndpointSlices []EndpointSlice
+	Ingresses      []Ingress
+	Nodes          []Node
+	Namespaces     []Namespace
+	RBAC           RBAC
+	Certs          CertManager
+	AWSAuth        *AWSAuth // nil when not read
+	Cluster        ClusterInfo
+	Unavailable    map[string]string // source name → reason
+	ReadAt         time.Time
 }

@@ -98,6 +98,9 @@ spec:
               valueFrom: {secretKeyRef: {name: kubesentry-api, key: token}}
             - name: KUBESENTRY_AGENT_TOKEN
               valueFrom: {secretKeyRef: {name: kubesentry-agent, key: token}}
+            # Enables POST /audit/webhook (bulk import and the stress harness's audit firehose).
+            - name: KUBESENTRY_AUDIT_TOKEN
+              valueFrom: {secretKeyRef: {name: kubesentry-audit, key: token, optional: true}}
           ports:
             - name: http
               containerPort: 8080

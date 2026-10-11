@@ -2,6 +2,8 @@ package audit
 
 import (
 	"container/list"
+	"context"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -24,7 +26,55 @@ type Query struct {
 	IncludeReads bool
 	// Limit caps the result; 0 means no limit.
 	Limit int
+
+	// Scope, set from the caller's RBAC. Namespaces nil means every namespace;
+	// otherwise only events in those namespaces match, plus events with no
+	// namespace when ClusterScoped is true.
+	Namespaces    map[string]bool
+	ClusterScoped bool
+	// Before pages backwards: only events strictly older than this position
+	// (time, then auditID) match. Zero means from the newest.
+	Before Cursor
 }
+
+// Cursor is a position in the newest-first order of events, used for keyset
+// paging: the next page starts after the last event of the previous one.
+type Cursor struct {
+	Time    time.Time
+	AuditID string
+}
+
+// Store keeps audit events. MemoryStore is the default; internal/pgstore
+// implements it on Postgres for retention, many replicas and enterprise
+// volume. Implementations must give identical results for the same events and
+// query (TestPGMatchesMemory checks this).
+type Store interface {
+	// Add stores events, merging the stages of one request by auditID (a later
+	// stage never loses to an earlier one). It returns ErrBackpressure when the
+	// store cannot accept more right now; the caller should retry later.
+	Add(ctx context.Context, events []Event) error
+	// Query returns matching events, newest first.
+	Query(ctx context.Context, q Query) ([]Event, error)
+	// Summarize aggregates matching events by user and tag.
+	Summarize(ctx context.Context, q Query) (Summary, error)
+	// Coverage reports the oldest event kept and the configured retention
+	// (0 when bounded by count, as MemoryStore is), so the UI can say how far
+	// back activity really goes.
+	Coverage(ctx context.Context) (Coverage, error)
+}
+
+// Coverage describes how much history a Store holds.
+type Coverage struct {
+	Oldest    time.Time     `json:"oldest"` // zero when empty
+	Newest    time.Time     `json:"newest"`
+	Events    int64         `json:"events"`
+	Retention time.Duration `json:"retention"` // 0: bounded by MaxEvents instead
+	MaxEvents int           `json:"maxEvents,omitempty"`
+	Backend   string        `json:"backend"` // "memory" or "postgres"
+}
+
+// ErrBackpressure means the store's write queue is full.
+var ErrBackpressure = errors.New("audit store is busy; retry later")
 
 func (q Query) matches(e *Event) bool {
 	if !q.Since.IsZero() && e.Time.Before(q.Since) {

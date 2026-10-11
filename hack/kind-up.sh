@@ -23,11 +23,12 @@ fi
 echo "==> Prometheus (kube-prometheus-stack)"
 helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
 helm repo update prometheus-community >/dev/null
+# KPS_VALUES replaces these defaults, e.g. test/stress/kind/kps-values.yaml for the stress cluster.
+kps_values=(--set grafana.enabled=false --set alertmanager.enabled=false --set prometheus.prometheusSpec.retention=3d)
+if [ -n "${KPS_VALUES:-}" ]; then kps_values=(-f "$KPS_VALUES"); fi
 helm upgrade --install kps prometheus-community/kube-prometheus-stack \
   --kube-context "$CTX" --namespace monitoring --create-namespace \
-  --set grafana.enabled=false \
-  --set alertmanager.enabled=false \
-  --set prometheus.prometheusSpec.retention=3d \
+  "${kps_values[@]}" \
   --wait --timeout 10m
 
 echo "==> cert-manager"
@@ -45,7 +46,7 @@ kind load docker-image --name "$CLUSTER" kubesentry:dev kubesentry-agent:dev
 
 echo "==> kubesentry"
 k create namespace kubesentry --dry-run=client -o yaml | k apply -f - >/dev/null
-for secret in kubesentry-api kubesentry-agent; do
+for secret in kubesentry-api kubesentry-agent kubesentry-audit; do
   k -n kubesentry get secret "$secret" >/dev/null 2>&1 ||
     k -n kubesentry create secret generic "$secret" --from-literal=token="$(openssl rand -hex 32)"
 done

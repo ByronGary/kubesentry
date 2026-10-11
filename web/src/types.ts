@@ -11,6 +11,24 @@ export interface Info {
   inventory: boolean
   /** The certificates route exists; cert-manager itself may still be absent. */
   certs: boolean
+  /** Who is calling, when the server knows (proxy or token mode). */
+  identity?: { user: string; groups: string[]; source: 'proxy' | 'token' | 'none' }
+  /** What this caller may see beyond namespaced data; absent means everything. */
+  capabilities?: Partial<Record<Capability, boolean>>
+  cluster?: { name?: string; version: string; platform: string; provider?: string; region?: string }
+  /** The precomputed view the inventory pages are served from. */
+  snapshot?: { version: number; builtAt: string; ageSeconds: number; stale: boolean; error?: string }
+  auditStore?: { backend: 'memory' | 'postgres'; oldest?: string; newest?: string; events: number; retentionHours?: number; maxEvents?: number }
+  prometheus?: { source: 'flag' | 'discovered' | 'amp' | 'none'; url?: string; retentionHours?: number }
+  /** Sources that could not be read, with the reason (e.g. RBAC forbidden). */
+  unavailable?: Record<string, string>
+}
+
+export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'clusterIssuers' | 'processes' | 'audit' | 'clusterAudit' | 'agents'
+
+/** Optional paging on list responses: pass `continue` back to get the next page. */
+export interface Paged {
+  continue?: string
 }
 
 export interface UnusedPVC {
@@ -70,9 +88,15 @@ export interface PodSummary {
   containers: number
   restarts: number
   oomKilled: boolean
+  ready?: boolean
+  /** Worst container waiting reason, e.g. CrashLoopBackOff. */
+  reason?: string
+  node?: string
+  /** "Kind/name" of the owner. */
+  workload?: string
 }
 
-export interface PodsResponse {
+export interface PodsResponse extends Paged {
   count: number
   items: PodSummary[]
 }
@@ -128,7 +152,7 @@ export interface AuditEvent {
   tags?: string[]
 }
 
-export interface AuditEventsResponse {
+export interface AuditEventsResponse extends Paged {
   count: number
   items: AuditEvent[]
 }
@@ -200,6 +224,9 @@ export interface WorkloadSummary {
   pods: number
   restarts: number
   oomKilled: boolean
+  notReady?: number
+  /** Pods by worst waiting reason, e.g. { CrashLoopBackOff: 2 }. */
+  waiting?: Record<string, number>
   images: string[]
   created: string
   schedule?: string
@@ -208,7 +235,7 @@ export interface WorkloadSummary {
   lastSuccessTime?: string
 }
 
-export interface WorkloadsResponse {
+export interface WorkloadsResponse extends Paged {
   count: number
   items: WorkloadSummary[]
 }
@@ -225,7 +252,13 @@ export interface ClaimSummary {
   status: Status
   detail: string
   created: string
+  estMonthlyCostUSD?: number
+  /** False when no price applies; priceSource says why (e.g. usage-billed for EFS). */
+  costKnown?: boolean
+  priceSource?: PriceSource
 }
+
+export type PriceSource = 'annotation' | 'class-price' | 'ebs-table' | 'default' | 'usage-billed' | 'unknown'
 
 export interface VolumeSummary {
   name: string
@@ -233,6 +266,8 @@ export interface VolumeSummary {
   storageClass: string
   reclaimPolicy: string
   source: string
+  driver?: string
+  volumeHandle?: string
   /** "namespace/name" */
   claim?: string
   capacityBytes: number
@@ -250,9 +285,12 @@ export interface ClassSummary {
   default: boolean
   claims: number
   capacityBytes: number
+  pricePerGiBMonth?: number
+  priceSource?: PriceSource
+  parameters?: Record<string, string>
 }
 
-export interface StorageResponse {
+export interface StorageResponse extends Paged {
   claims: ClaimSummary[]
   volumes: VolumeSummary[]
   classes: ClassSummary[]
@@ -288,7 +326,7 @@ export interface NamespacePosture {
   status: Status
 }
 
-export interface SecurityResponse {
+export interface SecurityResponse extends Paged {
   /** By severity, excluding system findings. */
   counts: Partial<Record<SecuritySeverity, number>>
   findings: SecurityFinding[]
@@ -352,7 +390,7 @@ export interface CertificatesResponse {
   requests: RequestSummary[]
 }
 
-export type GraphKind = 'Ingress' | 'Service' | 'Deployment' | 'StatefulSet' | 'DaemonSet' | 'Job' | 'CronJob' | 'Pod' | 'PVC' | 'Node'
+export type GraphKind = 'Ingress' | 'Service' | 'Deployment' | 'StatefulSet' | 'DaemonSet' | 'Job' | 'CronJob' | 'ReplicaSet' | 'Controller' | 'Pod' | 'PVC' | 'Node'
 
 export interface GraphNode {
   /** "<Kind>/<namespace>/<name>", or "Node/<name>" */
@@ -362,12 +400,20 @@ export interface GraphNode {
   namespace?: string
   status: Status
   detail: string
+  /** The real kind behind a Controller node, e.g. Rollout. */
+  ownerKind?: string
 }
 
 /** From the routing or owning object to what it routes to, runs or uses. */
 export interface GraphEdge {
   from: string
   to: string
+  /** How the link was found: ownerReferences, EndpointSlices, or labels (fallback). */
+  how?: 'owner' | 'endpoints' | 'selector'
+  /** Endpoint counts on Service links. */
+  ready?: number
+  notReady?: number
+  terminating?: number
 }
 
 export interface MapResponse {
@@ -383,6 +429,21 @@ export interface NodePod {
   status: Status
   /** "Kind/name" of the owning workload */
   workload?: string
+  ready?: boolean
+  reason?: string
+}
+
+export interface Placement {
+  zone?: string
+  region?: string
+  instanceType?: string
+  arch?: string
+  os?: string
+  /** Node group or Karpenter node pool name. */
+  pool?: string
+  poolKind?: 'nodegroup' | 'karpenter' | 'fargate' | ''
+  capacityType?: 'on-demand' | 'spot' | ''
+  providerID?: string
 }
 
 export interface NodeSummary {
@@ -402,7 +463,18 @@ export interface NodeSummary {
   memoryAllocatableBytes: number
   memoryRequestedBytes: number
   podsAllocatable: number
+  /** Omitted with ?summary=true; podCount stays. */
   pods: NodePod[]
+  podCount?: number
+  placement?: Placement
+}
+
+export interface AgentStatus {
+  node: string
+  lastReport: string
+  processes: number
+  bytes: number
+  stale: boolean
 }
 
 export interface NodesResponse {

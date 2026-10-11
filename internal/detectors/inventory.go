@@ -17,24 +17,28 @@ var SystemNamespaces = map[string]bool{
 
 // WorkloadSummary is one row on the Workloads page.
 type WorkloadSummary struct {
-	Kind             string     `json:"kind"`
-	Namespace        string     `json:"namespace"`
-	Name             string     `json:"name"`
-	Status           string     `json:"status"`
-	Detail           string     `json:"detail"`
-	Desired          int32      `json:"desired"`
-	Ready            int32      `json:"ready"`
-	Updated          int32      `json:"updated"`
-	Available        int32      `json:"available"`
-	Pods             int        `json:"pods"`     // live pods the selector matches
-	Restarts         int32      `json:"restarts"` // summed over those pods
-	OOMKilled        bool       `json:"oomKilled"`
-	Images           []string   `json:"images"`
-	Created          time.Time  `json:"created"`
-	Schedule         string     `json:"schedule,omitempty"` // CronJob
-	Suspended        bool       `json:"suspended,omitempty"`
-	LastScheduleTime *time.Time `json:"lastScheduleTime,omitempty"`
-	LastSuccessTime  *time.Time `json:"lastSuccessTime,omitempty"`
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	Detail    string `json:"detail"`
+	Desired   int32  `json:"desired"`
+	Ready     int32  `json:"ready"`
+	Updated   int32  `json:"updated"`
+	Available int32  `json:"available"`
+	Pods      int    `json:"pods"`     // live pods the workload owns
+	Restarts  int32  `json:"restarts"` // summed over those pods
+	OOMKilled bool   `json:"oomKilled"`
+	NotReady  int    `json:"notReady"` // live pods whose Ready condition is false
+	// Waiting counts pods by their worst container waiting reason, e.g.
+	// {"CrashLoopBackOff": 2, "ImagePullBackOff": 1}.
+	Waiting          map[string]int `json:"waiting,omitempty"`
+	Images           []string       `json:"images"`
+	Created          time.Time      `json:"created"`
+	Schedule         string         `json:"schedule,omitempty"` // CronJob
+	Suspended        bool           `json:"suspended,omitempty"`
+	LastScheduleTime *time.Time     `json:"lastScheduleTime,omitempty"`
+	LastSuccessTime  *time.Time     `json:"lastSuccessTime,omitempty"`
 }
 
 // ClaimSummary is one PVC on the Storage page.
@@ -49,6 +53,11 @@ type ClaimSummary struct {
 	Status        string    `json:"status"`
 	Detail        string    `json:"detail"`
 	Created       time.Time `json:"created"`
+	// Cost estimate for the claim's capacity; CostKnown is false when no price
+	// applies (PriceSource says why, e.g. usage-billed for EFS).
+	EstMonthlyCostUSD float64 `json:"estMonthlyCostUSD"`
+	CostKnown         bool    `json:"costKnown"`
+	PriceSource       string  `json:"priceSource"`
 }
 
 // VolumeSummary is one PV on the Storage page.
@@ -58,6 +67,8 @@ type VolumeSummary struct {
 	StorageClass  string    `json:"storageClass"`
 	ReclaimPolicy string    `json:"reclaimPolicy"`
 	Source        string    `json:"source"`
+	Driver        string    `json:"driver,omitempty"`
+	VolumeHandle  string    `json:"volumeHandle,omitempty"`
 	Claim         string    `json:"claim,omitempty"` // "namespace/name"
 	CapacityBytes int64     `json:"capacityBytes"`
 	Status        string    `json:"status"`
@@ -75,6 +86,10 @@ type ClassSummary struct {
 	Default        bool   `json:"default"`
 	Claims         int    `json:"claims"`        // PVCs using the class
 	CapacityBytes  int64  `json:"capacityBytes"` // summed capacity of those PVCs
+	// Price per GiB-month and where it came from (see the PriceFrom* constants).
+	PricePerGiBMonth float64           `json:"pricePerGiBMonth"`
+	PriceSource      string            `json:"priceSource"`
+	Parameters       map[string]string `json:"parameters,omitempty"`
 }
 
 // SecurityFinding is one risk on the Security page.
@@ -183,11 +198,13 @@ type Graph struct {
 // "Node/<name>" for nodes.
 type GraphNode struct {
 	ID        string `json:"id"`
-	Kind      string `json:"kind"` // Ingress, Service, Deployment, StatefulSet, DaemonSet, Job, CronJob, Pod, PVC, Node
+	Kind      string `json:"kind"` // Ingress, Service, Deployment, StatefulSet, DaemonSet, Job, CronJob, ReplicaSet (orphaned), Controller (other owners), Pod, PVC, Node
 	Name      string `json:"name"`
 	Namespace string `json:"namespace,omitempty"`
 	Status    string `json:"status"`
 	Detail    string `json:"detail"`
+	// OwnerKind is the real kind behind a "Controller" node (e.g. Rollout).
+	OwnerKind string `json:"ownerKind,omitempty"`
 }
 
 // GraphEdge points from the routing or owning object to the one it routes to,
@@ -195,7 +212,22 @@ type GraphNode struct {
 type GraphEdge struct {
 	From string `json:"from"`
 	To   string `json:"to"`
+	// How the link was found: "owner" (ownerReferences), "endpoints"
+	// (EndpointSlices) or "selector" (labels, the fallback).
+	How string `json:"how,omitempty"`
+	// Endpoints on Service links: how many of the target's endpoints are ready,
+	// not ready and terminating.
+	Ready       int `json:"ready,omitempty"`
+	NotReady    int `json:"notReady,omitempty"`
+	Terminating int `json:"terminating,omitempty"`
 }
+
+// Association methods for GraphEdge.How and pod ownership.
+const (
+	HowOwner     = "owner"
+	HowEndpoints = "endpoints"
+	HowSelector  = "selector"
+)
 
 // NodeSummary is one node in the Map page's node view.
 type NodeSummary struct {
@@ -216,6 +248,22 @@ type NodeSummary struct {
 	MemoryRequestedBytes   int64     `json:"memoryRequestedBytes"`
 	PodsAllocatable        int64     `json:"podsAllocatable"`
 	Pods                   []NodePod `json:"pods"`
+	Placement              Placement `json:"placement"`
+	PodCount               int       `json:"podCount"` // live pods, also when Pods is omitted (?summary=true)
+}
+
+// Placement is where and on what a node runs, derived from well-known labels
+// (EKS managed node groups, Karpenter, Fargate) and the providerID.
+type Placement struct {
+	Zone         string `json:"zone,omitempty"`
+	Region       string `json:"region,omitempty"`
+	InstanceType string `json:"instanceType,omitempty"`
+	Arch         string `json:"arch,omitempty"`
+	OS           string `json:"os,omitempty"`
+	Pool         string `json:"pool,omitempty"`         // node group or Karpenter node pool name
+	PoolKind     string `json:"poolKind,omitempty"`     // "nodegroup", "karpenter", "fargate" or ""
+	CapacityType string `json:"capacityType,omitempty"` // "on-demand" or "spot"
+	ProviderID   string `json:"providerID,omitempty"`
 }
 
 // NodePod is a pod listed under its node.
@@ -225,4 +273,16 @@ type NodePod struct {
 	Phase     string `json:"phase"`
 	Status    string `json:"status"`
 	Workload  string `json:"workload,omitempty"` // "Kind/name" of the owning workload
+	Ready     bool   `json:"ready"`
+	Reason    string `json:"reason,omitempty"` // worst container waiting reason, e.g. CrashLoopBackOff
+}
+
+// LeakReport is the background leak scan: candidates are found with one cheap
+// Prometheus query, then only those are analysed in detail.
+type LeakReport struct {
+	GeneratedAt time.Time     `json:"generatedAt"`
+	Window      string        `json:"window"`
+	Findings    []LeakFinding `json:"findings"`
+	Candidates  int           `json:"candidates"`
+	Errors      []string      `json:"errors,omitempty"`
 }

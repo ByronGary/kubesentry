@@ -85,6 +85,9 @@ const RANK: Record<GraphKind, number> = {
   CronJob: 2,
   Deployment: 3,
   StatefulSet: 3,
+  // Orphaned ReplicaSets and other owners (Rollouts, operators) run pods like workloads do.
+  ReplicaSet: 3,
+  Controller: 3,
   DaemonSet: 3,
   Job: 3,
   Pod: 4,
