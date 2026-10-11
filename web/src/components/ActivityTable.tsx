@@ -1,14 +1,14 @@
 import { ago, formatDateTime } from '../format'
 import type { AuditEvent } from '../types'
 
-function target(e: AuditEvent): string {
+/** What an audit event acted on: "shop: pods/exec/web-0", or the request URI. */
+export function auditTarget(e: AuditEvent): string {
   const r = [e.resource, e.subresource].filter(Boolean).join('/')
   const n = e.name ? `${r}/${e.name}` : r
   return e.namespace ? `${e.namespace}: ${n || e.requestURI || ''}` : n || e.requestURI || ''
 }
 
-export function ActivityTable({ events, showNamespace = true }: { events: AuditEvent[]; showNamespace?: boolean }) {
-  void showNamespace
+export function ActivityTable({ events }: { events: AuditEvent[] }) {
   return (
     <div className="table-wrap" tabIndex={0}>
       <table>
@@ -31,7 +31,7 @@ export function ActivityTable({ events, showNamespace = true }: { events: AuditE
                 {e.impersonatedUser && <span className="muted"> as {e.impersonatedUser}</span>}
               </td>
               <td>{e.verb}</td>
-              <td className="id wrap">{target(e)}</td>
+              <td className="id wrap">{auditTarget(e)}</td>
               <td className={e.statusCode >= 400 ? 'bad' : undefined}>{e.statusCode || '-'}</td>
               <td>
                 {(e.tags ?? []).map((t) => (

@@ -21,7 +21,9 @@ export interface Info {
   /** The precomputed view the inventory pages are served from. */
   snapshot?: { version: number; builtAt: string; ageSeconds: number; stale: boolean; error?: string }
   auditStore?: { backend: 'memory' | 'postgres'; oldest?: string; newest?: string; events: number; retentionHours?: number; maxEvents?: number }
-  prometheus?: { source: 'flag' | 'discovered' | 'amp' | 'none'; url?: string; retentionHours?: number }
+  prometheus?: { source: 'flag' | 'discovered' | 'amp' | 'none'; url?: string; retentionHours?: number; flavor?: string; version?: string }
+  /** How many namespaces the caller can see (0 means RBAC grants none). */
+  namespaces?: number
   /** Sources that could not be read, with the reason (e.g. RBAC forbidden). */
   unavailable?: Record<string, string>
 }
@@ -191,6 +193,8 @@ export interface PodDiagnostics {
   containers: ContainerDiag[]
   volumes: VolumeState[]
   activity: AuditEvent[]
+  /** Go duration of the activity lookback (e.g. "168h0m0s"). */
+  activityWindow?: string
   warnings?: string[]
 }
 
@@ -425,6 +429,8 @@ export interface MapResponse {
   namespace: string
   namespaces: string[]
   graph: { nodes: GraphNode[]; edges: GraphEdge[] }
+  /** Live pods per namespace the caller can see, for choosing a default namespace. */
+  namespaceStats?: { name: string; pods: number; system: boolean }[]
 }
 
 export interface NodePod {
@@ -434,6 +440,7 @@ export interface NodePod {
   status: Status
   /** "Kind/name" of the owning workload */
   workload?: string
+  /** Absent when the pod has not reported a Ready condition. */
   ready?: boolean
   reason?: string
 }
@@ -469,7 +476,7 @@ export interface NodeSummary {
   memoryRequestedBytes: number
   podsAllocatable: number
   /** Omitted with ?summary=true; podCount stays. */
-  pods: NodePod[]
+  pods?: NodePod[]
   podCount?: number
   placement?: Placement
 }
@@ -483,8 +490,11 @@ export interface AgentStatus {
   node: string
   lastReport: string
   processes: number
+  /** Size of the last report as received (compressed when the agent gzips). */
   bytes: number
   stale: boolean
+  /** Processes cut by the server's per-node cap in the last report. */
+  dropped?: number
 }
 
 export interface NodesResponse {

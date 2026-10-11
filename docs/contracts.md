@@ -37,8 +37,9 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 | `GET /api/v1/nodes` | `?summary=true` omits `pods` (keeps `podCount`); items gain `placement` |
 | `GET /api/v1/nodes/{name}` | one node with its pods |
 | `GET /api/v1/storage` | claims, classes gain cost/price fields; `?limit=&continue=` pages claims |
-| `GET /api/v1/security` | `?view=summary` returns counts + the 200 most severe; `?limit=&continue=` pages findings |
-| `GET /api/v1/map` | edges gain `how`, endpoint counts; kinds gain `ReplicaSet`, `Controller` |
+| `GET /api/v1/security` | `?view=summary` returns counts + the 200 most severe; `?limit=&continue=` pages findings. Counts cover only what the caller can see |
+| `GET /api/v1/map` | edges gain `how`, endpoint counts; kinds gain `ReplicaSet`, `Controller`; response gains `namespaceStats` (live pods per visible namespace, with `system`) |
+| `GET /api/v1/pods/{ns}/{name}/diagnostics` | gains `activityWindow` (Go duration) |
 | `GET /api/v1/oom` | leaks come from the background `LeakReport` when the window matches its window |
 | `GET /api/v1/audit/events` | `?continue=` (opaque cursor); scope-filtered |
 | `GET /api/v1/agents` | new: `[{node, lastReport, processes, bytes, stale}]` |
@@ -49,6 +50,8 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 - A proxy user starting with `system:` is refused. IdP groups starting with `system:` are dropped (so no IdP group can become `system:masters`); groups produced by the admin's group map are kept as written.
 - Every identity, including the token and `none` identities, carries `system:authenticated`.
 - The UI learns the mode from `/info` `identity.source`. In proxy mode oauth2-proxy guards every path, so a 401 mid-session means the SSO session expired: the UI reloads the page to sign in again. In token mode a 401 shows the token prompt.
+
+Pod readiness: `ready` on pods and node pods is omitted when the pod has not reported a Ready condition (Go `*bool` with `omitempty`), so "unknown" is never shown as "not ready". `/info` `namespaces` is the number of namespaces the caller can see.
 
 Pagination: `limit` (default 200, max 1000) and an opaque `continue` token; the response carries `continue` when there is more.
 

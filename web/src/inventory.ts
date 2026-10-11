@@ -3,7 +3,7 @@
 import { podHref, workloadHref } from './findings'
 import { ago } from './format'
 import { isWorkloadKind } from './mapLayout'
-import type { SecurityFinding, SecuritySeverity, WorkloadSummary } from './types'
+import type { PodSummary, SecurityFinding, SecurityResponse, SecuritySeverity, WorkloadSummary } from './types'
 
 /** Case-insensitive substring match of a search box against any of the fields. */
 export function matches(q: string, ...fields: (string | undefined)[]): boolean {
@@ -36,6 +36,37 @@ export function readiness(w: WorkloadSummary, now: number = Date.now()): { main:
     return { main: w.schedule || '-', sub: w.suspended ? `suspended, ${last}` : last }
   }
   return { main: `${w.ready}/${w.desired}` }
+}
+
+/** Pods matching a search over name, namespace, node, workload, phase and reason. */
+export function filterPods(items: PodSummary[], q: string): PodSummary[] {
+  if (!q.trim()) return items
+  return items.filter((p) => matches(q, `${p.namespace}/${p.name}`, p.node, p.workload, p.reason, p.phase))
+}
+
+/** Waiting reasons that mean the pod is broken rather than starting. */
+const BAD_REASON = /BackOff|Err|Invalid|Failed|OOMKilled|Error|CreateContainer/i
+
+/** How serious a pod's reason is: crit for crash loops and image errors, warn otherwise. */
+export function reasonStatus(reason: string | undefined): 'crit' | 'warn' | undefined {
+  if (!reason) return undefined
+  return BAD_REASON.test(reason) ? 'crit' : 'warn'
+}
+
+/** Pods stuck waiting, by reason, most pods first: ["CrashLoopBackOff ×3", "ImagePullBackOff ×1"]. */
+export function waitingReasons(waiting: Record<string, number> | undefined): string[] {
+  return Object.entries(waiting ?? {})
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([r, n]) => `${r} ×${n}`)
+}
+
+/** "Deployment/web" into its parts; undefined when it is not "Kind/name". */
+export function splitWorkload(ref: string | undefined): { kind: string; name: string } | undefined {
+  if (!ref) return undefined
+  const i = ref.indexOf('/')
+  if (i <= 0 || i === ref.length - 1) return undefined
+  return { kind: ref.slice(0, i), name: ref.slice(i + 1) }
 }
 
 /** First image and how many more there are. */
@@ -94,6 +125,20 @@ export interface SecurityGroup {
 }
 
 const SEV_RANK: Record<SecuritySeverity, number> = { crit: 0, warn: 1, info: 2 }
+
+/**
+ * Whether a security response holds only part of the findings: the server says
+ * there is more, or its counts (which leave out system findings) exceed the
+ * non-system findings that came back. A server without summaries sends
+ * everything, so this is false for it.
+ */
+export function securityPartial(resp: Pick<SecurityResponse, 'continue' | 'counts' | 'findings'>): boolean {
+  if (resp.continue) return true
+  const total = Object.values(resp.counts ?? {}).reduce((s: number, n) => s + (n ?? 0), 0)
+  let shown = 0
+  for (const f of resp.findings ?? []) if (!f.system) shown++
+  return total > shown
+}
 
 /**
  * Severity filter: "" (the default) shows critical and warnings, plus info when

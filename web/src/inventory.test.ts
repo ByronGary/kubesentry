@@ -1,6 +1,20 @@
 import { describe, expect, it } from 'vitest'
-import { filterWorkloads, groupSecurity, imageSummary, matches, readiness, securitySubjectHref, shortImage, splitSubject } from './inventory'
-import type { SecurityFinding, WorkloadSummary } from './types'
+import {
+  filterPods,
+  filterWorkloads,
+  groupSecurity,
+  imageSummary,
+  matches,
+  readiness,
+  reasonStatus,
+  securityPartial,
+  securitySubjectHref,
+  shortImage,
+  splitSubject,
+  splitWorkload,
+  waitingReasons,
+} from './inventory'
+import type { PodSummary, SecurityFinding, WorkloadSummary } from './types'
 
 const wl = (kind: WorkloadSummary['kind'], namespace: string, name: string, extra: Partial<WorkloadSummary> = {}): WorkloadSummary => ({
   kind, namespace, name, status: 'ok', detail: '', desired: 3, ready: 2, updated: 3, available: 2, pods: 3, restarts: 0,
@@ -103,5 +117,48 @@ describe('groupSecurity', () => {
     expect(matches('WEB', 'shop/web')).toBe(true)
     expect(matches('  ', 'x')).toBe(true)
     expect(matches('nope', 'x', undefined)).toBe(false)
+  })
+})
+
+describe('securityPartial', () => {
+  const f = (system = false): SecurityFinding => ({ id: String(Math.random()), category: 'pod', check: 'x', severity: 'warn', title: 'x', subject: 's', subjectKind: 'Pod', detail: '', system })
+  it('is false when every counted finding came back (servers without summaries)', () => {
+    expect(securityPartial({ counts: { warn: 2 }, findings: [f(), f(), f(true)] })).toBe(false)
+    expect(securityPartial({ counts: {}, findings: [] })).toBe(false)
+  })
+  it('is true when the server says there is more or counts exceed what came back', () => {
+    expect(securityPartial({ counts: { warn: 2 }, findings: [f(), f()], continue: 'abc' })).toBe(true)
+    expect(securityPartial({ counts: { crit: 150, warn: 5000 }, findings: Array.from({ length: 200 }, () => f()) })).toBe(true)
+  })
+})
+
+describe('pods and workloads', () => {
+  const pod = (name: string, extra: Partial<PodSummary> = {}): PodSummary => ({ namespace: 'shop', name, phase: 'Running', containers: 1, restarts: 0, oomKilled: false, ...extra })
+  it('searches pods by name, node, owner and reason', () => {
+    const items = [pod('web-1', { node: 'ip-10-0-1-1', workload: 'Deployment/web' }), pod('db-0', { reason: 'CrashLoopBackOff', workload: 'StatefulSet/db' })]
+    expect(filterPods(items, 'crashloop').map((p) => p.name)).toEqual(['db-0'])
+    expect(filterPods(items, 'ip-10-0-1').map((p) => p.name)).toEqual(['web-1'])
+    expect(filterPods(items, 'statefulset/').map((p) => p.name)).toEqual(['db-0'])
+    expect(filterPods(items, '')).toBe(items)
+  })
+  it('rates reasons: crash loops and image errors are critical, the rest are warnings', () => {
+    expect(reasonStatus('CrashLoopBackOff')).toBe('crit')
+    expect(reasonStatus('ImagePullBackOff')).toBe('crit')
+    expect(reasonStatus('ErrImagePull')).toBe('crit')
+    expect(reasonStatus('CreateContainerConfigError')).toBe('crit')
+    expect(reasonStatus('ContainerCreating')).toBe('warn')
+    expect(reasonStatus('Unschedulable')).toBe('warn')
+    expect(reasonStatus(undefined)).toBeUndefined()
+  })
+  it('lists waiting reasons, most pods first', () => {
+    expect(waitingReasons({ ImagePullBackOff: 1, CrashLoopBackOff: 3, Zero: 0 })).toEqual(['CrashLoopBackOff ×3', 'ImagePullBackOff ×1'])
+    expect(waitingReasons(undefined)).toEqual([])
+  })
+  it('splits owner references', () => {
+    expect(splitWorkload('Deployment/web')).toEqual({ kind: 'Deployment', name: 'web' })
+    expect(splitWorkload('Rollout/a/b')).toEqual({ kind: 'Rollout', name: 'a/b' })
+    expect(splitWorkload('web')).toBeUndefined()
+    expect(splitWorkload('Deployment/')).toBeUndefined()
+    expect(splitWorkload(undefined)).toBeUndefined()
   })
 })
