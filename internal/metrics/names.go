@@ -1,0 +1,66 @@
+package metrics
+
+// The metrics kubesentry exposes (docs/contracts.md), registered on Default.
+// Use these variables rather than registering names elsewhere, and keep label
+// values bounded: route patterns, not paths; result enums, not errors.
+var (
+	// HTTPRequests counts API responses. Labels: route (the route name given
+	// to api.WithMetrics), code (HTTP status, e.g. "200").
+	HTTPRequests = NewCounterVec("kubesentry_http_requests_total", "HTTP requests by route and status code.", "route", "code")
+	// HTTPDuration observes request latency. Label: route.
+	HTTPDuration = NewHistogramVec("kubesentry_http_request_duration_seconds", "HTTP request latency by route.", DefBuckets, "route")
+	// Inflight is the number of requests being served.
+	Inflight = NewGauge("kubesentry_http_inflight", "HTTP requests currently being served.")
+	// HTTPCache counts response-cache lookups. Label: result ("hit", "miss", "coalesced", "skip").
+	HTTPCache = NewCounterVec("kubesentry_http_cache_total", "Response cache lookups by result.", "result")
+
+	// SnapshotBuild observes how long a view rebuild takes.
+	SnapshotBuild = NewHistogram("kubesentry_snapshot_build_seconds", "Time to build a snapshot view.",
+		[]float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60})
+	// SnapshotAge is the age of the view being served; set it with SetFunc.
+	SnapshotAge = NewGauge("kubesentry_snapshot_age_seconds", "Age of the snapshot view being served.")
+	// SnapshotVersion is the version of the view being served.
+	SnapshotVersion = NewGauge("kubesentry_snapshot_version", "Version of the snapshot view being served.")
+	// InformerObjects counts cached objects. Label: resource (e.g. "pods").
+	InformerObjects = NewGaugeVec("kubesentry_informer_objects", "Objects held by the informer cache by resource.", "resource")
+	// KubeRequests counts requests to the Kubernetes API. Labels: verb, resource, code.
+	KubeRequests = NewCounterVec("kubesentry_kube_requests_total", "Kubernetes API requests by verb, resource and status code.", "verb", "resource", "code")
+
+	// AuthzReviews counts SubjectAccessReviews. Label: result ("allowed", "denied", "error").
+	AuthzReviews = NewCounterVec("kubesentry_authz_reviews_total", "SubjectAccessReviews by result.", "result")
+	// AuthzCache counts authorization cache lookups. Label: result ("hit", "miss", "coalesced").
+	AuthzCache = NewCounterVec("kubesentry_authz_cache_total", "Authorization cache lookups by result.", "result")
+
+	// PromQuery observes Prometheus query latency. Label: kind (e.g. "range", "instant").
+	PromQuery = NewHistogramVec("kubesentry_prometheus_query_seconds", "Prometheus query latency by kind.", DefBuckets, "kind")
+	// PromCache counts Prometheus result-cache lookups. Label: result.
+	PromCache = NewCounterVec("kubesentry_prometheus_cache_total", "Prometheus result cache lookups by result.", "result")
+
+	// AuditIngested counts stored audit events. Label: source ("webhook", "file", "cloudwatch", ...).
+	AuditIngested = NewCounterVec("kubesentry_audit_ingested_total", "Audit events ingested by source.", "source")
+	// AuditQueueDepth is the number of audit events waiting to be written.
+	AuditQueueDepth = NewGauge("kubesentry_audit_queue_depth", "Audit events queued for the store.")
+	// AuditStoreErrors counts failed audit store writes.
+	AuditStoreErrors = NewCounter("kubesentry_audit_store_errors_total", "Failed audit store operations.")
+	// CloudWatchLag is how far the CloudWatch reader is behind.
+	CloudWatchLag = NewGauge("kubesentry_cloudwatch_lag_seconds", "Delay between the newest CloudWatch audit event read and now.")
+
+	// AgentReports counts process agent reports. Label: code (HTTP status).
+	AgentReports = NewCounterVec("kubesentry_agent_reports_total", "Process agent reports by status code.", "code")
+	// AgentNodesReporting is the number of nodes with a fresh agent report.
+	AgentNodesReporting = NewGauge("kubesentry_agent_nodes_reporting", "Nodes whose process agent reported recently.")
+)
+
+func init() { Default.RegisterRuntime() }
+
+// AuthzObserver feeds AuthzReviews and AuthzCache. It satisfies
+// auth.Observer, for auth.SARAuthorizer.Metrics.
+var AuthzObserver authzObserver
+
+type authzObserver struct{}
+
+// ObserveReview counts one SubjectAccessReview.
+func (authzObserver) ObserveReview(result string) { AuthzReviews.With(result).Inc() }
+
+// ObserveCache counts one authorization cache lookup.
+func (authzObserver) ObserveCache(result string) { AuthzCache.With(result).Inc() }
