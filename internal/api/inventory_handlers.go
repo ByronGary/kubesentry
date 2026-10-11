@@ -487,9 +487,12 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 	}
 	sc := s.scope(r, auth.ViewNamespace)
 	namespaces := make([]string, 0, len(v.NamespacesWithPods))
+	stats := make([]namespaceStat, 0, len(v.NamespacesWithPods))
+	a := v.Assoc()
 	for _, n := range v.NamespacesWithPods {
 		if sc.Has(n) {
 			namespaces = append(namespaces, n)
+			stats = append(stats, namespaceStat{Name: n, Pods: v.LivePods[n], System: a.IsSystem(n)})
 		}
 	}
 	switch {
@@ -517,7 +520,7 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 		}
 		g = detectors.Graph{Nodes: nodes, Edges: g.Edges}
 	}
-	writeJSON(w, http.StatusOK, mapResponse{Namespace: ns, Namespaces: namespaces, Graph: g})
+	writeJSON(w, http.StatusOK, mapResponse{Namespace: ns, Namespaces: namespaces, Graph: g, NamespaceStats: stats})
 }
 
 // defaultNamespace is the non-system namespace among candidates with the most

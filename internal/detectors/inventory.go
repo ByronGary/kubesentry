@@ -272,8 +272,9 @@ type NodePod struct {
 	Phase     string `json:"phase"`
 	Status    string `json:"status"`
 	Workload  string `json:"workload,omitempty"` // "Kind/name" of the owning workload
-	Ready     bool   `json:"ready"`
-	Reason    string `json:"reason,omitempty"` // worst container waiting reason, e.g. CrashLoopBackOff
+	// Ready is the pod's Ready condition; nil (omitted) until it reports one.
+	Ready  *bool  `json:"ready,omitempty"`
+	Reason string `json:"reason,omitempty"` // worst container waiting reason, e.g. CrashLoopBackOff
 }
 
 // LeakReport is the background leak scan: candidates are found with one cheap

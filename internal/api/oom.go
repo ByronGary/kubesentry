@@ -29,7 +29,9 @@ func oomEvents(v *snapshot.View) []detectors.OOMEvent {
 }
 
 // oom lists OOM kills within the window and containers whose memory climbs
-// steadily, in the caller's namespaces.
+// steadily, in the caller's namespaces. Leaks come from the background scan
+// when the window is the scan's own; any other window queries Prometheus for
+// every container now, which is costly on large clusters.
 func (s *Server) oom(w http.ResponseWriter, r *http.Request) {
 	window, err := durationParam(r, "window", 24*time.Hour, 10*time.Minute, 7*24*time.Hour)
 	if err != nil {
@@ -49,8 +51,27 @@ func (s *Server) oom(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if s.Metrics != nil {
-		leaks, err := s.findLeaks(r.Context(), window, resp.Events, sc)
+	m := s.metrics()
+	if lr, ok := m.(leakReporter); ok {
+		if rep, win, ok := lr.LeakReport(); ok && win == window && !rep.GeneratedAt.IsZero() {
+			resp.MetricsAvailable = true
+			for _, f := range rep.Findings {
+				if sc.Has(f.Namespace) {
+					resp.Leaks = append(resp.Leaks, f)
+				}
+			}
+			for _, msg := range rep.Warnings {
+				resp.Warnings = append(resp.Warnings, "leak scan: "+msg)
+			}
+			if len(rep.Errors) > 0 {
+				resp.Warnings = append(resp.Warnings, fmt.Sprintf("leak scan of %s had errors; findings may be incomplete", rep.LastAttempt.UTC().Format(time.RFC3339)))
+			}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	}
+	if m != nil {
+		leaks, err := s.findLeaks(r.Context(), m, v, window, resp.Events, sc)
 		if err != nil {
 			slog.Error("leak detection failed", "err", err)
 			resp.Warnings = append(resp.Warnings, "leak detection unavailable: could not query Prometheus")
@@ -63,8 +84,9 @@ func (s *Server) oom(w http.ResponseWriter, r *http.Request) {
 }
 
 // findLeaks queries every container's memory over the window and analyses
-// the series in the caller's namespaces.
-func (s *Server) findLeaks(ctx context.Context, window time.Duration, events []detectors.OOMEvent, sc auth.Scope) ([]detectors.LeakFinding, error) {
+// the series in the caller's namespaces. Limits come from the pod specs
+// unless the source reports them (kube-state-metrics).
+func (s *Server) findLeaks(ctx context.Context, m MetricsSource, v *snapshot.View, window time.Duration, events []detectors.OOMEvent, sc auth.Scope) ([]detectors.LeakFinding, error) {
 	// ~240 points per series keeps queries cheap and well under Prometheus'
 	// 11,000-point limit, while still giving slow leaks enough samples.
 	step := window / 240
@@ -73,14 +95,15 @@ func (s *Server) findLeaks(ctx context.Context, window time.Duration, events []d
 	}
 	step = step.Round(time.Second)
 
-	series, err := s.Metrics.ContainerMemory(ctx, window, step)
+	series, err := m.ContainerMemory(ctx, window, step)
 	if err != nil {
 		return nil, fmt.Errorf("memory series: %w", err)
 	}
-	limits, err := s.Metrics.ContainerMemoryLimits(ctx)
+	ksm, err := m.ContainerMemoryLimits(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("memory limits: %w", err)
 	}
+	limits := podLimits(v.Inv.Pods, ksm)
 
 	oomByKey := make(map[model.ContainerKey]detectors.OOMEvent, len(events))
 	for _, e := range events {

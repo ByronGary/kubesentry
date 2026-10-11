@@ -145,10 +145,10 @@ func TestWorkloadReadinessAndWaiting(t *testing.T) {
 	}
 
 	ps := PodSummaryOf(&inv.Pods[1], Associate(inv, p))
-	if ps.Ready || ps.Reason != "CrashLoopBackOff" || ps.Workload != "Deployment/web" || ps.Node != "n1" {
+	if ps.Ready == nil || *ps.Ready || ps.Reason != "CrashLoopBackOff" || ps.Workload != "Deployment/web" || ps.Node != "n1" {
 		t.Errorf("pod summary = %+v", ps)
 	}
-	if ps := PodSummaryOf(&model.Pod{Phase: "Pending", Unschedulable: "no nodes"}, nil); ps.Reason != "Unschedulable" || ps.Workload != "" {
+	if ps := PodSummaryOf(&model.Pod{Phase: "Pending", Unschedulable: "no nodes"}, nil); ps.Reason != "Unschedulable" || ps.Workload != "" || ps.Ready != nil {
 		t.Errorf("pending pod summary = %+v", ps)
 	}
 }

@@ -156,10 +156,43 @@ func TestDemoInventoryTellsTheStory(t *testing.T) {
 	}
 	h := srv.Handler()
 
-	var info struct{ Inventory, Certs bool }
+	var info struct {
+		Inventory, Certs bool
+		Cluster          struct{ Name, Version, Platform, Region string }
+		Namespaces       int
+		Snapshot         *struct{ Version int }
+	}
 	getJSON(t, h, "/api/v1/info", &info)
-	if !info.Inventory || !info.Certs {
+	if !info.Inventory || !info.Certs || info.Snapshot == nil || info.Namespaces != 6 {
 		t.Errorf("info = %+v", info)
+	}
+	if c := info.Cluster; c.Name != "shop-prod" || c.Platform != "eks" || c.Region != "us-east-1" || !strings.Contains(c.Version, "-eks-") {
+		t.Errorf("cluster = %+v", c)
+	}
+
+	// Readiness shows for pods that report it.
+	var pods struct{ Items []detectors.PodSummary }
+	getJSON(t, h, "/api/v1/pods?namespace=prod&limit=1000", &pods)
+	ready := map[string]string{}
+	for _, p := range pods.Items {
+		switch {
+		case p.Ready == nil:
+			ready[p.Name] = "unknown"
+		case *p.Ready:
+			ready[p.Name] = "ready"
+		default:
+			ready[p.Name] = "not ready"
+		}
+	}
+	if ready["redis-0"] != "ready" || ready["recommendations-6d5f7c8b9-zt4qx"] != "not ready" {
+		t.Errorf("readiness = %v", ready)
+	}
+
+	// The agents page lists every node that runs an agent: not Fargate.
+	var agents []struct{ Node string }
+	getJSON(t, h, "/api/v1/agents", &agents)
+	if len(agents) != 3 {
+		t.Errorf("agents = %+v", agents)
 	}
 
 	var wl struct {

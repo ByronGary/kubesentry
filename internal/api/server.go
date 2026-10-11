@@ -86,8 +86,9 @@ type Server struct {
 	// ClusterInfo overrides what /info says about the cluster: a non-empty
 	// Name always wins, the rest fills in when the view knows nothing.
 	ClusterInfo model.ClusterInfo
-	// Prometheus describes the metrics source for /info; nil derives it from Metrics.
-	Prometheus *PrometheusInfo
+	// PrometheusInfo describes the metrics source for /info (it may change as
+	// discovery finds one); nil derives it from Metrics.
+	PrometheusInfo func() *PrometheusInfo
 	// Unavailable, if set, adds live unreadable sources (the informer cache's)
 	// to those the view recorded, for /info and /readyz.
 	Unavailable func() map[string]string
@@ -130,6 +131,8 @@ type PrometheusInfo struct {
 	Source         string  `json:"source"` // flag, discovered, amp or none
 	URL            string  `json:"url,omitempty"`
 	RetentionHours float64 `json:"retentionHours,omitempty"`
+	Flavor         string  `json:"flavor,omitempty"` // prometheus, thanos, mimir, victoriametrics, amp, unknown
+	Version        string  `json:"version,omitempty"`
 }
 
 func (s *Server) now() time.Time {
@@ -290,6 +293,9 @@ func (s *Server) apiRoutes() http.Handler {
 	}
 	if s.Processes != nil {
 		s.route(mux, "GET /api/v1/pods/{namespace}/{name}/processes", "pod_processes", t, s.podProcesses)
+		if _, ok := s.Processes.(agentLister); ok {
+			s.route(mux, "GET /api/v1/agents", "agents", t, s.agents)
+		}
 	}
 	if s.hasInventory() {
 		s.route(mux, "GET /api/v1/workloads", "workloads", t, s.workloads)

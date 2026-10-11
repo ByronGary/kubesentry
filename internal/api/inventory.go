@@ -70,6 +70,15 @@ type mapResponse struct {
 	Namespace  string          `json:"namespace"`
 	Namespaces []string        `json:"namespaces"` // every namespace with pods, for the picker
 	Graph      detectors.Graph `json:"graph"`
+	// NamespaceStats has the live pods of each namespace in Namespaces, for
+	// choosing a default.
+	NamespaceStats []namespaceStat `json:"namespaceStats"`
+}
+
+type namespaceStat struct {
+	Name   string `json:"name"`
+	Pods   int    `json:"pods"`
+	System bool   `json:"system"`
 }
 
 // GET /api/v1/nodes

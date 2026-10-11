@@ -145,6 +145,7 @@ type podDiagnosticsResponse struct {
 	Containers       []containerDiag         `json:"containers"`
 	Volumes          []detectors.VolumeState `json:"volumes"`
 	Activity         []audit.Event           `json:"activity"`
+	ActivityWindow   string                  `json:"activityWindow"` // Go duration of the activity look-back
 	Warnings         []string                `json:"warnings,omitempty"`
 }
 
@@ -190,17 +191,19 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var series []model.ContainerSeries
-	var limits map[model.ContainerKey]float64
-	if s.Metrics != nil {
+	limits := podLimits([]model.Pod{*pod}, nil)
+	if m := s.metrics(); m != nil {
 		step := window / 120
 		if step < 30*time.Second {
 			step = 30 * time.Second
 		}
-		series, limits, err = s.Metrics.PodMemory(ctx, ns, name, window, step.Round(time.Second))
+		var ksm map[model.ContainerKey]float64
+		series, ksm, err = m.PodMemory(ctx, ns, name, window, step.Round(time.Second))
 		if err != nil {
 			resp.Warnings = append(resp.Warnings, "Memory history is unavailable: could not query Prometheus.")
 		} else {
 			resp.MetricsAvailable = true
+			limits = podLimits([]model.Pod{*pod}, ksm)
 		}
 	}
 
@@ -237,6 +240,7 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	policy := v.Policy
+	resp.ActivityWindow = policy.Thresholds.ActivityWindow.String()
 	var execCount, deniedCount int
 	if s.Audit != nil {
 		if allowed(ctx, s.Authorizer, auth.ViewAudit, ns) {

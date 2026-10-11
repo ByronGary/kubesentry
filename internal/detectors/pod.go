@@ -475,10 +475,20 @@ type PodSummary struct {
 	Containers int    `json:"containers"`
 	Restarts   int32  `json:"restarts"`
 	OOMKilled  bool   `json:"oomKilled"`
-	Ready      bool   `json:"ready"`
+	Ready      *bool  `json:"ready,omitempty"`    // nil until the pod reports a Ready condition
 	Reason     string `json:"reason,omitempty"`   // see PodReason
 	Node       string `json:"node,omitempty"`     //
 	Workload   string `json:"workload,omitempty"` // "Kind/name" of the owner
+}
+
+// ReadyOf is the pod's Ready condition, or nil when it has not reported one
+// (so "unknown" never reads as "not ready").
+func ReadyOf(p *model.Pod) *bool {
+	if !readinessKnown(p) {
+		return nil
+	}
+	v := p.Ready
+	return &v
 }
 
 // PodSummaryOf summarises one pod for the pods list. Containers, Restarts and
@@ -487,7 +497,7 @@ type PodSummary struct {
 func PodSummaryOf(p *model.Pod, a *Assoc) PodSummary {
 	s := PodSummary{
 		Namespace: p.Namespace, Name: p.Name, Phase: p.Phase,
-		Ready: p.Ready, Reason: PodReason(p), Node: p.NodeName,
+		Ready: ReadyOf(p), Reason: PodReason(p), Node: p.NodeName,
 	}
 	s.Restarts, s.Containers = appContainers(p)
 	for _, c := range p.Containers {

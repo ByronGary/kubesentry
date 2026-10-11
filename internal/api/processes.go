@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -13,10 +12,18 @@ import (
 )
 
 // ProcessBackend stores reports from node agents and answers per-pod queries.
+// procmon.Store implements it, and agentLister and storeOptions too.
 type ProcessBackend interface {
 	Update(r procmon.Report)
 	ForPod(uid string) (procmon.PodView, bool)
 }
+
+type (
+	// agentLister lists the node agents; with it, GET /api/v1/agents exists.
+	agentLister interface{ Agents() []procmon.AgentStatus }
+	// storeOptions tells how old process data is stale.
+	storeOptions interface{ Options() procmon.StoreOptions }
+)
 
 const (
 	maxAgentBody      = 8 << 20
@@ -25,21 +32,24 @@ const (
 	processStaleAfter = 2 * time.Minute
 )
 
-// agentReport receives a node snapshot. Like the audit webhook it fails closed
-// without a token: anyone who could post here could invent process data.
+// agentReport receives a node snapshot, plain or gzipped. Like the audit
+// webhook it fails closed without a token: anyone who could post here could
+// invent process data.
 func (s *Server) agentReport(w http.ResponseWriter, r *http.Request) {
 	if s.AgentToken == "" {
 		writeError(w, http.StatusServiceUnavailable, "agent endpoint disabled: no agent token configured")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxAgentBody)
-	var rep procmon.Report
-	if err := decodeJSON(r, &rep); err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			writeError(w, http.StatusRequestEntityTooLarge, "report too large")
-			return
-		}
+	rep, err := procmon.DecodeReport(r, maxAgentBody)
+	switch {
+	case errors.Is(err, procmon.ErrTooLarge):
+		writeError(w, http.StatusRequestEntityTooLarge, "report too large")
+		return
+	case errors.Is(err, procmon.ErrUnsupportedEncoding):
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported content encoding: send plain or gzip JSON")
+		return
+	case err != nil:
 		writeError(w, http.StatusBadRequest, "invalid report")
 		return
 	}
@@ -99,7 +109,11 @@ func (s *Server) podProcesses(w http.ResponseWriter, r *http.Request) {
 	resp.Available, resp.Node = true, view.Node
 	obs := view.ObservedAt
 	resp.ObservedAt = &obs
-	resp.Stale = s.now().Sub(obs) > processStaleAfter
+	staleAfter := processStaleAfter
+	if o, ok := s.Processes.(storeOptions); ok {
+		staleAfter = o.Options().StaleAfter
+	}
+	resp.Stale = s.now().Sub(obs) > staleAfter
 	for _, p := range view.Processes {
 		c := names[p.ContainerID]
 		switch {
@@ -117,6 +131,20 @@ func (s *Server) podProcesses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// agents lists every node agent with when it last reported and whether its
+// data is stale. It needs the cluster-wide ViewAgents capability.
+func (s *Server) agents(w http.ResponseWriter, r *http.Request) {
+	if !s.can(r, auth.ViewAgents) {
+		writeError(w, http.StatusForbidden, "you may not list the node agents")
+		return
+	}
+	out := s.Processes.(agentLister).Agents()
+	if out == nil {
+		out = []procmon.AgentStatus{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // countReports feeds kubesentry_agent_reports_total{code}, including
 // reports the token guard refuses.
 func countReports(next http.Handler) http.Handler {
@@ -125,8 +153,4 @@ func countReports(next http.Handler) http.Handler {
 		next.ServeHTTP(sw, r)
 		metrics.AgentReports.With(strconv.Itoa(sw.code())).Inc()
 	})
-}
-
-func decodeJSON(r *http.Request, v any) error {
-	return json.NewDecoder(r.Body).Decode(v)
 }

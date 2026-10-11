@@ -283,10 +283,28 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	}
 	var sec securityResponse
 	getAs(t, h, "alice", "/api/v1/security?limit=1000", &sec)
+	own := map[string]int{"crit": 0, "warn": 0, "info": 0}
 	for _, f := range sec.Findings {
 		if f.Namespace == "" {
 			t.Errorf("alice sees a cluster-scoped finding: %+v", f)
 		}
+		if !f.System {
+			own[f.Severity]++
+		}
+	}
+	// The summary counts only what alice can see, on every view.
+	var summary, all securityResponse
+	getAs(t, h, "alice", "/api/v1/security?view=summary", &summary)
+	unrestricted := tenantServer(t)
+	unrestricted.Authenticator = nil
+	getAs(t, unrestricted.Handler(), "", "/api/v1/security?view=summary", &all)
+	for sev, n := range own {
+		if summary.Counts[sev] != n || sec.Counts[sev] != n {
+			t.Errorf("alice's %s count = %d (summary) / %d (list), her findings hold %d", sev, summary.Counts[sev], sec.Counts[sev], n)
+		}
+	}
+	if all.Counts["crit"] <= summary.Counts["crit"] || all.Counts["warn"] <= summary.Counts["warn"] {
+		t.Errorf("unrestricted counts %v should exceed alice's %v", all.Counts, summary.Counts)
 	}
 	var certs certificatesResponse
 	getAs(t, h, "alice", "/api/v1/certificates", &certs)

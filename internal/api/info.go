@@ -21,14 +21,16 @@ type infoResponse struct {
 	Inventory bool `json:"inventory"` // map, workloads, nodes, storage and security routes exist
 	Certs     bool `json:"certs"`     // the certificates route exists (cert-manager may still be absent)
 
-	Identity     *infoIdentity     `json:"identity,omitempty"`
-	SignOutURL   string            `json:"signOutURL,omitempty"`
-	Capabilities map[string]bool   `json:"capabilities,omitempty"`
-	Cluster      *infoCluster      `json:"cluster,omitempty"`
-	Snapshot     *infoSnapshot     `json:"snapshot,omitempty"`
-	AuditStore   *infoAuditStore   `json:"auditStore,omitempty"`
-	Prometheus   *PrometheusInfo   `json:"prometheus,omitempty"`
-	Unavailable  map[string]string `json:"unavailable,omitempty"`
+	Identity     *infoIdentity   `json:"identity,omitempty"`
+	SignOutURL   string          `json:"signOutURL,omitempty"`
+	Capabilities map[string]bool `json:"capabilities,omitempty"`
+	Cluster      *infoCluster    `json:"cluster,omitempty"`
+	Snapshot     *infoSnapshot   `json:"snapshot,omitempty"`
+	AuditStore   *infoAuditStore `json:"auditStore,omitempty"`
+	Prometheus   *PrometheusInfo `json:"prometheus,omitempty"`
+	// Namespaces is how many namespaces the caller can see (ViewNamespace).
+	Namespaces  *int              `json:"namespaces,omitempty"`
+	Unavailable map[string]string `json:"unavailable,omitempty"`
 }
 
 type infoIdentity struct {
@@ -72,7 +74,7 @@ const infoViewWait = 5 * time.Second
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := infoResponse{
-		Demo: s.Demo, Metrics: s.Metrics != nil, Audit: s.Audit != nil, Processes: s.Processes != nil,
+		Demo: s.Demo, Metrics: s.metrics() != nil, Audit: s.Audit != nil, Processes: s.Processes != nil,
 		Inventory: s.hasInventory(), Certs: s.hasCerts(), SignOutURL: s.SignOutURL,
 	}
 
@@ -93,6 +95,21 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.Identity = &infoIdentity{User: id.User, Groups: groups, Source: id.Source}
 		resp.Capabilities = s.capabilities(ctx, id)
+		if sc := s.scope(r, auth.ViewNamespace); !sc.All {
+			n := 0
+			for _, held := range sc.Namespaces {
+				if held {
+					n++
+				}
+			}
+			resp.Namespaces = &n
+		} else if v != nil {
+			n := len(v.Inv.Namespaces)
+			if n == 0 {
+				n = len(v.Assoc().Namespaces()) // namespaces unreadable: those holding objects
+			}
+			resp.Namespaces = &n
+		}
 	}
 
 	ci := s.ClusterInfo
@@ -120,13 +137,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp.Prometheus = s.Prometheus
-	if resp.Prometheus == nil {
-		resp.Prometheus = &PrometheusInfo{Source: "none"}
-		if s.Metrics != nil {
-			resp.Prometheus.Source = "flag"
-		}
-	}
+	resp.Prometheus = s.prometheusInfo()
 
 	var fromView map[string]string
 	if v != nil {
