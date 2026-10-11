@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -194,6 +195,66 @@ func TestHandMadeViewBuildsIndexesLazily(t *testing.T) {
 	stale := withStale(v, errors.New("x"))
 	if stale.Assoc() != v.Assoc() || !stale.Stale {
 		t.Error("withStale should share the indexes")
+	}
+}
+
+func TestHandMadeViewIsSafeUnderConcurrency(t *testing.T) {
+	v := &View{Inv: smallInventory(), Policy: detectors.DefaultPolicy()}
+	var wg sync.WaitGroup
+	assocs := make([]*detectors.Assoc, 16)
+	memos := make([]any, 16)
+	builds := 0
+	var mu sync.Mutex
+	for i := range assocs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assocs[i] = v.Assoc()
+			v.Topology("a")
+			memos[i] = v.Memo("k", func() any {
+				mu.Lock()
+				builds++
+				mu.Unlock()
+				return new(int)
+			})
+		}()
+	}
+	wg.Wait()
+	for i := range assocs {
+		if assocs[i] != assocs[0] || memos[i] != memos[0] {
+			t.Fatal("concurrent first callers must share one set of extras")
+		}
+	}
+	if builds != 1 {
+		t.Errorf("Memo built %d times, want 1", builds)
+	}
+	if got := withStale(v, errors.New("x")).Memo("k", func() any { return nil }); got != memos[0] {
+		t.Error("a stale copy shares memoised values")
+	}
+}
+
+// withStale copies a View field by field; this catches a field added to View
+// but not to that list.
+func TestWithStaleCopiesEveryField(t *testing.T) {
+	inv, _ := synthInventory(sizeSmall)
+	v := Build(inv, detectors.DefaultPolicy(), synthNow)
+	s := withStale(v, errors.New("boom"))
+	rv, rs := reflect.ValueOf(v).Elem(), reflect.ValueOf(s).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		f := rv.Type().Field(i)
+		switch {
+		case !f.IsExported():
+			continue
+		case f.Name == "Stale" || f.Name == "Err":
+			continue
+		case rv.Field(i).IsZero():
+			t.Errorf("field %s is zero in the built view; the test needs data there", f.Name)
+		case !reflect.DeepEqual(rv.Field(i).Interface(), rs.Field(i).Interface()):
+			t.Errorf("withStale does not copy %s", f.Name)
+		}
+	}
+	if !s.Stale || s.Err != "boom" || v.Stale {
+		t.Errorf("stale = %v %q, original stale = %v", s.Stale, s.Err, v.Stale)
 	}
 }
 
