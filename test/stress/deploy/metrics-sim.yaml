@@ -1,0 +1,70 @@
+# Synthetic container_memory_working_set_bytes for pods on KWOK fake nodes,
+# scraped by the kube-prometheus-stack Prometheus (ServiceMonitor label
+# release: kps). honorLabels keeps the exporter's namespace/pod/container
+# labels. Scale with: kubectl -n stress-load set env deploy/metrics-sim SERIES=10000
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-sim
+  namespace: stress-load
+  labels: {app: metrics-sim, kubesentry.io/stress: "true", kubesentry.io/stress-load: "true"}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: metrics-sim}
+  template:
+    metadata:
+      labels: {app: metrics-sim, kubesentry.io/stress: "true", kubesentry.io/stress-load: "true"}
+    spec:
+      serviceAccountName: stress-runner
+      nodeSelector: {kubesentry.io/role: loadgen}
+      tolerations:
+        - {key: kubesentry.io/loadgen, operator: Exists, effect: NoSchedule}
+      securityContext: {runAsUser: 0}
+      containers:
+        - name: metrics-sim
+          image: kubesentry-stress:dev
+          imagePullPolicy: Never
+          args: ["metrics-sim", "--listen=:9100", "--truth=/results/metrics-sim-truth.json"]
+          env:
+            - {name: SERIES, value: "5000"}
+          ports:
+            - {name: metrics, containerPort: 9100}
+          readinessProbe:
+            httpGet: {path: /healthz, port: metrics}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: results, mountPath: /results}
+      volumes:
+        - name: results
+          hostPath: {path: /var/lib/kubesentry-stress, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-sim
+  namespace: stress-load
+  labels: {app: metrics-sim, kubesentry.io/stress: "true"}
+spec:
+  selector: {app: metrics-sim}
+  ports:
+    - {name: metrics, port: 9100, targetPort: metrics}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: metrics-sim
+  namespace: stress-load
+  labels: {release: kps, kubesentry.io/stress: "true"}
+spec:
+  selector:
+    matchLabels: {app: metrics-sim}
+  namespaceSelector:
+    matchNames: [stress-load]
+  endpoints:
+    - port: metrics
+      interval: 30s
+      scrapeTimeout: 25s
+      honorLabels: true

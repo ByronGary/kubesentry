@@ -331,9 +331,9 @@ def summarize(d):
             for (name, sev, state, _, _), v in rows:
                 out.append(f"| {name} | {sev} | {state} | {v['peak']} | {v['seen']}/{len(snaps)} | {v['first'][11:19]} / {v['last'][11:19]} | {v['where'] or ''} |")
         else:
-            out += ["| Alert | Severity | Peak count | Why it is an artifact |", "|---|---|---:|---|"]
+            out += ["| Alert | Severity | State | Peak count | Why it is an artifact |", "|---|---|---|---:|---|"]
             for (name, sev, state, _, why), v in rows:
-                out.append(f"| {name} | {sev} | {v['peak']} | {why} |")
+                out.append(f"| {name} | {sev} | {state} | {v['peak']} | {why} |")
         out.append("")
 
     # Health metrics: worst value seen

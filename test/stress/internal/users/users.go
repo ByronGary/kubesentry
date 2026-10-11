@@ -1,0 +1,311 @@
+package users
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/ByronGary/kubesentry/test/stress/internal/hist"
+	"github.com/ByronGary/kubesentry/test/stress/internal/ks"
+	"github.com/ByronGary/kubesentry/test/stress/internal/out"
+)
+
+// Options configure a run.
+type Options struct {
+	Client      *ks.Client
+	Identities  func(i int) ks.Identity // identity of virtual user i
+	Stages      []Stage
+	RampUp      time.Duration // spread new users of a stage over this
+	ThinkMin    time.Duration
+	ThinkMax    time.Duration
+	PageTimeout time.Duration // stop waiting for a page's first load
+	ReqTimeout  time.Duration
+	Targets     *Targets
+	Pages       []Page
+	// Abort when, for AbortAfter, every 30s window has p99 > AbortP99 or an
+	// error rate > AbortErrRate (or requests stuck longer than AbortP99).
+	AbortP99     time.Duration
+	AbortErrRate float64
+	AbortAfter   time.Duration
+	Seed         uint64
+}
+
+// StageResult is one stage's numbers.
+type StageResult struct {
+	Users     int                `json:"users"`
+	Started   time.Time          `json:"started"`
+	Seconds   float64            `json:"seconds"`
+	Routes    []hist.RouteReport `json:"routes"`
+	PageLoads []hist.RouteReport `json:"pageLoads"`
+	Aborted   bool               `json:"aborted"`
+	Reason    string             `json:"reason,omitempty"`
+	Requests  int64              `json:"requests"`
+	RPS       float64            `json:"rps"`
+}
+
+// Result is users.json.
+type Result struct {
+	Started  time.Time     `json:"started"`
+	Finished time.Time     `json:"finished"`
+	Options  OptionsDoc    `json:"options"`
+	Stages   []StageResult `json:"stages"`
+	Series   []hist.Bucket `json:"series"`
+	Aborted  bool          `json:"aborted"`
+	Reason   string        `json:"reason,omitempty"`
+	Targets  int           `json:"targetPods"`
+}
+
+// OptionsDoc records the options in results.
+type OptionsDoc struct {
+	Stages       string  `json:"stages"`
+	RampUp       string  `json:"rampUp"`
+	Think        string  `json:"think"`
+	ReqTimeout   string  `json:"requestTimeout"`
+	PageTimeout  string  `json:"pageTimeout"`
+	AbortP99     string  `json:"abortP99"`
+	AbortErrRate float64 `json:"abortErrorRate"`
+	AbortAfter   string  `json:"abortAfter"`
+}
+
+type runner struct {
+	o        Options
+	stage    atomic.Pointer[hist.Recorder]
+	pages    atomic.Pointer[hist.Recorder]
+	all      *hist.Recorder
+	active   atomic.Int64
+	inflight sync.Map // *int64 start nanos
+}
+
+// Run executes the ramp and returns per-stage results.
+func Run(ctx context.Context, o Options) *Result {
+	r := &runner{o: o, all: hist.NewRecorder()}
+	res := &Result{Started: time.Now().UTC(), Targets: len(o.Targets.Pods), Options: OptionsDoc{
+		RampUp: o.RampUp.String(), Think: o.ThinkMin.String() + "-" + o.ThinkMax.String(), ReqTimeout: o.ReqTimeout.String(),
+		PageTimeout: o.PageTimeout.String(), AbortP99: o.AbortP99.String(), AbortErrRate: o.AbortErrRate, AbortAfter: o.AbortAfter.String(),
+	}}
+	for i, s := range o.Stages {
+		if i > 0 {
+			res.Options.Stages += ","
+		}
+		res.Options.Stages += fmt.Sprintf("%d:%s", s.Users, s.Hold)
+	}
+	runCtx, stopAll := context.WithCancel(ctx)
+	defer stopAll()
+	var wg sync.WaitGroup
+	started := 0
+	for _, st := range o.Stages {
+		rec, pageRec := hist.NewRecorder(), hist.NewRecorder()
+		r.stage.Store(rec)
+		r.pages.Store(pageRec)
+		sr := StageResult{Users: st.Users, Started: time.Now().UTC()}
+		out.Logf("users: stage %d users (hold %s)", st.Users, st.Hold)
+		add := st.Users - started
+		stageStart := time.Now()
+		for k := 0; k < add; k++ {
+			id := started + k
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.user(runCtx, id)
+			}()
+			if add > 1 && o.RampUp > 0 {
+				select {
+				case <-time.After(o.RampUp / time.Duration(add)):
+				case <-ctx.Done():
+				}
+			}
+		}
+		started = st.Users
+		reason := r.hold(ctx, rec, stageStart, st.Hold)
+		sr.Seconds = time.Since(stageStart).Seconds()
+		sr.Routes, sr.PageLoads = rec.Report(), pageRec.Report()
+		for _, rt := range sr.Routes {
+			sr.Requests += rt.Requests
+		}
+		sr.RPS = float64(sr.Requests) / sr.Seconds
+		if reason != "" {
+			sr.Aborted, sr.Reason = true, reason
+			res.Aborted, res.Reason = true, fmt.Sprintf("stage %d users: %s", st.Users, reason)
+		}
+		res.Stages = append(res.Stages, sr)
+		logStage(sr)
+		if reason != "" || ctx.Err() != nil {
+			break
+		}
+	}
+	stopAll()
+	wg.Wait()
+	res.Series = r.all.Series()
+	res.Finished = time.Now().UTC()
+	return res
+}
+
+func logStage(s StageResult) {
+	out.Logf("users: stage %d users done: %d requests (%.1f/s)%s", s.Users, s.Requests, s.RPS, map[bool]string{true: " ABORTED: " + s.Reason, false: ""}[s.Aborted])
+	for _, rt := range s.Routes {
+		out.Logf("  %-14s n=%-6d p50=%8.0fms p95=%8.0fms p99=%8.0fms max=%8.0fms err=%.1f%% timeouts=%d aborted=%d status=%v",
+			rt.Route, rt.Requests, rt.All.P50, rt.All.P95, rt.All.P99, rt.All.Max, 100*rt.ErrorRate, rt.Timeouts, rt.Aborted, rt.Status)
+	}
+}
+
+// hold waits out the stage, checking the abort criteria every 10s.
+func (r *runner) hold(ctx context.Context, rec *hist.Recorder, start time.Time, d time.Duration) string {
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+	var badSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return "cancelled"
+		case <-tick.C:
+		}
+		r.all.SetUsers(int(r.active.Load()))
+		w := rec.Window(30 * time.Second)
+		stuck := r.stuck(r.o.AbortP99)
+		errRate := 0.0
+		if n := w.Requests - w.Aborted; n > 0 {
+			errRate = float64(w.Errors) / float64(n)
+		}
+		bad := errRate > r.o.AbortErrRate || w.P99 > float64(r.o.AbortP99.Milliseconds()) || stuck > 0 && w.Requests-w.Aborted == 0
+		out.Logf("users: %d active, last 30s: %d requests, err %.1f%%, p99 %.0fms, %d stuck > %s",
+			r.active.Load(), w.Requests, 100*errRate, w.P99, stuck, r.o.AbortP99)
+		switch {
+		case !bad:
+			badSince = time.Time{}
+		case badSince.IsZero():
+			badSince = time.Now()
+		case time.Since(badSince) >= r.o.AbortAfter:
+			return fmt.Sprintf("abort criteria held for %s (last 30s: err %.0f%%, p99 %.0fs, %d requests stuck > %s)",
+				r.o.AbortAfter, 100*errRate, w.P99/1000, stuck, r.o.AbortP99)
+		}
+		if time.Since(start) >= d {
+			return ""
+		}
+	}
+}
+
+func (r *runner) stuck(older time.Duration) int {
+	n := 0
+	cut := time.Now().Add(-older).UnixNano()
+	r.inflight.Range(func(_, v any) bool {
+		if v.(int64) < cut {
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+var reqSeq atomic.Int64
+
+// errSuperseded cancels a request that the hook's next poll replaces.
+var errSuperseded = errors.New("superseded by the next poll")
+
+func (r *runner) request(ctx context.Context, id ks.Identity, route, path string) hist.Outcome {
+	rctx, cancel := context.WithTimeout(ctx, r.o.ReqTimeout)
+	defer cancel()
+	k := reqSeq.Add(1)
+	r.inflight.Store(k, time.Now().UnixNano())
+	resp := r.o.Client.Do(rctx, id, http.MethodGet, path, nil, "", false)
+	r.inflight.Delete(k)
+	outcome := hist.Classify(resp.Err, ctx.Err())
+	switch {
+	case resp.Err != nil && rctx.Err() == context.DeadlineExceeded && ctx.Err() == nil:
+		outcome = hist.Timeout
+	case resp.Err != nil && errors.Is(context.Cause(ctx), errSuperseded):
+		// The next poll replaced it: the screen kept waiting for longer than
+		// the poll interval, which counts as a failure, not a neutral abort.
+		outcome = hist.Superseded
+	}
+	r.stage.Load().Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
+	r.all.Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
+	return outcome
+}
+
+// user is one virtual user's session.
+func (r *runner) user(ctx context.Context, n int) {
+	r.active.Add(1)
+	defer r.active.Add(-1)
+	rnd := rand.New(rand.NewPCG(r.o.Seed, uint64(n)))
+	id := r.o.Identities(n)
+	r.request(ctx, id, "info", "/api/v1/info") // App.tsx, once per session
+	for ctx.Err() == nil {
+		page := Pick(r.o.Pages, rnd)
+		hooks := page.Hooks(r.o.Targets, rnd)
+		pctx, leave := context.WithCancel(ctx)
+		loaded := make(chan struct{}, len(hooks))
+		loadStart := time.Now()
+		for _, h := range hooks {
+			go r.hook(pctx, id, h, loaded)
+		}
+		// The user waits for the page (up to PageTimeout), then reads it.
+		timeout := time.NewTimer(r.o.PageTimeout)
+		got := 0
+	wait:
+		for got < len(hooks) {
+			select {
+			case <-loaded:
+				got++
+			case <-timeout.C:
+				break wait
+			case <-ctx.Done():
+				break wait
+			}
+		}
+		timeout.Stop()
+		if ctx.Err() == nil {
+			out := hist.OK
+			if got < len(hooks) {
+				out = hist.Timeout
+			}
+			r.pages.Load().Record("page:"+page.Name, 200, 0, time.Since(loadStart), out, nil)
+		}
+		think := r.o.ThinkMin + time.Duration(rnd.Int64N(int64(r.o.ThinkMax-r.o.ThinkMin)+1))
+		select {
+		case <-time.After(think):
+		case <-ctx.Done():
+		}
+		leave() // navigation aborts whatever the page still has in flight
+	}
+}
+
+// hook fires the request on load and then every h.Every, aborting a request
+// still running when the next one starts (useApi's effect cleanup).
+//
+// The hook counts as loaded once a request ends other than by being aborted
+// (a response, a timeout or an error), as the page then shows data or an error.
+func (r *runner) hook(ctx context.Context, id ks.Identity, h Hook, loaded chan<- struct{}) {
+	var cancelPrev context.CancelCauseFunc
+	var signalled atomic.Bool
+	fire := func(bool) {
+		if cancelPrev != nil {
+			cancelPrev(errSuperseded)
+		}
+		rctx, cancel := context.WithCancelCause(ctx)
+		cancelPrev = cancel
+		go func() {
+			if oc := r.request(rctx, id, h.Route, h.Path); oc != hist.Aborted && oc != hist.Superseded && signalled.CompareAndSwap(false, true) {
+				loaded <- struct{}{}
+			}
+		}()
+	}
+	fire(true)
+	t := time.NewTicker(h.Every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if cancelPrev != nil {
+				cancelPrev(context.Canceled)
+			}
+			return
+		case <-t.C:
+			fire(false)
+		}
+	}
+}

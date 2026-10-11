@@ -1,0 +1,6 @@
+# Raw run output stays local; the markdown summaries are committed.
+*.json
+*.log
+*.csv
+!expected.json
+superseded-run-*/

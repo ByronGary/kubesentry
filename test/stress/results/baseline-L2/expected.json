@@ -1,0 +1,412 @@
+{
+  "generatedAt": "2026-10-11T16:29:17.369063666Z",
+  "level": "L2",
+  "cases": [
+    {
+      "id": "overlap-selectors",
+      "namespace": "stress-tricky",
+      "description": "Deployment web (app=web) and web-canary (app=web,track=canary): the canary pods match both selectors but are owned by web-canary.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/web",
+          "to": "web-",
+          "count": 2,
+          "note": "pods named web-\u003chash\u003e, not web-canary-"
+        },
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/web-canary",
+          "to": "web-canary-",
+          "count": 1
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Deployment/stress-tricky/web",
+          "to": "",
+          "count": 2
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Deployment/stress-tricky/web-canary",
+          "to": "",
+          "count": 1
+        },
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/web",
+          "to": "web-",
+          "count": 3
+        },
+        {
+          "relation": "ingress-service",
+          "from": "Ingress/stress-tricky/web",
+          "to": "Service/stress-tricky/web"
+        }
+      ]
+    },
+    {
+      "id": "jobs-identical-labels",
+      "namespace": "stress-tricky",
+      "description": "Jobs batch-a and batch-b with identical pod labels (app=batch) and generated selectors.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Job/stress-tricky/batch-a",
+          "to": "batch-a-",
+          "count": 1
+        },
+        {
+          "relation": "pod-owner",
+          "from": "Job/stress-tricky/batch-b",
+          "to": "batch-b-",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "jobs-manual-selector",
+      "namespace": "stress-tricky",
+      "description": "Jobs manual-a and manual-b with manualSelector app=batch-manual: both selectors match both pods; ownerReferences decide.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Job/stress-tricky/manual-a",
+          "to": "manual-a-",
+          "count": 1
+        },
+        {
+          "relation": "pod-owner",
+          "from": "Job/stress-tricky/manual-b",
+          "to": "manual-b-",
+          "count": 1
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Job/stress-tricky/manual-a",
+          "to": "",
+          "count": 1
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Job/stress-tricky/manual-b",
+          "to": "",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "id": "orphan-replicaset",
+      "namespace": "stress-tricky",
+      "description": "Deployment orphan-src deleted with propagationPolicy=Orphan: its ReplicaSet and pods remain, owned by nothing above the ReplicaSet.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "ReplicaSet/stress-tricky/orphan-src-*",
+          "to": "orphan-src-",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "custom-owner",
+      "namespace": "stress-tricky",
+      "description": "Pods widget-a-0/1 owned directly by a custom resource Widget/widget-a (widgets.stress.kubesentry.io).",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Widget/stress-tricky/widget-a",
+          "to": "widget-a-",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "rollout-like",
+      "namespace": "stress-tricky",
+      "description": "A Rollout custom resource owns ReplicaSet checkout-rs, which owns 2 pods (as Argo Rollouts does).",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Rollout/stress-tricky/checkout",
+          "to": "checkout-rs-",
+          "count": 2
+        },
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/checkout",
+          "to": "checkout-rs-",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "failing-readiness",
+      "namespace": "stress-tricky",
+      "description": "Deployment unready: readiness probe always fails; Service unready lists both pods as not ready.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/unready",
+          "to": "unready-",
+          "count": 2,
+          "note": "endpoints ready=false"
+        },
+        {
+          "relation": "status",
+          "from": "Pod/stress-tricky/unready-",
+          "to": "NotReady"
+        }
+      ]
+    },
+    {
+      "id": "terminating-endpoint",
+      "namespace": "stress-tricky",
+      "description": "Deployment term (2 replicas, preStop sleep 3600): one pod deleted and stuck terminating; its endpoint is terminating, a replacement runs.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/term",
+          "to": "term-",
+          "count": 3,
+          "note": "1 endpoint terminating=true"
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Deployment/stress-tricky/term",
+          "to": "",
+          "count": 2,
+          "note": "the terminating pod is no longer counted"
+        }
+      ]
+    },
+    {
+      "id": "publish-not-ready",
+      "namespace": "stress-tricky",
+      "description": "Service pnra with publishNotReadyAddresses: its unready pod is published as ready.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/pnra",
+          "to": "pnra-",
+          "count": 1,
+          "note": "endpoint ready=true although the pod is not"
+        }
+      ]
+    },
+    {
+      "id": "crashloop",
+      "namespace": "stress-tricky",
+      "description": "Deployment crashloop exits 1 immediately: CrashLoopBackOff.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/crashloop",
+          "to": "crashloop-",
+          "count": 1
+        },
+        {
+          "relation": "status",
+          "from": "Pod/stress-tricky/crashloop-",
+          "to": "CrashLoopBackOff"
+        }
+      ]
+    },
+    {
+      "id": "image-pull",
+      "namespace": "stress-tricky",
+      "description": "Deployment imagepull uses an image that does not exist: ImagePullBackOff.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/imagepull",
+          "to": "imagepull-",
+          "count": 1
+        },
+        {
+          "relation": "status",
+          "from": "Pod/stress-tricky/imagepull-",
+          "to": "ImagePullBackOff"
+        }
+      ]
+    },
+    {
+      "id": "unschedulable",
+      "namespace": "stress-tricky",
+      "description": "Deployment unschedulable selects a node label nothing has: Pending, no node.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/unschedulable",
+          "to": "unschedulable-",
+          "count": 1
+        },
+        {
+          "relation": "pod-node",
+          "from": "Pod/stress-tricky/unschedulable-",
+          "to": ""
+        },
+        {
+          "relation": "status",
+          "from": "Pod/stress-tricky/unschedulable-",
+          "to": "Unschedulable"
+        }
+      ]
+    },
+    {
+      "id": "bare-pod",
+      "namespace": "stress-tricky",
+      "description": "Pod bare-1 with no owner.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "",
+          "to": "bare-1",
+          "count": 1,
+          "note": "no owner"
+        }
+      ]
+    },
+    {
+      "id": "static-pod",
+      "namespace": "stress-tricky",
+      "description": "Static pod from a manifest in kubesentry-worker:/etc/kubernetes/manifests; its mirror pod is owned by the Node.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "",
+          "to": "static-web-kubesentry-worker",
+          "count": 1,
+          "note": "mirror pod, owned by the Node: no workload"
+        },
+        {
+          "relation": "pod-node",
+          "from": "Pod/stress-tricky/static-web-kubesentry-worker",
+          "to": "Node/kubesentry-worker"
+        }
+      ]
+    },
+    {
+      "id": "succeeded-selected",
+      "namespace": "stress-tricky",
+      "description": "Pod done-1 has Succeeded; Service done selects it. The EndpointSlice keeps it as an endpoint that is neither ready nor serving, so it gets no traffic.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/done",
+          "to": "done-1",
+          "count": 1,
+          "note": "ready=false, serving=false"
+        }
+      ]
+    },
+    {
+      "id": "mid-rollout",
+      "namespace": "stress-tricky",
+      "description": "Deployment rollout: revision 2 never becomes ready (maxUnavailable 0), so 3 old and 1 new pod coexist.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "Deployment/stress-tricky/rollout",
+          "to": "rollout-",
+          "count": 4
+        },
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/rollout",
+          "to": "rollout-",
+          "count": 4,
+          "note": "1 not ready"
+        }
+      ]
+    },
+    {
+      "id": "multi-workload-service",
+      "namespace": "stress-tricky",
+      "description": "Service backend (tier=backend) spans Deployments api and worker.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/backend",
+          "to": "",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "statefulset",
+      "namespace": "stress-tricky",
+      "description": "StatefulSet db with a headless Service.",
+      "expect": [
+        {
+          "relation": "pod-owner",
+          "from": "StatefulSet/stress-tricky/db",
+          "to": "db-",
+          "count": 2
+        },
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-tricky/db",
+          "to": "db-",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "cronjob",
+      "namespace": "stress-tricky",
+      "description": "CronJob tick runs every 2 minutes; CronJob → Job → pod.",
+      "expect": [
+        {
+          "relation": "cronjob-job",
+          "from": "CronJob/stress-tricky/tick",
+          "to": "tick-"
+        }
+      ]
+    },
+    {
+      "id": "pvc-mount",
+      "namespace": "stress-tricky",
+      "description": "Deployment pvc-user mounts a dynamically provisioned claim tricky-data; Ingress ghost points at a missing Service.",
+      "expect": [
+        {
+          "relation": "pod-pvc",
+          "from": "Pod/stress-tricky/pvc-user-",
+          "to": "PVC/stress-tricky/tricky-data"
+        },
+        {
+          "relation": "ingress-service",
+          "from": "Ingress/stress-tricky/ghost",
+          "to": "",
+          "note": "backend Service missing"
+        }
+      ]
+    },
+    {
+      "id": "wide-service",
+      "namespace": "stress-wide",
+      "description": "Service wide selects a 300-replica Deployment on fake nodes: 3+ EndpointSlices.",
+      "expect": [
+        {
+          "relation": "service-pods",
+          "from": "Service/stress-wide/wide",
+          "to": "wide-",
+          "count": 300
+        },
+        {
+          "relation": "workload-pods",
+          "from": "Deployment/stress-wide/wide",
+          "to": "",
+          "count": 300
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Relations follow controller ownerReferences (Pod→ReplicaSet→Deployment, Pod→Job→CronJob, StatefulSet, DaemonSet, custom owners) and EndpointSlices for Service→Pod.",
+    "pod-owner From is the nearest workload-level owner: a ReplicaSet owned by a Deployment collapses to the Deployment; an orphaned ReplicaSet or one owned by a custom resource does not.",
+    "To is a pod name prefix where pod names are generated; Count is the number of such pods expected.",
+    "workload-pods counts live pods (not Succeeded/Failed, not terminating).",
+    "Generated namespaces (team and EKS add-on) are verified against the live ground truth only."
+  ]
+}

@@ -2,132 +2,134 @@
 
 These are running notes from the enterprise stress test of kubesentry. Each run gets its own section. Alongside the performance numbers, the notes keep track of every caution and critical alert the cluster itself raised while the run was going.
 
-- **Full reports.** The generated per-level reports live in `test/stress/results/<run>/report.md`.
-- **Cluster cautions.** `hack/cluster-cautions.py` takes a snapshot every 5 minutes. Each run's summary goes in `test/stress/results/cautions-<run>/cautions.md`, produced with `hack/cluster-cautions.py --summarize <dir>`. A snapshot covers:
-  - Prometheus alerts that are firing or pending
-  - warning events
+**Where things are:**
+- **Generated reports:** `test/stress/results/<variant>-<level>/report.md`. The baseline write-up is in `test/stress/results/baseline-summary.md`.
+- **Cluster cautions:** `hack/cluster-cautions.py` takes a snapshot every 5 minutes. Each snapshot covers:
+  - Prometheus alerts, firing or pending
+  - API server, etcd and Prometheus health
   - node conditions
   - pods in trouble
+  - warning events
   - cert-manager status
-  - API server, etcd and Prometheus health
+  - PVCs
 
-  Alerts are split into *real* ones and *artifacts* of the kind/KWOK environment. Pass `--no-artifacts` on a real cluster.
-- **Feeding the next build.** The last section collects what these runs teach us about the alerting, automation and monitoring build that comes next.
+  Each run's summary is in `test/stress/results/cautions-<run>/cautions.md`, produced by `hack/cluster-cautions.py --summarize <dir>`. Alerts are split into real ones and artifacts of the kind/KWOK environment. Pass `--no-artifacts` on a real cluster.
+- **Next build:** the last section collects what these runs teach us for the alerting, automation and monitoring build that comes next.
 
 **Environment:**
-- kind on Kubernetes 1.36.4: 1 control plane and 5 workers, with worker 5 reserved for load generators.
+- kind on Kubernetes 1.36.4, with 1 control plane and 5 workers (worker 5 runs only the load generators).
 - KWOK fake nodes with EKS labels.
-- kube-prometheus-stack with Grafana and Alertmanager off. Prometheus keeps 6h of data and is capped at 1.5 GiB.
+- kube-prometheus-stack with Grafana and Alertmanager off, 6h retention, Prometheus capped at 1.5 GiB.
 - cert-manager.
-- The host is WSL2 with 15.6 GiB and 12 CPUs. Stress levels are capped at L3: 500 nodes and about 10k pods.
+- Host: WSL2 with 15.6 GiB and 12 CPUs.
+- Stress scale is capped at L3: 500 nodes and about 10k pods.
 
 ## Run log
 
-### Baseline L1: 100 fake nodes, 2,036 pods (2026-10-11, 15:33–16:15 UTC)
-This run used the code tagged `baseline` with today's manifest (kubesentry memory limit 256 MiB).
+### Baseline: L1, L2 and L3 (2026-10-11, 15:33–18:30 UTC)
+This run tested the code tagged `baseline` as shipped: one replica, a 256 MiB memory limit, client-go defaults, and an in-memory audit store holding 50k events.
 
-| Step | Result |
-|---|---|
-| Generate | 2,076 objects created, 0 failed, in 96s |
-| Association | pod→node 100%. pod→owner 99.9% precision and 99.6% recall. service→pods 100% / 99.9%. workload→pods 99.1%. Only **29 of 42** tricky cases are right |
-| Connectivity | 108/108 probes pass: pod→pod, pod→ClusterIP, DNS and →kubesentry across all real nodes. Agents are fresh on 6 of 6 real nodes |
-| Users | **Aborted at 200 users.** At 10 users list pages already take 2–8s at p95. At 50 users the error rate is 51%, with p95 30–46s. At 200 users errors reach 98.5%, mostly timeouts |
-| Audit firehose | 1,000,000 events at **3,003/s**, 0 failed batches, webhook p99 32ms. Queries after a restart got "connection refused", and the store was empty after the OOM restart |
-| Agents, staggered | 500 agents at 33 posts/s: 100% success, p99 2ms |
-| Agents, surge | **49% success**: 1,211 timeouts and 937 errors. After the restarts no process data was available (94 of 100 pods) |
-| kubesentry itself | **OOMKilled repeatedly** at 256 MiB, with 12 restarts by L2. Its readiness probe failed 1,689 times |
+| | L1 | L2 | L3 |
+|---|---:|---:|---:|
+| Fake nodes / pods | 100 / 2,036 | 250 / 5,023 | 500 / 10,002 |
+| Namespaces / Services / Deployments | 29 / 185 / 285 | 78 / 554 / 844 | 160 / 1,148 / 1,727 |
+| Single user, map of one namespace / nodes / security | 1.6s / 1.2s / 1.4s | 3.0s / 2.5s / 2.7s | 5.8s / 4.9s / 4.8s |
+| Highest passing user stage (≤20% errors, p99 ≤ 60s) at 256 MiB | 10 | **0** (31% errors at 10 users) | **0** (56% errors at 10 users) |
+| Same at 1 GiB | not run | 10 | **0**: pages never finish within their poll |
+| kubesentry OOM kills | 8 | 13 | 10 |
+| kubesentry → API server while serving users | 4.5/s | 7.6/s | 5.0/s |
+| Association, pod → owner precision / recall | 99.9% / 99.6% | 99.9% / 99.6% | 99.9% / 99.8% |
+| Tricky cases right | 29/42 | 29/42 | 29/42 |
+| Connectivity probes | 108/108 | 108/108 | 108/108 |
+| Audit webhook, 1M events | 3,003/s, p99 32ms | 3,003/s, p99 26ms | 3,003/s, p99 25ms |
+| 500 agents, staggered / all at once | 100% / 49% (OOM) | 100% / 70% (OOM) | 100% / 57% (OOM) |
+| `/oom` 24h answer, projected (cap 64 MiB) | 21 MB | 41 MB | **81 MB** |
+| kube-apiserver / etcd / Prometheus memory max | 1.27 GB / 115 MB / 452 MB | 1.72 GB / 179 MB / 560 MB | 2.31 GB / 312 MB / 695 MB |
 
-Where the baseline breaks, and what the new build is meant to fix:
-- **Every request does full-cluster LISTs.** During the user test that was 2,765 API calls, including 1,043 pod lists. Latency grows with users until the 256 MiB pod is OOM-killed.
-- **All state lives in the process.** Every OOM restart wipes the audit store and the process data, so the run loses both.
-- **`/oom` will outgrow its read cap.** The 24h `/oom` query would be about 20 MB at L1 (2,389 series) against a 64 MiB read cap. At L3 it would exceed the cap.
-- **Selector-based association gets the tricky cases wrong:**
-  - custom-resource owners and Rollouts are not reported
-  - orphaned ReplicaSets are not reported
-  - Jobs with manual selectors get the wrong owner
-  - overlapping Deployment selectors attribute a canary's pods to the main Deployment
+**Why the baseline fails:**
+- **Client-side throttling.** Every request does full LISTs through client-go's default limit of 5 QPS per API group. kubesentry tops out at 5–8 API requests/s however many users there are, and page latency grows by about 0.55 ms per pod. The API server is not the bottleneck: it answers in 3–14 ms p50 and never returned a 429.
+- **Memory.** 256 MiB is too small, and every OOM costs minutes. Each one means CrashLoopBackOff, losing the audit and process stores, and replaying the audit log from the start. With 1 GiB there are no OOMs, but throttling remains.
+- **Synchronized agents kill the server.** 500 agents posting at the same moment (as after a DaemonSet rollout) OOM-kill it every time. The baseline agent has no jitter.
+- **Association.** Selector-based association is wrong where selectors and ownership diverge: overlapping selectors, manual Job selectors, orphaned ReplicaSets, custom-resource and Rollout owners, terminating pods counted, unready pods shown as ok.
+- **`/oom` outgrows its read cap at L3.**
+- **The audit store fills fast.** The 50k cap holds about 17 seconds of a 3k/s firehose.
 
-### Baseline L2: 250 fake nodes, about 5k pods
-*In progress.*
-
-### Baseline L3: 500 fake nodes, about 10k pods
+### After: the new build at L3
 *Pending.*
+- **Deploy:** kind switches to the Helm chart, with `oauth2-proxy` over the Unix socket.
+- **Checkpoint D:** association, authorization leaks (`verify authz`), connectivity and a chaos smoke test.
+- **Then the full L3 run:** the 2h soak, Postgres and the CloudWatch path.
 
-### After: new build at L3
-*Pending.* This needs the baseline to finish, kind switched to the Helm chart, and checkpoint D at L1.
-
-## Cautions and critical alerts across the cluster
-
-Snapshot at 2026-10-11 16:49 UTC, during baseline L2 (256 nodes, about 5k pods). It is refreshed every 5 minutes into `test/stress/results/cautions-baseline/`.
+## Cautions and critical alerts across the cluster (baseline, 20 snapshots, 16:49–18:30 UTC)
+Full table: `test/stress/results/cautions-baseline/cautions.md`.
 
 ### Real cautions
 
 | What | Severity | Detail | Why it matters on EKS |
 |---|---|---|---|
-| **No alert routing** | critical (gap) | Alertmanager is off, so every alert below fires into nothing. `PrometheusNotConnectedToAlertmanagers` is firing | In production, an alert that reaches no one is the same as no alert. Route through Alertmanager, or AMP's alert manager, to Slack, PagerDuty or email |
-| **Prometheus is falling behind** | warning | 35 rule groups have pending `PrometheusMissingRuleEvaluations`, at 0.13 missed evaluations per second. 81k head series, 477 MiB RSS, and that is with kube-state-metrics cut to one metric and kubelet scraping limited to real nodes | A full kube-state-metrics on a 500-node EKS cluster is several times this. Size Prometheus (or use AMP) before adding rules |
-| **kubesentry crash-looping** | critical | OOMKilled at 256 MiB, 12 restarts, 1,689 readiness probe failures, 92 BackOff events | The monitoring tool itself needs an alert, such as `KubePodCrashLooping` on its own namespace. Its memory must scale with the cluster |
-| **Certificates expiring** | warning | 56 Certificates expire within 14 days, with some at 1 day. The generator makes short-lived certs on purpose | This is exactly what a cert-expiry alert with an owner must catch. kube-prometheus-stack has no cert-manager rules by default |
-| **Certificates not ready** | warning | 5 Certificates reference issuers that do not exist (`DoesNotExist`) | Broken TLS issuance is silent until the old certificate expires |
-| **Certificate issued with an empty Issuer DN** | caution | 6 `BadConfig` events: a self-signed issuer without a subject produces certificates that break RFC 5280 | Strict TLS clients (Java, some service meshes) reject them. Give issuers a subject |
-| **Duplicate CertificateRequest** | caution | 1 `RequestFailed`: "certificaterequests ... already exists" | cert-manager races under churn. Watch it if it repeats |
-| **Crash-looping workload** | warning | `stress-tricky/crashloop` has 19 restarts. `demo-apps/leaky` was OOMKilled | Planted on purpose. kubesentry should flag both |
-| **Image pull failure** | warning | `stress-tricky/imagepull`: ImagePullBackOff for more than 5 minutes, 283 `Failed` events | Planted. On EKS this is usually ECR auth or rate limits |
-| **Unschedulable pod** | warning | `stress-tricky/unschedulable`: 105 `FailedScheduling` events ("102 nodes had untolerated taints, 4 didn't match affinity") | Planted. On EKS this means Karpenter or the nodegroup cannot satisfy the pod |
-| **Event volume** | caution | 7,033 Event objects in etcd, the largest object type, ahead of pods (5,047) | Event churn costs etcd and API server capacity. kind runs with `--event-ttl=30m`; EKS uses 1h by default |
+| **No alert routing** | critical (gap) | Alertmanager is off, so every alert below fired into nothing (`PrometheusNotConnectedToAlertmanagers`) | An alert that reaches no one is the same as no alert. Route through Alertmanager or AMP's alert manager to Slack, PagerDuty or email |
+| **Prometheus falling behind** | warning | `PrometheusMissingRuleEvaluations` pending in 19 of 20 snapshots, for 35 rule groups, at 0.13 missed/s. 102k head series, RSS up to 695 MiB, and that is with kube-state-metrics cut to one metric and only real nodes scraped | A full kube-state-metrics on a 500-node EKS cluster is several times this. Size Prometheus (or use AMP) before adding rules |
+| **kubesentry crash-looping (baseline build)** | critical | 31 OOM kills over the run, 4,137 readiness probe failures, 181 BackOff events | The monitoring tool needs its own alert, and its memory must scale with the cluster. The new build is being tested for exactly this |
+| **cert-manager restarting under load** | warning | Liveness probe returned HTTP 500 at L3; 3 restarts. cert-manager runs with no resource requests or limits | With hundreds of certificates, give cert-manager requests and limits and watch its restarts. A restart pauses issuance and renewal |
+| **Certificates expiring** | warning | 117 Certificates expire within 14 days, some within 1 day. The generator makes short-lived certs on purpose | Exactly what a cert-expiry alert with an owner should catch. kube-prometheus-stack has no cert-manager rules by default |
+| **Certificates not ready** | warning | 9 Certificates reference issuers that don't exist (`DoesNotExist`) | Broken issuance is silent until the old certificate expires |
+| **Certificate with an empty Issuer DN** | caution | 12 `BadConfig` events: a self-signed issuer without a subject produces RFC 5280-violating certificates | Strict TLS clients (Java, some meshes) reject them. Give issuers a subject |
+| **ClusterIP repair** | caution | 3 `ClusterIPNotAllocated` events ("not allocated; repairing") while creating 1,148 Services | The API server's IP allocator repaired leaked or raced allocations. Worth an alert if it repeats, because it means Service IP state drifted |
+| **Control-plane latency under load** | caution | API read p99 up to 250ms and write p99 up to 361ms (16–23ms when idle); etcd p99 44ms; kube-apiserver 2.31 GB at L3 | Fine here. On EKS, watch API latency and APF rejections per flow, because kubesentry and every controller share them |
+| **Node clock** | caution | `NodeClockNotSynchronising` was pending once (WSL clock drift) | On EKS, clock skew breaks token validation and SigV4. Keep the node-exporter rule |
+| **Real node pressure** | caution | Real nodes went down to 24% memory available; load per CPU reached 1.04 | Fine for the load generators. On EKS, node pressure leads to evictions |
+| **Event volume** | caution | Events were the largest object type at L2 (7k). At L3, pods 10k and RoleBindings 3.1k led | Event churn costs etcd and API capacity. kind runs `--event-ttl=30m`; EKS uses 1h |
+| **Planted workload faults** | expected | crashloop (38 restarts), `leaky` (OOMKilled ×6, 88% of its limit), ImagePullBackOff (704 `Failed` events), Unschedulable (107 `FailedScheduling`) | kubesentry must flag all of these. The after run checks it |
 
-**Control-plane health, which is fine so far at L2:**
+**Control plane, overall:**
 - no 429s or 5xx from the API server, and nothing queued by APF
-- API read p99 54ms and write p99 24ms
-- etcd request p99 19ms
-- real nodes have at least 39% memory and 77% disk free, with load per CPU at 0.17
-- the host has at least 6.1 GiB available
+- real nodes kept at least 77% disk free
+- the host never went below 3.9 GiB available, and the memory guard never fired
 
 ### Artifacts of the stress environment, not real problems
-These alerts are expected here and are filtered out in the summaries.
 
-| Alert | Count | Cause |
+| Alert | Peak | Cause |
 |---|---:|---|
-| KubeProxyInstanceUnreachable | 256 | kube-proxy binds its metrics to 127.0.0.1, and on KWOK nodes nothing runs |
+| KubeProxyInstanceUnreachable | 501 | kube-proxy binds its metrics to 127.0.0.1, and on KWOK nodes nothing runs |
 | etcdInsufficientMembers (critical), etcdMembersDown | 1 each | kind binds etcd metrics to localhost |
 | KubeControllerManagerInstanceUnreachable, KubeSchedulerInstanceUnreachable | 1 each | kind binds both to localhost |
 | TargetDown | 4 | the same targets |
-| Watchdog | 1 | the always-firing heartbeat (good: it proves rule evaluation works) |
+| Watchdog | 1 | the always-firing heartbeat |
 
-**The same noise appears on EKS unless the monitoring stack is configured for it.** EKS manages etcd, the scheduler and the controller manager, so none of them can be scraped. To avoid alerts that fire forever on day one:
+**The same noise appears on EKS unless the monitoring stack is set up for it.** EKS manages etcd, the scheduler and the controller manager, so none of them can be scraped. To avoid alerts that fire forever on day one:
 - turn those components off in kube-prometheus-stack (`kubeEtcd`, `kubeScheduler` and `kubeControllerManager` with `enabled: false`)
 - patch kube-proxy's `metricsBindAddress` to `0.0.0.0:10249`, or turn its scraping off
 
 ## Inputs for the alerting, automation and monitoring build
-These are candidates collected while the runs go on. The proposal comes after the baseline L3 data is in.
-- **Routing comes first.** Choose Alertmanager, or AMP alert manager on EKS, with receivers per team. Route by namespace owner, the same RBAC ownership kubesentry already uses for scoping.
+These are candidates from the runs so far. The proposal is in `docs/proposals/alerting-automation.md`.
+- **Routing first:** Alertmanager, or AMP alert manager on EKS, with receivers per team, routed by namespace owner. That is the same RBAC ownership kubesentry already uses for scoping.
 - **Watch the monitor:**
   - kubesentry crash loops and OOMs
-  - snapshot age (`kubesentry_snapshot_age_seconds`)
-  - authorization review errors and latency
+  - snapshot age
+  - authorization review errors
   - audit queue depth and store errors
   - CloudWatch lag
   - agents not reporting
-
-  The chart's `PrometheusRule` is the start of this.
-- **Alerts kubesentry can raise from its own detectors,** which plain Prometheus rules cannot express as well:
+  - cert-manager restarts
+- **Alerts kubesentry can raise from its own detectors:**
   - certificates expiring or not ready, with owner and issuer
   - unused PVCs, with cost
-  - memory leaks before the OOM, from the leak scanner
+  - memory leaks before the OOM
   - crash loops attributed to their owning workload
-  - RBAC drift, such as new cluster-admin bindings or wildcard roles
-  - exposure changes (a new internet-facing load balancer, or an Ingress without TLS)
-  - sensitive audit events (secret reads, exec, denied bursts)
+  - RBAC drift
+  - exposure changes
+  - sensitive audit events
 - **Automation candidates:**
-  - open or update a ticket or Slack thread per finding, with a dedupe key
-  - annotate a workload with its leak finding
-  - cordon and drain on node pressure (opt-in)
-  - restart stuck certificate requests
-  - clean up unused PVCs after an approval
-  - attach a runbook link to every alert
-- **Monitoring gaps found so far:**
+  - a ticket or Slack thread per finding, with a dedupe key
+  - opt-in node cordon and drain
+  - restarting stuck certificate requests
+  - approval-gated PVC cleanup
+  - a runbook link on every alert
+- **Monitoring gaps:**
   - no alert routing
   - Prometheus capacity at 500+ nodes
   - EKS-specific scrape configuration
   - no cert-manager rules
+  - no resource requests on cert-manager
   - event volume
+  - API server latency and APF per flow

@@ -1,0 +1,77 @@
+# Stress-test cluster: kind on Kubernetes 1.36.4 with 1 control plane and 5 real
+# workers, sized so KWOK can add about 1,000 fake nodes with EKS labels on top.
+# hack/stress-up.sh replaces __REPO__ with the repository's absolute path.
+#
+# - podSubnet /12 leaves room for ~4,000 node /24s, so every fake node gets a podCIDR.
+# - The API server and controller manager get more headroom than kind's defaults,
+#   because the generator creates tens of thousands of objects.
+# - Worker 5 carries the load generators: it is tainted so the cluster's own
+#   workloads stay off it, and labelled so the harness can target it.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubesentry
+networking:
+  podSubnet: 10.240.0.0/12
+  serviceSubnet: 10.96.0.0/16
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    extraMounts:
+      - hostPath: __REPO__/deploy/audit-policy.yaml
+        containerPath: /etc/kubernetes/audit-policy.yaml
+        readOnly: true
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - name: audit-policy-file
+              value: /etc/kubernetes/audit-policy.yaml
+            - name: audit-log-path
+              value: /var/log/kubernetes/audit/audit.log
+            - name: audit-log-maxsize
+              value: "100"
+            - name: audit-log-maxbackup
+              value: "3"
+            - name: max-requests-inflight
+              value: "800"
+            - name: max-mutating-requests-inflight
+              value: "400"
+            - name: event-ttl
+              value: 30m
+          extraVolumes:
+            - name: audit-policy
+              hostPath: /etc/kubernetes/audit-policy.yaml
+              mountPath: /etc/kubernetes/audit-policy.yaml
+              readOnly: true
+              pathType: File
+            - name: audit-logs
+              hostPath: /var/log/kubernetes/audit
+              mountPath: /var/log/kubernetes/audit
+              pathType: DirectoryOrCreate
+        controllerManager:
+          extraArgs:
+            - name: kube-api-qps
+              value: "200"
+            - name: kube-api-burst
+              value: "400"
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    labels:
+      kubesentry.io/role: loadgen
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          taints:
+            - key: kubesentry.io/loadgen
+              value: "true"
+              effect: NoSchedule

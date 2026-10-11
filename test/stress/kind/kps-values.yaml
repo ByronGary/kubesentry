@@ -1,0 +1,41 @@
+# kube-prometheus-stack values for the stress cluster (hack/kind-up.sh passes this
+# file as KPS_VALUES). KWOK fake nodes have no kubelet, so nothing scrapes them,
+# and only the series kubesentry reads are kept, so Prometheus fits the host.
+grafana:
+  enabled: false
+alertmanager:
+  enabled: false
+prometheus:
+  prometheusSpec:
+    retention: 6h
+    scrapeInterval: 30s
+    resources:
+      requests: {cpu: 200m, memory: 512Mi}
+      limits: {memory: 1536Mi}
+kubelet:
+  serviceMonitor:
+    probes: false
+    resource: false
+    # Fake nodes use 172.19.100.0/22 (see test/stress); their kubelet targets do not exist.
+    relabelings:
+      - action: drop
+        sourceLabels: [__address__]
+        regex: '172\.19\.10[0-3]\..*'
+    cAdvisorRelabelings:
+      - action: drop
+        sourceLabels: [__address__]
+        regex: '172\.19\.10[0-3]\..*'
+      - action: replace
+        sourceLabels: [__metrics_path__]
+        targetLabel: metrics_path
+prometheus-node-exporter:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: type, operator: NotIn, values: [kwok]}
+kube-state-metrics:
+  # The only series the baseline kubesentry queries from kube-state-metrics.
+  metricAllowlist:
+    - kube_pod_container_resource_limits
