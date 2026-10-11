@@ -2,16 +2,20 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/ByronGary/kubesentry/internal/model"
@@ -32,80 +36,98 @@ func paginate(what string, list func(opts metav1.ListOptions) (string, error)) e
 	}
 }
 
+func (s *Source) listDeployments(ctx context.Context) ([]model.Workload, error) {
+	return collect("deployments", func(o metav1.ListOptions) ([]appsv1.Deployment, string, error) {
+		l, err := s.cs.AppsV1().Deployments(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertDeployment)
+}
+
+func (s *Source) listStatefulSets(ctx context.Context) ([]model.Workload, error) {
+	return collect("statefulsets", func(o metav1.ListOptions) ([]appsv1.StatefulSet, string, error) {
+		l, err := s.cs.AppsV1().StatefulSets(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertStatefulSet)
+}
+
+func (s *Source) listDaemonSets(ctx context.Context) ([]model.Workload, error) {
+	return collect("daemonsets", func(o metav1.ListOptions) ([]appsv1.DaemonSet, string, error) {
+		l, err := s.cs.AppsV1().DaemonSets(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertDaemonSet)
+}
+
+func (s *Source) listJobs(ctx context.Context) ([]model.Workload, error) {
+	return collect("jobs", func(o metav1.ListOptions) ([]batchv1.Job, string, error) {
+		l, err := s.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertJob)
+}
+
+func (s *Source) listCronJobs(ctx context.Context) ([]model.Workload, error) {
+	return collect("cronjobs", func(o metav1.ListOptions) ([]batchv1.CronJob, string, error) {
+		l, err := s.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertCronJob)
+}
+
 // ListWorkloads lists Deployments, StatefulSets, DaemonSets, Jobs and CronJobs.
 func (s *Source) ListWorkloads(ctx context.Context) ([]model.Workload, error) {
 	var out []model.Workload
-	apps, batch := s.cs.AppsV1(), s.cs.BatchV1()
-	err := paginate("deployments", func(o metav1.ListOptions) (string, error) {
-		l, err := apps.Deployments(metav1.NamespaceAll).List(ctx, o)
+	for _, list := range []func(context.Context) ([]model.Workload, error){
+		s.listDeployments, s.listStatefulSets, s.listDaemonSets, s.listJobs, s.listCronJobs,
+	} {
+		ws, err := list(ctx)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		for i := range l.Items {
-			out = append(out, convertDeployment(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = paginate("statefulsets", func(o metav1.ListOptions) (string, error) {
-		l, err := apps.StatefulSets(metav1.NamespaceAll).List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for i := range l.Items {
-			out = append(out, convertStatefulSet(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = paginate("daemonsets", func(o metav1.ListOptions) (string, error) {
-		l, err := apps.DaemonSets(metav1.NamespaceAll).List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for i := range l.Items {
-			out = append(out, convertDaemonSet(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = paginate("jobs", func(o metav1.ListOptions) (string, error) {
-		l, err := batch.Jobs(metav1.NamespaceAll).List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for i := range l.Items {
-			out = append(out, convertJob(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	err = paginate("cronjobs", func(o metav1.ListOptions) (string, error) {
-		l, err := batch.CronJobs(metav1.NamespaceAll).List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for i := range l.Items {
-			out = append(out, convertCronJob(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return nil, err
+		out = append(out, ws...)
 	}
 	return out, nil
 }
 
+// ListReplicaSets lists ReplicaSets, for resolving Pod → ReplicaSet → Deployment.
+func (s *Source) ListReplicaSets(ctx context.Context) ([]model.ReplicaSet, error) {
+	return collect("replicasets", func(o metav1.ListOptions) ([]appsv1.ReplicaSet, string, error) {
+		l, err := s.cs.AppsV1().ReplicaSets(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertReplicaSet)
+}
+
+// ListEndpointSlices lists discovery.k8s.io/v1 EndpointSlices.
+func (s *Source) ListEndpointSlices(ctx context.Context) ([]model.EndpointSlice, error) {
+	return collect("endpointslices", func(o metav1.ListOptions) ([]discoveryv1.EndpointSlice, string, error) {
+		l, err := s.cs.DiscoveryV1().EndpointSlices(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertEndpointSlice)
+}
+
 func baseWorkload(kind string, m metav1.ObjectMeta, sel *metav1.LabelSelector, tpl *corev1.PodTemplateSpec) model.Workload {
-	w := model.Workload{Kind: kind, Namespace: m.Namespace, Name: m.Name, Created: m.CreationTimestamp.Time, Selector: convertSelector(sel)}
+	w := model.Workload{
+		Kind: kind, Namespace: m.Namespace, Name: m.Name, UID: string(m.UID), Owners: convertOwners(m.OwnerReferences),
+		Created: m.CreationTimestamp.Time, Selector: convertSelector(sel),
+	}
 	if tpl != nil {
 		w.Images = templateImages(tpl.Spec)
 	}
@@ -137,7 +159,7 @@ func convertSelector(sel *metav1.LabelSelector) *model.LabelSelector {
 }
 
 func condition(typ, status, reason, message string, at time.Time) model.Condition {
-	return model.Condition{Type: typ, Status: status, Reason: reason, Message: message, LastTransition: at}
+	return model.Condition{Type: typ, Status: status, Reason: reason, Message: truncate(message), LastTransition: at}
 }
 
 func replicas(p *int32) int32 {
@@ -205,25 +227,62 @@ func convertCronJob(c *batchv1.CronJob) model.Workload {
 	return w
 }
 
+func convertReplicaSet(r *appsv1.ReplicaSet) model.ReplicaSet {
+	return model.ReplicaSet{
+		Namespace: r.Namespace, Name: r.Name, UID: string(r.UID), Owners: convertOwners(r.OwnerReferences),
+		Desired: replicas(r.Spec.Replicas), Ready: r.Status.ReadyReplicas, Created: r.CreationTimestamp.Time,
+	}
+}
+
+// convertEndpointSlice reads the slice's Service and endpoint conditions. A
+// nil condition takes the API's documented default: ready and serving true,
+// terminating false.
+func convertEndpointSlice(e *discoveryv1.EndpointSlice) model.EndpointSlice {
+	out := model.EndpointSlice{
+		Namespace: e.Namespace, Name: e.Name,
+		Service: e.Labels[serviceNameLabel], ManagedBy: e.Labels[managedByLabel],
+	}
+	if len(e.Endpoints) > 0 {
+		out.Endpoints = make([]model.Endpoint, len(e.Endpoints))
+	}
+	for i, ep := range e.Endpoints {
+		c := ep.Conditions
+		m := model.Endpoint{
+			Addresses:   ep.Addresses,
+			Ready:       c.Ready == nil || *c.Ready,
+			Serving:     c.Serving == nil || *c.Serving,
+			Terminating: c.Terminating != nil && *c.Terminating,
+		}
+		if ep.NodeName != nil {
+			m.NodeName = *ep.NodeName
+		}
+		if r := ep.TargetRef; r != nil {
+			m.TargetKind, m.TargetName, m.TargetUID = r.Kind, r.Name, string(r.UID)
+		}
+		out.Endpoints[i] = m
+	}
+	return out
+}
+
 func (s *Source) ListServices(ctx context.Context) ([]model.Service, error) {
-	var out []model.Service
-	err := paginate("services", func(o metav1.ListOptions) (string, error) {
+	return collect("services", func(o metav1.ListOptions) ([]corev1.Service, string, error) {
 		l, err := s.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertService(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, convertService)
 }
 
 func convertService(s *corev1.Service) model.Service {
 	out := model.Service{
 		Namespace: s.Namespace, Name: s.Name, Type: string(s.Spec.Type), ClusterIP: s.Spec.ClusterIP,
 		Selector: s.Spec.Selector, ExternalIPs: s.Spec.ExternalIPs, Created: s.CreationTimestamp.Time,
+		SourceRanges: s.Spec.LoadBalancerSourceRanges, PublishNotReady: s.Spec.PublishNotReadyAddresses,
+		Annotations: filterKeys(s.Annotations, serviceAnnotations),
+	}
+	if c := s.Spec.LoadBalancerClass; c != nil {
+		out.LoadBalancerClass = *c
 	}
 	for _, p := range s.Spec.Ports {
 		out.Ports = append(out.Ports, model.ServicePort{
@@ -241,22 +300,20 @@ func convertService(s *corev1.Service) model.Service {
 }
 
 func (s *Source) ListIngresses(ctx context.Context) ([]model.Ingress, error) {
-	var out []model.Ingress
-	err := paginate("ingresses", func(o metav1.ListOptions) (string, error) {
+	return collect("ingresses", func(o metav1.ListOptions) ([]networkingv1.Ingress, string, error) {
 		l, err := s.cs.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertIngress(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, convertIngress)
 }
 
 func convertIngress(in *networkingv1.Ingress) model.Ingress {
-	out := model.Ingress{Namespace: in.Namespace, Name: in.Name, Created: in.CreationTimestamp.Time}
+	out := model.Ingress{
+		Namespace: in.Namespace, Name: in.Name, Created: in.CreationTimestamp.Time,
+		Annotations: filterKeys(in.Annotations, ingressAnnotations),
+	}
 	if in.Spec.IngressClassName != nil {
 		out.Class = *in.Spec.IngressClassName
 	}
@@ -285,23 +342,17 @@ func convertIngress(in *networkingv1.Ingress) model.Ingress {
 }
 
 func (s *Source) ListNodes(ctx context.Context) ([]model.Node, error) {
-	var out []model.Node
-	err := paginate("nodes", func(o metav1.ListOptions) (string, error) {
+	labels := s.nodeLabels()
+	return collect("nodes", func(o metav1.ListOptions) ([]corev1.Node, string, error) {
 		l, err := s.cs.CoreV1().Nodes().List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertNode(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, func(n *corev1.Node) model.Node { return convertNode(n, labels) })
 }
 
-const rolePrefix = "node-role.kubernetes.io/"
-
-func convertNode(n *corev1.Node) model.Node {
+func convertNode(n *corev1.Node, labels labelFilter) model.Node {
 	out := model.Node{
 		Name:                   n.Name,
 		Unschedulable:          n.Spec.Unschedulable,
@@ -311,11 +362,20 @@ func convertNode(n *corev1.Node) model.Node {
 		CPUAllocatableMilli:    n.Status.Allocatable.Cpu().MilliValue(),
 		MemoryAllocatableBytes: n.Status.Allocatable.Memory().Value(),
 		PodsAllocatable:        n.Status.Allocatable.Pods().Value(),
+		Labels:                 labels.filter(n.Labels),
+		ProviderID:             n.Spec.ProviderID,
 		Created:                n.CreationTimestamp.Time,
 	}
 	for k := range n.Labels {
-		if role, ok := strings.CutPrefix(k, rolePrefix); ok && role != "" {
+		if role, ok := strings.CutPrefix(k, nodeRolePrefix); ok && role != "" {
 			out.Roles = append(out.Roles, role)
+		}
+	}
+	sort.Strings(out.Roles)
+	for _, a := range n.Status.Addresses {
+		if a.Type == corev1.NodeInternalIP {
+			out.InternalIP = a.Address
+			break
 		}
 	}
 	for _, c := range n.Status.Conditions {
@@ -335,25 +395,30 @@ func convertNode(n *corev1.Node) model.Node {
 }
 
 func (s *Source) ListPVs(ctx context.Context) ([]model.PV, error) {
-	var out []model.PV
-	err := paginate("persistentvolumes", func(o metav1.ListOptions) (string, error) {
+	return collect("persistentvolumes", func(o metav1.ListOptions) ([]corev1.PersistentVolume, string, error) {
 		l, err := s.cs.CoreV1().PersistentVolumes().List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertPV(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, convertPV)
 }
+
+// inTreeEBS is the in-tree plugin name reported as the Driver of
+// awsElasticBlockStore volumes.
+const inTreeEBS = "kubernetes.io/aws-ebs"
 
 func convertPV(pv *corev1.PersistentVolume) model.PV {
 	out := model.PV{
 		Name: pv.Name, StorageClass: pv.Spec.StorageClassName, Phase: string(pv.Status.Phase),
 		ReclaimPolicy: string(pv.Spec.PersistentVolumeReclaimPolicy), Source: pvSource(pv.Spec.PersistentVolumeSource),
 		Created: pv.CreationTimestamp.Time,
+	}
+	switch src := pv.Spec.PersistentVolumeSource; {
+	case src.CSI != nil:
+		out.Driver, out.VolumeHandle = src.CSI.Driver, src.CSI.VolumeHandle
+	case src.AWSElasticBlockStore != nil:
+		out.Driver, out.VolumeHandle = inTreeEBS, ebsVolumeID(src.AWSElasticBlockStore.VolumeID)
 	}
 	if q, ok := pv.Spec.Capacity[corev1.ResourceStorage]; ok {
 		out.CapacityBytes = q.Value()
@@ -367,10 +432,23 @@ func convertPV(pv *corev1.PersistentVolume) model.PV {
 	return out
 }
 
+// ebsVolumeID turns the in-tree form "aws://us-east-1a/vol-0abc" into "vol-0abc".
+func ebsVolumeID(id string) string {
+	if rest, ok := strings.CutPrefix(id, "aws://"); ok {
+		if i := strings.LastIndex(rest, "/"); i >= 0 {
+			return rest[i+1:]
+		}
+		return rest
+	}
+	return id
+}
+
 func pvSource(s corev1.PersistentVolumeSource) string {
 	switch {
 	case s.CSI != nil:
 		return "csi:" + s.CSI.Driver
+	case s.AWSElasticBlockStore != nil:
+		return "awsElasticBlockStore"
 	case s.HostPath != nil:
 		return "hostPath"
 	case s.Local != nil:
@@ -386,26 +464,22 @@ func pvSource(s corev1.PersistentVolumeSource) string {
 }
 
 func (s *Source) ListStorageClasses(ctx context.Context) ([]model.StorageClass, error) {
-	var out []model.StorageClass
-	err := paginate("storageclasses", func(o metav1.ListOptions) (string, error) {
+	return collect("storageclasses", func(o metav1.ListOptions) ([]storagev1.StorageClass, string, error) {
 		l, err := s.cs.StorageV1().StorageClasses().List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for i := range l.Items {
-			out = append(out, convertStorageClass(&l.Items[i]))
-		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, convertStorageClass)
 }
 
 func convertStorageClass(c *storagev1.StorageClass) model.StorageClass {
 	out := model.StorageClass{
 		Name: c.Name, Provisioner: c.Provisioner, Created: c.CreationTimestamp.Time,
 		ReclaimPolicy: string(corev1.PersistentVolumeReclaimDelete), BindingMode: string(storagev1.VolumeBindingImmediate),
-		Default: c.Annotations["storageclass.kubernetes.io/is-default-class"] == "true" ||
-			c.Annotations["storageclass.beta.kubernetes.io/is-default-class"] == "true",
+		Default:         c.Annotations[defaultClassAnnotation] == "true" || c.Annotations[betaDefaultClassAnnotation] == "true",
+		Parameters:      c.Parameters,
+		PriceAnnotation: c.Annotations[PriceAnnotation],
 	}
 	if c.ReclaimPolicy != nil {
 		out.ReclaimPolicy = string(*c.ReclaimPolicy)
@@ -420,83 +494,99 @@ func convertStorageClass(c *storagev1.StorageClass) model.StorageClass {
 }
 
 func (s *Source) ListNamespaces(ctx context.Context) ([]model.Namespace, error) {
-	var out []model.Namespace
-	err := paginate("namespaces", func(o metav1.ListOptions) (string, error) {
+	return collect("namespaces", func(o metav1.ListOptions) ([]corev1.Namespace, string, error) {
 		l, err := s.cs.CoreV1().Namespaces().List(ctx, o)
 		if err != nil {
-			return "", err
+			return nil, "", err
 		}
-		for _, n := range l.Items {
-			out = append(out, model.Namespace{Name: n.Name, Phase: string(n.Status.Phase), Labels: n.Labels, Created: n.CreationTimestamp.Time})
+		return l.Items, l.Continue, nil
+	}, convertNamespace)
+}
+
+func convertNamespace(n *corev1.Namespace) model.Namespace {
+	return model.Namespace{Name: n.Name, Phase: string(n.Status.Phase), Labels: n.Labels, Created: n.CreationTimestamp.Time}
+}
+
+func (s *Source) listRoles(ctx context.Context) ([]model.Role, error) {
+	return collect("roles", func(o metav1.ListOptions) ([]rbacv1.Role, string, error) {
+		l, err := s.cs.RbacV1().Roles(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
 		}
-		return l.Continue, nil
-	})
-	return out, err
+		return l.Items, l.Continue, nil
+	}, convertRole)
+}
+
+func (s *Source) listClusterRoles(ctx context.Context) ([]model.Role, error) {
+	return collect("clusterroles", func(o metav1.ListOptions) ([]rbacv1.ClusterRole, string, error) {
+		l, err := s.cs.RbacV1().ClusterRoles().List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertClusterRole)
+}
+
+func (s *Source) listRoleBindings(ctx context.Context) ([]model.RoleBinding, error) {
+	return collect("rolebindings", func(o metav1.ListOptions) ([]rbacv1.RoleBinding, string, error) {
+		l, err := s.cs.RbacV1().RoleBindings(metav1.NamespaceAll).List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertRoleBinding)
+}
+
+func (s *Source) listClusterRoleBindings(ctx context.Context) ([]model.RoleBinding, error) {
+	return collect("clusterrolebindings", func(o metav1.ListOptions) ([]rbacv1.ClusterRoleBinding, string, error) {
+		l, err := s.cs.RbacV1().ClusterRoleBindings().List(ctx, o)
+		if err != nil {
+			return nil, "", err
+		}
+		return l.Items, l.Continue, nil
+	}, convertClusterRoleBinding)
 }
 
 // ListRBAC lists Roles, ClusterRoles, RoleBindings and ClusterRoleBindings.
 func (s *Source) ListRBAC(ctx context.Context) (model.RBAC, error) {
 	var out model.RBAC
-	r := s.cs.RbacV1()
-	err := paginate("roles", func(o metav1.ListOptions) (string, error) {
-		l, err := r.Roles(metav1.NamespaceAll).List(ctx, o)
+	for _, list := range []func(context.Context) ([]model.Role, error){s.listRoles, s.listClusterRoles} {
+		rs, err := list(ctx)
 		if err != nil {
-			return "", err
+			return model.RBAC{}, err
 		}
-		for _, x := range l.Items {
-			out.Roles = append(out.Roles, model.Role{Kind: "Role", Namespace: x.Namespace, Name: x.Name, Rules: convertRules(x.Rules)})
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return model.RBAC{}, err
+		out.Roles = append(out.Roles, rs...)
 	}
-	err = paginate("clusterroles", func(o metav1.ListOptions) (string, error) {
-		l, err := r.ClusterRoles().List(ctx, o)
+	for _, list := range []func(context.Context) ([]model.RoleBinding, error){s.listRoleBindings, s.listClusterRoleBindings} {
+		bs, err := list(ctx)
 		if err != nil {
-			return "", err
+			return model.RBAC{}, err
 		}
-		for _, x := range l.Items {
-			out.Roles = append(out.Roles, model.Role{Kind: "ClusterRole", Name: x.Name, Rules: convertRules(x.Rules)})
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return model.RBAC{}, err
-	}
-	err = paginate("rolebindings", func(o metav1.ListOptions) (string, error) {
-		l, err := r.RoleBindings(metav1.NamespaceAll).List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for _, x := range l.Items {
-			out.Bindings = append(out.Bindings, model.RoleBinding{
-				Kind: "RoleBinding", Namespace: x.Namespace, Name: x.Name,
-				RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
-			})
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return model.RBAC{}, err
-	}
-	err = paginate("clusterrolebindings", func(o metav1.ListOptions) (string, error) {
-		l, err := r.ClusterRoleBindings().List(ctx, o)
-		if err != nil {
-			return "", err
-		}
-		for _, x := range l.Items {
-			out.Bindings = append(out.Bindings, model.RoleBinding{
-				Kind: "ClusterRoleBinding", Name: x.Name,
-				RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
-			})
-		}
-		return l.Continue, nil
-	})
-	if err != nil {
-		return model.RBAC{}, err
+		out.Bindings = append(out.Bindings, bs...)
 	}
 	return out, nil
+}
+
+func convertRole(x *rbacv1.Role) model.Role {
+	return model.Role{Kind: "Role", Namespace: x.Namespace, Name: x.Name, Rules: convertRules(x.Rules)}
+}
+
+func convertClusterRole(x *rbacv1.ClusterRole) model.Role {
+	return model.Role{Kind: "ClusterRole", Name: x.Name, Rules: convertRules(x.Rules)}
+}
+
+func convertRoleBinding(x *rbacv1.RoleBinding) model.RoleBinding {
+	return model.RoleBinding{
+		Kind: "RoleBinding", Namespace: x.Namespace, Name: x.Name,
+		RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
+	}
+}
+
+func convertClusterRoleBinding(x *rbacv1.ClusterRoleBinding) model.RoleBinding {
+	return model.RoleBinding{
+		Kind: "ClusterRoleBinding", Name: x.Name,
+		RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
+	}
 }
 
 func convertRules(rules []rbacv1.PolicyRule) []model.PolicyRule {
@@ -516,4 +606,111 @@ func convertSubjects(subjects []rbacv1.Subject) []model.Subject {
 		out = append(out, model.Subject{Kind: s.Kind, Name: s.Name, Namespace: s.Namespace})
 	}
 	return out
+}
+
+// forbiddenReason describes a forbidden list for Inventory.Unavailable.
+func forbiddenReason(err error) string {
+	var st apierrors.APIStatus
+	if errors.As(err, &st) && st.Status().Message != "" {
+		return st.Status().Message // "<resource> is forbidden: ..."
+	}
+	return "forbidden: " + err.Error()
+}
+
+// Inventory lists everything the inventory pages need with one LIST per
+// resource. A forbidden resource is reported in Unavailable with an empty
+// slice; any other error fails the read. Implements snapshot.Source.
+func (s *Source) Inventory(ctx context.Context) (model.Inventory, error) {
+	inv := model.Inventory{Unavailable: map[string]string{}}
+	var firstErr error
+	// read records a failed list: forbidden as unavailable, anything else as
+	// the error to return.
+	read := func(name string, err error) {
+		switch {
+		case err == nil:
+		case apierrors.IsForbidden(err):
+			inv.Unavailable[name] = forbiddenReason(err)
+		case firstErr == nil:
+			firstErr = err
+		}
+	}
+	var err error
+	inv.Pods, err = s.ListPods(ctx)
+	read("pods", err)
+	inv.PVCs, err = s.ListPVCs(ctx)
+	read("persistentvolumeclaims", err)
+	inv.PVs, err = s.ListPVs(ctx)
+	read("persistentvolumes", err)
+	inv.StorageClasses, err = s.ListStorageClasses(ctx)
+	read("storageclasses", err)
+	for _, w := range []struct {
+		name string
+		list func(context.Context) ([]model.Workload, error)
+	}{
+		{"deployments", s.listDeployments}, {"statefulsets", s.listStatefulSets}, {"daemonsets", s.listDaemonSets},
+		{"jobs", s.listJobs}, {"cronjobs", s.listCronJobs},
+	} {
+		ws, err := w.list(ctx)
+		read(w.name, err)
+		inv.Workloads = append(inv.Workloads, ws...)
+	}
+	inv.ReplicaSets, err = s.ListReplicaSets(ctx)
+	read("replicasets", err)
+	inv.Services, err = s.ListServices(ctx)
+	read("services", err)
+	inv.EndpointSlices, err = s.ListEndpointSlices(ctx)
+	read("endpointslices", err)
+	inv.Ingresses, err = s.ListIngresses(ctx)
+	read("ingresses", err)
+	inv.Nodes, err = s.ListNodes(ctx)
+	read("nodes", err)
+	inv.Namespaces, err = s.ListNamespaces(ctx)
+	read("namespaces", err)
+	for _, r := range []struct {
+		name string
+		list func(context.Context) ([]model.Role, error)
+	}{{"roles", s.listRoles}, {"clusterroles", s.listClusterRoles}} {
+		rs, err := r.list(ctx)
+		read(r.name, err)
+		inv.RBAC.Roles = append(inv.RBAC.Roles, rs...)
+	}
+	for _, b := range []struct {
+		name string
+		list func(context.Context) ([]model.RoleBinding, error)
+	}{{"rolebindings", s.listRoleBindings}, {"clusterrolebindings", s.listClusterRoleBindings}} {
+		bs, err := b.list(ctx)
+		read(b.name, err)
+		inv.RBAC.Bindings = append(inv.RBAC.Bindings, bs...)
+	}
+	inv.Certs, err = s.certManager(ctx, inv.Unavailable)
+	read("cert-manager", err)
+	if s.opts.AWSAuth {
+		cm, err := s.cs.CoreV1().ConfigMaps(awsAuthNamespace).Get(ctx, awsAuthName, metav1.GetOptions{})
+		switch {
+		case apierrors.IsNotFound(err):
+			inv.AWSAuth = &model.AWSAuth{}
+		case err != nil:
+			read(awsAuthName, err)
+		default:
+			a := awsAuthFromConfigMap(cm)
+			inv.AWSAuth = &a
+		}
+	}
+	if firstErr != nil {
+		return model.Inventory{}, firstErr
+	}
+	var version string
+	if v, err := s.cs.Discovery().ServerVersion(); err == nil {
+		version = v.GitVersion
+	}
+	inv.Cluster = clusterInfo(s.opts.ClusterName, version, inv.Nodes)
+	inv.ReadAt = now(s.opts.Now)
+	return inv, nil
+}
+
+func now(f func() time.Time) time.Time {
+	if f != nil {
+		return f()
+	}
+	return time.Now()
 }

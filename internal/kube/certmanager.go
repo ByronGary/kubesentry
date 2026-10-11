@@ -22,10 +22,20 @@ func certGVR(resource string) schema.GroupVersionResource {
 // issuerTypes are the spec keys that select an issuer's backend.
 var issuerTypes = []string{"acme", "ca", "vault", "selfSigned", "venafi"}
 
+// certManagerResources are the cert-manager.io/v1 resources kubesentry reads,
+// in the order their objects appear in model.CertManager.
+var certManagerResources = []string{"certificates", "issuers", "clusterissuers", "certificaterequests"}
+
 // CertManager reads cert-manager's Certificates, Issuers, ClusterIssuers and
 // CertificateRequests. It reports Installed: false, without an error, when the
 // cert-manager.io/v1 API is not served. Secrets are never read.
 func (s *Source) CertManager(ctx context.Context) (model.CertManager, error) {
+	return s.certManager(ctx, nil)
+}
+
+// certManager is CertManager; with a non-nil unavailable map a forbidden
+// resource is recorded there instead of failing the read.
+func (s *Source) certManager(ctx context.Context, unavailable map[string]string) (model.CertManager, error) {
 	if s.dyn == nil {
 		return model.CertManager{}, nil
 	}
@@ -36,26 +46,25 @@ func (s *Source) CertManager(ctx context.Context) (model.CertManager, error) {
 		return model.CertManager{}, fmt.Errorf("discover cert-manager: %w", err)
 	}
 	out := model.CertManager{Installed: true}
-
-	err := s.listDynamic(ctx, "certificates", func(u *unstructured.Unstructured) {
-		out.Certificates = append(out.Certificates, convertCertificate(u))
-	})
-	if err != nil {
-		return model.CertManager{}, err
-	}
-	for _, kind := range []struct{ resource, kind string }{{"issuers", "Issuer"}, {"clusterissuers", "ClusterIssuer"}} {
-		err := s.listDynamic(ctx, kind.resource, func(u *unstructured.Unstructured) {
-			out.Issuers = append(out.Issuers, convertIssuer(u, kind.kind))
-		})
+	for _, r := range []struct {
+		resource string
+		each     func(*unstructured.Unstructured)
+	}{
+		{"certificates", func(u *unstructured.Unstructured) { out.Certificates = append(out.Certificates, convertCertificate(u)) }},
+		{"issuers", func(u *unstructured.Unstructured) { out.Issuers = append(out.Issuers, convertIssuer(u, "Issuer")) }},
+		{"clusterissuers", func(u *unstructured.Unstructured) {
+			out.Issuers = append(out.Issuers, convertIssuer(u, "ClusterIssuer"))
+		}},
+		{"certificaterequests", func(u *unstructured.Unstructured) { out.Requests = append(out.Requests, convertCertificateRequest(u)) }},
+	} {
+		err := s.listDynamic(ctx, r.resource, r.each)
+		if err != nil && unavailable != nil && apierrors.IsForbidden(err) {
+			unavailable[r.resource] = forbiddenReason(err)
+			continue
+		}
 		if err != nil {
 			return model.CertManager{}, err
 		}
-	}
-	err = s.listDynamic(ctx, "certificaterequests", func(u *unstructured.Unstructured) {
-		out.Requests = append(out.Requests, convertCertificateRequest(u))
-	})
-	if err != nil {
-		return model.CertManager{}, err
 	}
 	return out, nil
 }
@@ -83,9 +92,19 @@ func timeField(u *unstructured.Unstructured, fields ...string) time.Time {
 	return t
 }
 
+// durationField parses a Go duration string such as "2160h0m0s"; 0 when
+// unset or malformed.
+func durationField(u *unstructured.Unstructured, fields ...string) time.Duration {
+	d, err := time.ParseDuration(str(u, fields...))
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
+}
+
 // statusCondition returns the status, reason and message of the named condition.
 func statusCondition(u *unstructured.Unstructured, typ string) (status, reason, message string) {
-	conds, _, _ := unstructured.NestedSlice(u.Object, "status", "conditions")
+	conds, _ := nestedSlice(u.Object, "status", "conditions")
 	for _, c := range conds {
 		m, ok := c.(map[string]any)
 		if !ok || m["type"] != typ {
@@ -94,7 +113,7 @@ func statusCondition(u *unstructured.Unstructured, typ string) (status, reason, 
 		status, _ = m["status"].(string)
 		reason, _ = m["reason"].(string)
 		message, _ = m["message"].(string)
-		return
+		return status, reason, truncate(message)
 	}
 	return "", "", ""
 }
@@ -113,6 +132,8 @@ func convertCertificate(u *unstructured.Unstructured) model.Certificate {
 		SecretName: str(u, "spec", "secretName"), CommonName: str(u, "spec", "commonName"),
 		NotBefore: timeField(u, "status", "notBefore"), NotAfter: timeField(u, "status", "notAfter"),
 		RenewalTime: timeField(u, "status", "renewalTime"),
+		Duration:    durationField(u, "spec", "duration"),
+		RenewBefore: durationField(u, "spec", "renewBefore"),
 	}
 	c.DNSNames, _, _ = unstructured.NestedStringSlice(u.Object, "spec", "dnsNames")
 	c.IssuerKind, c.IssuerName = issuerRef(u)
@@ -122,7 +143,7 @@ func convertCertificate(u *unstructured.Unstructured) model.Certificate {
 
 func convertIssuer(u *unstructured.Unstructured, kind string) model.Issuer {
 	is := model.Issuer{Kind: kind, Namespace: u.GetNamespace(), Name: u.GetName(), Type: "unknown", Created: u.GetCreationTimestamp().Time}
-	spec, _, _ := unstructured.NestedMap(u.Object, "spec")
+	spec, _ := u.Object["spec"].(map[string]any)
 	for _, t := range issuerTypes {
 		if _, ok := spec[t]; ok {
 			is.Type = t
@@ -142,7 +163,7 @@ func convertIssuer(u *unstructured.Unstructured, kind string) model.Issuer {
 func convertCertificateRequest(u *unstructured.Unstructured) model.CertificateRequest {
 	r := model.CertificateRequest{
 		Namespace: u.GetNamespace(), Name: u.GetName(), Created: u.GetCreationTimestamp().Time,
-		Certificate: u.GetAnnotations()["cert-manager.io/certificate-name"],
+		Certificate: u.GetAnnotations()[certificateNameAnnotation],
 	}
 	r.IssuerKind, r.IssuerName = issuerRef(u)
 	r.Ready, r.Reason, r.Message = statusCondition(u, "Ready")

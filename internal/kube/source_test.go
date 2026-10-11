@@ -69,8 +69,11 @@ func TestConvertPodSecurityAndSidecars(t *testing.T) {
 	if got.Specs[1].RunAsUser == nil || *got.Specs[1].RunAsUser != 1000 {
 		t.Errorf("pod-level runAsUser should apply to the sidecar: %+v", got.Specs[1])
 	}
-	// The sidecar's status is kept so its OOMKill counts; the ordinary init container's is not.
-	if len(got.Containers) != 2 || got.Containers[1].Name != "proxy" || got.Containers[1].LastTerminatedReason != "OOMKilled" {
+	// The sidecar's status is kept so its OOMKill counts; the ordinary init
+	// container's is kept too (Init:CrashLoopBackOff), both marked Init.
+	if len(got.Containers) != 3 || got.Containers[0].Init ||
+		got.Containers[1].Name != "proxy" || !got.Containers[1].Init || got.Containers[1].LastTerminatedReason != "OOMKilled" ||
+		got.Containers[2].Name != "migrate" || !got.Containers[2].Init {
 		t.Errorf("container statuses: %+v", got.Containers)
 	}
 }
