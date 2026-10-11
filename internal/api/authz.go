@@ -258,6 +258,8 @@ func CacheKeyFunc(a auth.Authorizer, version func() uint64, caps ...auth.Capabil
 		if version != nil {
 			v = version()
 		}
-		return r.URL.Path + "?" + r.URL.Query().Encode() + "\x00" + sk + "\x00" + strconv.FormatUint(v, 10), true
+		// The escaped path and the encoded query hold no raw "?" or NUL, so
+		// the parts cannot run into each other.
+		return r.URL.EscapedPath() + "?" + r.URL.Query().Encode() + "\x00" + sk + "\x00" + strconv.FormatUint(v, 10), true
 	}
 }

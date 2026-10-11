@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/ByronGary/kubesentry/internal/auth"
@@ -189,5 +190,12 @@ func TestCacheKeyFunc(t *testing.T) {
 	}
 	if _, ok := keyOf("", "/api/v1/pods"); ok {
 		t.Fatal("anonymous request cacheable")
+	}
+	// The path cannot spill into the query or the scope part.
+	a, _ := keyOf("alice", "/api/v1/nodes/n1?summary=true")
+	b, _ := keyOf("alice", "/api/v1/nodes/n1%3Fsummary=true")
+	c, _ := keyOf("alice", "/api/v1/nodes/n1%00x")
+	if a == b || strings.Count(c, "\x00") != 2 {
+		t.Errorf("ambiguous keys: %q %q %q", a, b, c)
 	}
 }
