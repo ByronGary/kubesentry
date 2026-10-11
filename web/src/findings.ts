@@ -127,7 +127,7 @@ const SECURITY_CATEGORY_LABEL: Record<string, string> = { pod: 'Pods', rbac: 'RB
  * One line per security check with critical or warning hits outside system
  * components, e.g. "2 workloads run privileged containers: data/ml-trainer, shop/cache."
  */
-export function securityFindings(resp: SecurityResponse | undefined): Finding[] {
+export function securityFindings(resp: SecurityResponse | undefined, partial = false): Finding[] {
   const byCheck = new Map<string, SecurityFinding[]>()
   for (const f of resp?.findings ?? []) {
     if (f.system || (f.severity !== 'crit' && f.severity !== 'warn')) continue
@@ -146,7 +146,8 @@ export function securityFindings(resp: SecurityResponse | undefined): Finding[] 
       category: 'Security',
       subject: fs[0].title,
       subjectIsId: false,
-      sentence: `${phrase}: ${listSome(subjects)}.`,
+      // A summary holds only the most severe findings, so the count is a lower bound.
+      sentence: `${partial ? `At least ${phrase}` : phrase}: ${listSome(subjects)}.`,
       meta: SECURITY_CATEGORY_LABEL[fs[0].category] ?? fs[0].category,
       href: `#/security?check=${encodeURIComponent(check)}`,
       order: -n,

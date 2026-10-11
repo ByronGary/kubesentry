@@ -11,9 +11,25 @@ export interface ApiState<T> {
 
 let authVersion = 0
 const listeners = new Set<() => void>()
+
+/**
+ * Refetch everything: a token was entered, or the user's access was
+ * rechecked. Every useApi and usePaged hook loads again.
+ */
 export function bumpAuth(): void {
   authVersion++
   listeners.forEach((l) => l())
+}
+
+/** Changes whenever bumpAuth runs, so effects that depend on it refetch. */
+export function useAuthVersion(): number {
+  const [v, setV] = useState(authVersion)
+  useEffect(() => {
+    const on = () => setV(authVersion)
+    listeners.add(on)
+    return () => void listeners.delete(on)
+  }, [])
+  return v
 }
 
 /**
@@ -25,14 +41,8 @@ export function useApi<T>(path: string | null, refreshMs?: number): ApiState<T> 
   const [error, setError] = useState<ApiError | Error>()
   const [loading, setLoading] = useState(path !== null)
   const [tick, setTick] = useState(0)
-  const [auth, setAuth] = useState(authVersion)
+  const auth = useAuthVersion()
   const lastPath = useRef<string | null>(null)
-
-  useEffect(() => {
-    const on = () => setAuth(authVersion)
-    listeners.add(on)
-    return () => void listeners.delete(on)
-  }, [])
 
   useEffect(() => {
     if (!path) {
@@ -40,7 +50,10 @@ export function useApi<T>(path: string | null, refreshMs?: number): ApiState<T> 
       return
     }
     // A different resource: drop stale data. Same resource: keep it while refetching.
-    if (lastPath.current !== path) setData(undefined)
+    if (lastPath.current !== path) {
+      setData(undefined)
+      setError(undefined)
+    }
     lastPath.current = path
     const ctl = new AbortController()
     setLoading(true)
@@ -67,4 +80,27 @@ export function useApi<T>(path: string | null, refreshMs?: number): ApiState<T> 
 
   const reload = useCallback(() => setTick((t) => t + 1), [])
   return { data, error, loading, reload }
+}
+
+/** `value`, once it has stopped changing for `ms`. Keeps typing responsive on big lists. */
+export function useDebounced<T>(value: T, ms = 200): T {
+  const [v, setV] = useState(value)
+  useEffect(() => {
+    if (Object.is(v, value)) return
+    const id = setTimeout(() => setV(value), ms)
+    return () => clearTimeout(id)
+  }, [value, ms, v])
+  return v
+}
+
+/** A clock that ticks every `ms`, for "3 s ago" text and cool-downs. */
+export function useNow(ms = 1000, active = true): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), ms)
+    return () => clearInterval(id)
+  }, [ms, active])
+  return now
 }

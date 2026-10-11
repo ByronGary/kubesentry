@@ -1,10 +1,15 @@
 import { useMemo } from 'react'
-import { Async, Empty, PageHead, slashBreaks, StatusGlyph } from '../components/ui'
+import { seesNothing } from '../access'
+import { NoNamespaces, useInfo } from '../components/Access'
+import { Async, Empty, ListStatus, PageHead, StatusGlyph } from '../components/ui'
+import { Lines, VirtualTable, type Column } from '../components/VirtualTable'
 import { formatAge, formatDateTime, plural } from '../format'
-import { filterWorkloads, imageSummary, readiness, shortImage } from '../inventory'
+import { filterWorkloads, imageSummary, readiness, shortImage, waitingReasons } from '../inventory'
 import { setQuery, type Route } from '../router'
 import type { WorkloadSummary, WorkloadsResponse } from '../types'
-import { useApi } from '../useApi'
+import { useDebounced } from '../useApi'
+import { usePaged } from '../usePaged'
+import { compareNumber, compareStatus, compareText } from '../virtual'
 
 const KINDS: WorkloadSummary['kind'][] = ['Deployment', 'StatefulSet', 'DaemonSet', 'Job', 'CronJob']
 const STATUSES = [
@@ -14,17 +19,114 @@ const STATUSES = [
   ['unknown', 'Unknown'],
 ] as const
 
+const items = (r: WorkloadsResponse) => r.items
+const merge = (r: WorkloadsResponse, all: WorkloadSummary[]): WorkloadsResponse => ({ ...r, items: all, count: all.length })
+
+const columns: Column<WorkloadSummary>[] = [
+  { key: 'status', header: 'Status', width: 112, sort: (a, b) => compareStatus(a.status, b.status), cell: (w) => <StatusGlyph status={w.status} /> },
+  { key: 'kind', header: 'Kind', width: 116, sort: (a, b) => compareText(a.kind, b.kind), cell: (w) => w.kind },
+  {
+    key: 'name',
+    header: 'Workload',
+    width: '24%',
+    sort: (a, b) => compareText(`${a.namespace}/${a.name}`, `${b.namespace}/${b.name}`),
+    title: (w) => `${w.namespace}/${w.name}`,
+    cell: (w) => (
+      <Lines
+        main={<a className="id" href={`#/map?namespace=${encodeURIComponent(w.namespace)}`} title="Show on the map">{w.name}</a>}
+        sub={<span className="id">{w.namespace}</span>}
+      />
+    ),
+  },
+  {
+    key: 'ready',
+    header: 'Ready',
+    width: 128,
+    sort: (a, b) => compareNumber(a.desired ? a.ready / a.desired : 1, b.desired ? b.ready / b.desired : 1),
+    title: (w) => (w.lastScheduleTime ? `Last scheduled ${formatDateTime(w.lastScheduleTime)}` : undefined),
+    cell: (w) => {
+      const r = readiness(w)
+      const sub = r.sub ?? (w.notReady ? `${w.notReady} not ready` : undefined)
+      return <Lines main={<span className={w.kind === 'CronJob' ? 'id' : 'num'}>{r.main}</span>} sub={sub} />
+    },
+  },
+  { key: 'pods', header: 'Pods', width: 72, className: 'num', firstDir: 'desc', sort: (a, b) => compareNumber(a.pods, b.pods), cell: (w) => w.pods },
+  {
+    key: 'restarts',
+    header: 'Restarts',
+    width: 96,
+    className: 'num',
+    firstDir: 'desc',
+    sort: (a, b) => compareNumber(a.restarts, b.restarts),
+    cell: (w) => <Lines main={w.restarts} sub={w.oomKilled ? <span className="tag">OOMKilled</span> : undefined} />,
+  },
+  {
+    key: 'detail',
+    header: 'Detail',
+    width: '26%',
+    sort: (a, b) => compareNumber(Object.values(a.waiting ?? {}).reduce((s, n) => s + n, 0), Object.values(b.waiting ?? {}).reduce((s, n) => s + n, 0)),
+    firstDir: 'desc',
+    title: (w) => [...waitingReasons(w.waiting), w.detail].filter(Boolean).join('\n') || undefined,
+    cell: (w) => {
+      const waiting = waitingReasons(w.waiting)
+      if (!waiting.length) return w.detail ? <Lines main={w.detail} /> : <span className="muted">-</span>
+      return (
+        <Lines
+          main={waiting.map((r) => (
+            <span key={r} className="tag tag-glyph tag-crit">
+              <StatusGlyph status="crit" label={false} />
+              {r}
+            </span>
+          ))}
+          sub={w.detail || undefined}
+        />
+      )
+    },
+  },
+  {
+    key: 'images',
+    header: 'Images',
+    width: '18%',
+    sort: (a, b) => compareText(a.images?.[0], b.images?.[0]),
+    title: (w) => (w.images ?? []).join('\n') || undefined,
+    cell: (w) => {
+      const img = imageSummary(w.images)
+      return (
+        <span className="id">
+          {shortImage(img.first)}
+          {img.more > 0 && <span className="muted"> +{img.more}</span>}
+        </span>
+      )
+    },
+  },
+  {
+    key: 'age',
+    header: 'Age',
+    width: 64,
+    className: 'num',
+    sort: (a, b) => compareText(b.created, a.created),
+    title: (w) => formatDateTime(w.created),
+    cell: (w) => formatAge(w.created),
+  },
+]
+
 export function Workloads({ route }: { route: Route }) {
+  const info = useInfo()
   const p = route.query
   const filter = { q: p.get('q') ?? '', namespace: p.get('namespace') ?? '', kind: p.get('kind') ?? '', status: p.get('status') ?? '' }
   const set = (k: keyof typeof filter, v: string) => setQuery('/workloads', { ...filter, [k]: v })
 
-  // All namespaces at once so the namespace picker always lists every one.
-  const state = useApi<WorkloadsResponse>('/api/v1/workloads', 30_000)
-  const items = state.data?.items
-  const namespaces = useMemo(() => [...new Set([...(items ?? []).map((w) => w.namespace), ...(filter.namespace ? [filter.namespace] : [])])].sort(), [items, filter.namespace])
-  const shown = useMemo(() => filterWorkloads(items ?? [], filter), [items, filter.q, filter.namespace, filter.kind, filter.status])
-  const filtered = !!(filter.q || filter.namespace || filter.kind || filter.status)
+  // All namespaces at once so the namespace picker always lists every one; pages follow in the background.
+  const state = usePaged<WorkloadsResponse, WorkloadSummary>('/api/v1/workloads', { items, merge, refreshMs: 30_000 })
+  const all = state.data?.items
+  const dq = useDebounced(filter.q)
+  const namespaces = useMemo(() => [...new Set([...(all ?? []).map((w) => w.namespace), ...(filter.namespace ? [filter.namespace] : [])])].sort(), [all, filter.namespace])
+  const shown = useMemo(
+    () => filterWorkloads(all ?? [], { ...filter, q: dq }),
+    // The filter object is rebuilt every render; its fields are the dependencies.
+    [all, dq, filter.namespace, filter.kind, filter.status],
+  )
+  const troubled = useMemo(() => shown.filter((w) => w.waiting && Object.keys(w.waiting).length > 0).length, [shown])
 
   return (
     <>
@@ -58,66 +160,33 @@ export function Workloads({ route }: { route: Route }) {
       </div>
       <Async state={state} what="workloads">
         {(d) =>
-          shown.length === 0 ? (
-            d.items.length === 0 ? (
-              <Empty title="No workloads found">Nothing in the cluster is managed by a Deployment, StatefulSet, DaemonSet, Job or CronJob.</Empty>
-            ) : (
-              <Empty title="No workloads match">Clear the search or pick other filters.</Empty>
-            )
+          seesNothing(info, d.items.length, state.complete) ? (
+            <NoNamespaces />
           ) : (
             <>
-              <p className="count">
-                {shown.length} {plural(shown.length, 'workload', 'workloads')}
-                {filtered && shown.length !== d.items.length && ` of ${d.items.length}`}
-              </p>
-              <div className="table-wrap" tabIndex={0}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Status</th>
-                      <th>Kind</th>
-                      <th>Workload</th>
-                      <th>Ready</th>
-                      <th className="num">Pods</th>
-                      <th className="num">Restarts</th>
-                      <th>Images</th>
-                      <th className="num">Age</th>
-                      <th>Detail</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {shown.map((w) => {
-                      const r = readiness(w)
-                      const img = imageSummary(w.images)
-                      return (
-                        <tr key={`${w.kind}/${w.namespace}/${w.name}`}>
-                          <td><StatusGlyph status={w.status} /></td>
-                          <td>{w.kind}</td>
-                          <td className="id brk name">
-                            <a href={`#/map?namespace=${encodeURIComponent(w.namespace)}`} title="Show on the map">{slashBreaks(`${w.namespace}/${w.name}`)}</a>
-                          </td>
-                          <td>
-                            <span className={w.kind === 'CronJob' ? 'id nowrap' : 'num'}>{r.main}</span>
-                            {r.sub && <div className="muted small" title={w.lastScheduleTime ? formatDateTime(w.lastScheduleTime) : undefined}>{r.sub}</div>}
-                          </td>
-                          <td className="num">{w.pods}</td>
-                          <td className="num">
-                            {w.restarts}
-                            {w.oomKilled && <div><span className="tag">OOMKilled</span></div>}
-                          </td>
-                          <td className="id brk" title={(w.images ?? []).join('\n') || undefined}>
-                            <span aria-hidden="true">{slashBreaks(shortImage(img.first), '/:')}</span>
-                            <span className="sr-only">{img.first}</span>
-                            {img.more > 0 && <span className="muted"> +{img.more}</span>}
-                          </td>
-                          <td className="num" title={formatDateTime(w.created)}>{formatAge(w.created)}</td>
-                          <td className="msg">{w.detail || <span className="muted">-</span>}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
+              <ListStatus state={state} noun={['workload', 'workloads']} shown={shown.length} />
+              {troubled > 0 && (
+                <p className="muted small">
+                  {troubled} {plural(troubled, 'workload has', 'workloads have')} pods stuck waiting.
+                </p>
+              )}
+              {shown.length === 0 ? (
+                state.following ? null : d.items.length === 0 ? (
+                  <Empty title="No workloads found">Nothing in the cluster is managed by a Deployment, StatefulSet, DaemonSet, Job or CronJob.</Empty>
+                ) : (
+                  <Empty title="No workloads match">Clear the search or pick other filters.</Empty>
+                )
+              ) : (
+                <VirtualTable
+                  rows={shown}
+                  columns={columns}
+                  rowKey={(w) => `${w.kind}/${w.namespace}/${w.name}`}
+                  caption="Workloads, the ones in trouble first"
+                  rowHeight={52}
+                  minWidth={1120}
+                  resetKey={`${dq}|${filter.namespace}|${filter.kind}|${filter.status}`}
+                />
+              )}
             </>
           )
         }

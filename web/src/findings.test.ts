@@ -98,6 +98,10 @@ describe('securityFindings', () => {
     expect(f.find((x) => x.id === 'security:mystery')!.sentence).toBe('Odd thing: 1 object: shop/x.')
     expect(securityFindings(undefined)).toEqual([])
   })
+  it('gives a lower bound when built from a partial summary', () => {
+    const f = securityFindings(secResp([sec('privileged', 'shop/cache', 'crit')]), true)
+    expect(f[0].sentence).toBe('At least 1 workload runs privileged containers: shop/cache.')
+  })
 })
 
 const cert = (name: string, status: CertSummary['status'], extra: Partial<CertSummary> = {}): CertSummary => ({

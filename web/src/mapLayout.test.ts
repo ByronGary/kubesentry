@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { countCrossings, graphHref, layoutGraph, linksOf, placeInOrder, type MapLayout } from './mapLayout'
+import { collapseGraph, countCrossings, endpointText, graphHref, groupedText, howText, kindLabel, layoutGraph, linksOf, placeInOrder, type MapLayout } from './mapLayout'
 import type { GraphEdge, GraphKind, GraphNode } from './types'
 
 const n = (kind: GraphKind, name: string, ns = 'shop'): GraphNode =>
@@ -156,5 +156,153 @@ describe('helpers', () => {
     const { out, in: inc } = linksOf(shopEdges)
     expect(out.get(dep.id)).toEqual([pod1.id, pod2.id])
     expect(inc.get(node.id)).toEqual([pod1.id, pod2.id])
+  })
+
+  it('drops node links for users who cannot see nodes', () => {
+    expect(graphHref(node, 'shop', { nodes: false })).toBeUndefined()
+    expect(graphHref(pod1, 'shop', { nodes: false })).toBe('#/pods/shop/web-7d9-a')
+  })
+})
+
+describe('new kinds and links', () => {
+  it('puts ReplicaSets and other controllers in the workload column', () => {
+    const rs = n('ReplicaSet', 'web-7d9')
+    const ctl: GraphNode = { ...n('Controller', 'canary'), ownerKind: 'Rollout' }
+    const l = layoutGraph([svc, rs, ctl, pod1, pod2], [e(svc, rs), e(rs, pod1), e(ctl, pod2)])
+    expect(box(l, rs.id).column).toBe(box(l, ctl.id).column)
+    expect(l.columns.map((c) => c.label)).toEqual(['Services', 'Workloads', 'Pods'])
+    expect(kindLabel(ctl)).toBe('Rollout (controller)')
+    expect(kindLabel({ ...ctl, ownerKind: undefined })).toBe('Controller')
+    expect(kindLabel(rs)).toBe('ReplicaSet')
+    expect(graphHref(rs, 'shop')).toBeUndefined()
+    expect(graphHref(ctl, 'shop')).toBeUndefined()
+  })
+
+  it('describes endpoint states and how a link was found', () => {
+    expect(endpointText({ how: 'endpoints', ready: 3, notReady: 1, terminating: 2 })).toBe('3 ready, 1 not ready, 2 terminating')
+    // The server omits zero counts.
+    expect(endpointText({ how: 'endpoints', notReady: 2 })).toBe('0 ready, 2 not ready')
+    expect(endpointText({ how: 'endpoints' })).toBe('0 ready')
+    expect(endpointText({ how: 'owner' })).toBeUndefined()
+    expect(endpointText({})).toBeUndefined()
+    expect(howText('selector')).toBe('matched by labels')
+    expect(howText(undefined)).toBeUndefined()
+  })
+})
+
+describe('collapseGraph', () => {
+  const big = (pods: number, nodes: number) => {
+    const ns: GraphNode[] = [svc, dep]
+    const es: GraphEdge[] = [{ from: svc.id, to: dep.id, how: 'endpoints', ready: pods - 2, notReady: 2 }]
+    const nodeList = Array.from({ length: nodes }, (_, i) => n('Node', `node-${i}`))
+    ns.push(...nodeList)
+    for (let i = 0; i < pods; i++) {
+      const p = { ...n('Pod', `web-${i}`), status: (i === 0 ? 'crit' : 'ok') as GraphNode['status'] }
+      const c = n('PVC', `data-web-${i}`)
+      ns.push(p, c)
+      es.push({ from: dep.id, to: p.id, how: 'owner' }, e(p, nodeList[i % nodes]), e(p, c))
+    }
+    return { nodes: ns, edges: es }
+  }
+
+  it('leaves small namespaces alone', () => {
+    const g = collapseGraph(shopNodes, shopEdges)
+    expect(g.hidden).toBe(0)
+    expect(g.nodes.map((x) => x.id)).toEqual(shopNodes.map((x) => x.id))
+    expect(g.edges).toHaveLength(shopEdges.length)
+  })
+
+  it('folds a big workload into one pod box, its claims into one, and many nodes into one', () => {
+    const { nodes, edges } = big(300, 40)
+    const g = collapseGraph(nodes, edges)
+    const groups = g.nodes.filter((x) => x.group)
+    expect(groups.map((x) => [x.kind, x.name])).toEqual([
+      ['Pod', '300 pods'],
+      ['PVC', '300 claims'],
+      ['Node', '40 nodes'],
+    ])
+    const pods = groups[0]
+    expect(pods.status).toBe('crit')
+    expect(pods.detail).toBe('1 critical, 299 OK')
+    expect(pods.group).toEqual({ count: 300, owner: 'web' })
+    expect(g.hidden).toBe(640)
+    expect(g.nodes).toHaveLength(2 + 3)
+    // Links are merged, keep their method, and the Service link keeps its endpoint counts.
+    expect(g.edges.map((x) => [x.from, x.to, x.merged])).toEqual([
+      [svc.id, dep.id, 1],
+      [dep.id, pods.id, 300],
+      [pods.id, groups[2].id, 300],
+      [pods.id, groups[1].id, 300],
+    ])
+    expect(g.edges[0]).toMatchObject({ how: 'endpoints', ready: 298, notReady: 2 })
+    expect(g.edges[1].how).toBe('owner')
+    expect(graphHref(pods, 'shop')).toBe('#/pods?namespace=shop&q=web')
+    expect(graphHref(groups[1], 'shop')).toBe('#/storage?q=shop%2F')
+    expect(graphHref(groups[2], 'shop')).toBe('#/map?view=nodes')
+    expect(graphHref(groups[2], 'shop', { nodes: false })).toBeUndefined()
+    expect(kindLabel(pods)).toBe('Pods')
+  })
+
+  it('sums endpoint counts when Service links to pods merge', () => {
+    const pods = Array.from({ length: 20 }, (_, i) => n('Pod', `p-${i}`))
+    const edges: GraphEdge[] = pods.flatMap((p, i) => [
+      { from: dep.id, to: p.id, how: 'owner' as const },
+      { from: svc.id, to: p.id, how: 'endpoints' as const, ready: i < 15 ? 1 : undefined, terminating: i >= 18 ? 1 : undefined },
+    ])
+    const g = collapseGraph([svc, dep, ...pods], edges)
+    const toGroup = g.edges.find((x) => x.from === svc.id)!
+    expect(endpointText(toGroup)).toBe('15 ready, 2 terminating')
+  })
+
+  it('keeps pods of different owners apart and shared claims out of groups', () => {
+    const other = n('StatefulSet', 'db')
+    const shared = n('PVC', 'shared')
+    const a = Array.from({ length: 13 }, (_, i) => n('Pod', `a-${i}`))
+    const b = Array.from({ length: 3 }, (_, i) => n('Pod', `b-${i}`))
+    const edges = [...a.map((p) => e(dep, p)), ...b.map((p) => e(other, p)), e(a[0], shared), e(b[0], shared)]
+    const g = collapseGraph([dep, other, shared, ...a, ...b], edges)
+    expect(g.nodes.filter((x) => x.group).map((x) => x.name)).toEqual(['13 pods'])
+    expect(g.nodes.some((x) => x.id === shared.id)).toBe(true)
+    expect(g.nodes.filter((x) => x.kind === 'Pod' && !x.group)).toHaveLength(3)
+  })
+
+  it('folds the biggest small owners too when too many single pods remain', () => {
+    const owners = Array.from({ length: 100 }, (_, i) => n('Deployment', `w-${i}`))
+    const nodes: GraphNode[] = [...owners]
+    const edges: GraphEdge[] = []
+    owners.forEach((w, i) => {
+      // Owners 0-9 have 3 pods, the rest 1 or 2.
+      const count = i < 10 ? 3 : 1 + (i % 2)
+      for (let k = 0; k < count; k++) {
+        const p = n('Pod', `${w.name}-${k}`)
+        nodes.push(p)
+        edges.push(e(w, p))
+      }
+    })
+    const all = nodes.filter((x) => x.kind === 'Pod').length
+    expect(all).toBe(30 + 45 * 1 + 45 * 2)
+    const g = collapseGraph(nodes, edges, { maxPods: 12, maxTotalPods: 150, maxClaims: 12, maxNodes: 24 })
+    const single = g.nodes.filter((x) => x.kind === 'Pod' && !x.group).length
+    expect(single).toBeLessThanOrEqual(150)
+    // The 3-pod owners went first.
+    expect(g.nodes.filter((x) => x.group).every((x) => x.group!.count === 3)).toBe(true)
+    expect(collapseGraph(nodes, edges, { maxPods: 12, maxTotalPods: 1000, maxClaims: 12, maxNodes: 24 }).hidden).toBe(0)
+  })
+
+  it('describes what was grouped', () => {
+    const { nodes, edges } = big(300, 40)
+    const g = collapseGraph(nodes, edges)
+    expect(groupedText(g.nodes)).toBe('300 pods of 1 owner, 300 volume claims and 40 nodes')
+    expect(groupedText([])).toBe('')
+  })
+
+  it('makes a 10,000-pod namespace small enough to lay out quickly', () => {
+    const { nodes, edges } = big(10_000, 500)
+    const t = performance.now()
+    const g = collapseGraph(nodes, edges)
+    const l = layoutGraph(g.nodes, g.edges)
+    expect(performance.now() - t).toBeLessThan(1500)
+    expect(l.boxes).toHaveLength(5)
+    expect(l.height).toBeLessThan(1000)
   })
 })

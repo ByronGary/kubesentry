@@ -1,18 +1,24 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
+import { can } from '../access'
 import { qs } from '../api'
 import { ActivityTable } from '../components/ActivityTable'
 import { MemoryChart } from '../components/MemoryChart'
 import { Async, PageHead, Segmented, StatusGlyph } from '../components/ui'
 import { ago, formatBytes, formatCPU, plural } from '../format'
+import { activityEmptyText, metricsHistoryHours, metricsWhy, windowChoices, type WindowOption } from '../retention'
 import type { Info, PodDiagnostics, ProcessesResponse, Status } from '../types'
 import { useApi } from '../useApi'
 
-const WINDOWS = [
-  { value: '1h', label: '1 hour' },
-  { value: '6h', label: '6 hours' },
-  { value: '24h', label: '24 hours' },
-  { value: '168h', label: '7 days' },
+/** The server's memory windows (it accepts up to 7 days); longer than Prometheus keeps are disabled. */
+const WINDOWS: WindowOption[] = [
+  { value: '1h', label: '1 hour', hours: 1 },
+  { value: '6h', label: '6 hours', hours: 6 },
+  { value: '24h', label: '24 hours', hours: 24 },
+  { value: '168h', label: '7 days', hours: 168 },
 ]
+
+/** Diagnostics plus the lookback of its activity list, which a newer server may send (proposed contract). */
+type Diagnostics = PodDiagnostics & { activityWindow?: string }
 
 function verdict(d: PodDiagnostics): { status: Status; text: string } {
   const bad = d.checks.filter((c) => c.status === 'crit')
@@ -24,14 +30,17 @@ function verdict(d: PodDiagnostics): { status: Status; text: string } {
 
 export function PodDetail({ ns, name, info }: { ns: string; name: string; info: Info }) {
   const [win, setWin] = useState('6h')
-  const state = useApi<PodDiagnostics>(
+  const state = useApi<Diagnostics>(
     `/api/v1/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/diagnostics${qs({ window: win })}`,
     30_000,
   )
+  const procsOK = info.processes && can(info, 'processes')
+  const auditOK = can(info, 'audit')
   const procs = useApi<ProcessesResponse>(
-    info.processes ? `/api/v1/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/processes` : null,
+    procsOK ? `/api/v1/pods/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/processes` : null,
     15_000,
   )
+  const windows = useMemo(() => windowChoices(WINDOWS, metricsHistoryHours(info.prometheus), metricsWhy), [info.prometheus])
 
   return (
     <>
@@ -66,7 +75,7 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
               <section aria-labelledby="h-mem">
                 <div className="section-head">
                   <h2 id="h-mem">Memory</h2>
-                  <Segmented label="Time window" value={win} options={WINDOWS} onChange={setWin} />
+                  <Segmented label="Time window" value={win} options={windows} onChange={setWin} />
                 </div>
                 {!d.metricsAvailable ? (
                   <div className="notice">Memory history needs Prometheus. Start the server with <code>-prometheus-url</code>.</div>
@@ -88,7 +97,7 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
                 )}
               </section>
 
-              {info.processes && (
+              {procsOK && (
                 <section aria-labelledby="h-proc">
                   <h2 id="h-proc">Processes</h2>
                   {!procs.data ? (
@@ -149,16 +158,18 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
                 )}
               </section>
 
-              <section aria-labelledby="h-act">
-                <h2 id="h-act">Recent activity</h2>
-                {!d.auditAvailable ? (
-                  <div className="notice">Activity needs audit ingestion. The README shows how to turn it on.</div>
-                ) : d.activity.length === 0 ? (
-                  <p className="muted">Nobody has acted on this pod in the last 7 days.</p>
-                ) : (
-                  <ActivityTable events={d.activity} />
-                )}
-              </section>
+              {auditOK && (
+                <section aria-labelledby="h-act">
+                  <h2 id="h-act">Recent activity</h2>
+                  {!d.auditAvailable ? (
+                    <div className="notice">Activity needs audit ingestion. The README shows how to turn it on.</div>
+                  ) : d.activity.length === 0 ? (
+                    <p className="muted">{activityEmptyText(d.activityWindow, info.auditStore)}</p>
+                  ) : (
+                    <ActivityTable events={d.activity} />
+                  )}
+                </section>
+              )}
             </>
           )
         }}

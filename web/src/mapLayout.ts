@@ -12,7 +12,7 @@
 //    sits beside its pods rather than at the top of its column.
 
 import { podHref, workloadHref } from './findings'
-import type { GraphEdge, GraphKind, GraphNode } from './types'
+import type { GraphEdge, GraphKind, GraphNode, Status } from './types'
 
 export interface LayoutOptions {
   boxW: number
@@ -208,9 +208,15 @@ export function layoutGraph(nodes: GraphNode[], edges: GraphEdge[], options: Par
   const seen = new Set<string>()
   const down = new Map<string, string[]>()
   const up = new Map<string, string[]>()
+  // Push in place: a Service or Node with hundreds of neighbours must not copy its list per edge.
+  const push = (m: Map<string, string[]>, k: string, v: string) => {
+    const l = m.get(k)
+    if (l) l.push(v)
+    else m.set(k, [v])
+  }
   const link = (a: string, b: string) => {
-    down.set(a, [...(down.get(a) ?? []), b])
-    up.set(b, [...(up.get(b) ?? []), a])
+    push(down, a, b)
+    push(up, b, a)
   }
   edges.forEach((e, k) => {
     const a = items.get(e.from)
@@ -382,8 +388,12 @@ export function linksOf(edges: GraphEdge[]): { out: Map<string, string[]>; in: M
     const key = `${e.from}\u0000${e.to}`
     if (e.from === e.to || seen.has(key)) continue
     seen.add(key)
-    out.set(e.from, [...(out.get(e.from) ?? []), e.to])
-    inc.set(e.to, [...(inc.get(e.to) ?? []), e.from])
+    const o = out.get(e.from)
+    if (o) o.push(e.to)
+    else out.set(e.from, [e.to])
+    const i = inc.get(e.to)
+    if (i) i.push(e.from)
+    else inc.set(e.to, [e.from])
   }
   return { out, in: inc }
 }
@@ -394,12 +404,249 @@ export function isWorkloadKind(kind: string): boolean {
   return WORKLOAD_KINDS.has(kind)
 }
 
-/** Where a map object links to; undefined for kinds with no page of their own. */
-export function graphHref(n: GraphNode, namespace: string): string | undefined {
+/**
+ * Where a map object links to; undefined for kinds with no page of their own.
+ * `nodes: false` drops links to the node view for users who cannot see nodes.
+ */
+export function graphHref(n: MapNode, namespace: string, opts: { nodes?: boolean } = {}): string | undefined {
   const ns = n.namespace ?? namespace
+  const canNodes = opts.nodes ?? true
+  if (n.group) {
+    if (n.kind === 'Pod') return `#/pods?${new URLSearchParams({ namespace: ns, ...(n.group.owner ? { q: n.group.owner } : {}) })}`
+    if (n.kind === 'PVC') return `#/storage?q=${encodeURIComponent(`${ns}/`)}`
+    if (n.kind === 'Node') return canNodes ? '#/map?view=nodes' : undefined
+    return undefined
+  }
   if (n.kind === 'Pod') return podHref(ns, n.name)
   if (isWorkloadKind(n.kind)) return workloadHref(ns, n.name)
   if (n.kind === 'PVC') return `#/storage?q=${encodeURIComponent(`${ns}/${n.name}`)}`
-  if (n.kind === 'Node') return `#/map?view=nodes&node=${encodeURIComponent(n.name)}`
+  if (n.kind === 'Node') return canNodes ? `#/map?view=nodes&node=${encodeURIComponent(n.name)}` : undefined
   return undefined
+}
+
+/** The kind line on a box: the real kind behind a Controller (e.g. Rollout), or the plural for a group. */
+export function kindLabel(n: MapNode): string {
+  if (n.group) return GROUP_LABEL[n.kind] ?? `${n.kind}s`
+  if (n.kind === 'Controller') return n.ownerKind ? `${n.ownerKind} (controller)` : 'Controller'
+  return n.kind
+}
+
+const GROUP_LABEL: Partial<Record<GraphKind, string>> = { Pod: 'Pods', PVC: 'Volume claims', Node: 'Nodes' }
+
+/**
+ * Endpoint states on a Service link: "3 ready, 1 not ready, 2 terminating".
+ * Undefined when the link carries none (it was not found through EndpointSlices).
+ */
+export function endpointText(e: Pick<GraphEdge, 'how' | 'ready' | 'notReady' | 'terminating'>): string | undefined {
+  const any = e.ready !== undefined || e.notReady !== undefined || e.terminating !== undefined
+  if (!any && e.how !== 'endpoints') return undefined
+  const parts = [`${e.ready ?? 0} ready`]
+  if (e.notReady) parts.push(`${e.notReady} not ready`)
+  if (e.terminating) parts.push(`${e.terminating} terminating`)
+  return parts.join(', ')
+}
+
+/** How a link was found, in words, for the list view and tooltips. */
+export function howText(how: GraphEdge['how']): string | undefined {
+  switch (how) {
+    case 'owner':
+      return 'owner reference'
+    case 'endpoints':
+      return 'endpoints'
+    case 'selector':
+      return 'matched by labels'
+    default:
+      return undefined
+  }
+}
+
+// Collapsing big namespaces.
+//
+// A workload with hundreds of pods would make a column thousands of pixels
+// tall and the SVG slow. Pods sharing an owner collapse into one box past a
+// threshold, claims used only by such a group collapse with them, and many
+// nodes collapse into one box that links to the node view.
+
+/** A graph object as drawn: a real one, or a group standing for several. */
+export interface MapNode extends GraphNode {
+  group?: {
+    /** How many objects it stands for. */
+    count: number
+    /** Name of the owning workload, for pod groups. */
+    owner?: string
+  }
+}
+
+/** A drawn link; `merged` counts the real links it stands for. */
+export interface MapEdge extends GraphEdge {
+  merged?: number
+}
+
+export interface CollapseOptions {
+  /** Pods per owner above which they become one box. */
+  maxPods: number
+  /** Pods shown one by one at most; past it the biggest remaining owners collapse too. */
+  maxTotalPods: number
+  /** Claims per pod group above which they become one box. */
+  maxClaims: number
+  /** Nodes above which they become one box. */
+  maxNodes: number
+}
+
+export const DEFAULT_COLLAPSE: CollapseOptions = { maxPods: 12, maxTotalPods: 150, maxClaims: 12, maxNodes: 24 }
+
+export interface CollapsedGraph {
+  nodes: MapNode[]
+  edges: MapEdge[]
+  /** Group id to the ids it stands for. */
+  members: Map<string, string[]>
+  /** Real objects hidden inside groups. */
+  hidden: number
+}
+
+const STATUS_ORDER: Status[] = ['crit', 'warn', 'unknown', 'ok']
+const STATUS_WORD: Record<Status, string> = { crit: 'critical', warn: 'warning', unknown: 'unknown', ok: 'OK' }
+
+function worstOf(ns: GraphNode[]): Status {
+  const has = new Set(ns.map((n) => n.status))
+  return STATUS_ORDER.find((s) => has.has(s)) ?? 'unknown'
+}
+
+/** "2 critical, 5 warning, 280 OK", worst first. */
+export function statusMix(ns: GraphNode[]): string {
+  const c: Record<Status, number> = { crit: 0, warn: 0, unknown: 0, ok: 0 }
+  for (const n of ns) c[n.status in c ? n.status : 'unknown']++
+  return STATUS_ORDER.filter((s) => c[s] > 0)
+    .map((s) => `${c[s]} ${STATUS_WORD[s]}`)
+    .join(', ')
+}
+
+const HOW_RANK: Record<string, number> = { endpoints: 0, owner: 1, selector: 2 }
+const GROUP = '\u0001'
+
+/** Whether an id is a group made by collapseGraph. */
+export function isGroupId(id: string): boolean {
+  return id.startsWith(GROUP)
+}
+
+export function collapseGraph(nodes: GraphNode[], edges: GraphEdge[], o: CollapseOptions = DEFAULT_COLLAPSE): CollapsedGraph {
+  const byId = new Map<string, GraphNode>()
+  for (const n of nodes) if (!byId.has(n.id)) byId.set(n.id, n)
+
+  // Each pod's owner: an incoming link from a workload-like object (lowest id wins, for stable output).
+  const ownerOf = new Map<string, string>()
+  for (const e of edges) {
+    const to = byId.get(e.to)
+    const from = byId.get(e.from)
+    if (to?.kind !== 'Pod' || !from || rankOf(from.kind) !== RANK.Deployment) continue
+    const cur = ownerOf.get(e.to)
+    if (cur === undefined || e.from < cur) ownerOf.set(e.to, e.from)
+  }
+  const podBuckets = new Map<string, string[]>()
+  for (const n of byId.values()) {
+    if (n.kind !== 'Pod') continue
+    const k = ownerOf.get(n.id) ?? ''
+    const b = podBuckets.get(k)
+    if (b) b.push(n.id)
+    else podBuckets.set(k, [n.id])
+  }
+
+  const rep = new Map<string, string>()
+  const members = new Map<string, string[]>()
+  const groups: MapNode[] = []
+  const addGroup = (id: string, kind: GraphKind, ids: string[], noun: [string, string], owner?: string) => {
+    const ms = ids.map((m) => byId.get(m)!)
+    groups.push({
+      id,
+      kind,
+      name: `${ids.length} ${ids.length === 1 ? noun[0] : noun[1]}`,
+      namespace: ms[0]?.namespace,
+      status: worstOf(ms),
+      detail: statusMix(ms),
+      group: owner ? { count: ids.length, owner } : { count: ids.length },
+    })
+    members.set(id, ids)
+    for (const m of ids) rep.set(m, id)
+  }
+
+  // Big owners always fold. If too many single pods remain, fold the biggest
+  // remaining owners (two pods or more) until the rest fit the budget.
+  const buckets = [...podBuckets].sort((a, b) => b[1].length - a[1].length || (a[0] < b[0] ? -1 : 1))
+  let single = 0
+  for (const [, ids] of buckets) if (ids.length <= o.maxPods) single += ids.length
+  for (const [owner, ids] of buckets) {
+    const big = ids.length > o.maxPods
+    const overBudget = !big && single > o.maxTotalPods && ids.length > 1 && owner !== ''
+    if (!big && !overBudget) continue
+    if (overBudget) single -= ids.length
+    addGroup(`${GROUP}pods:${owner}`, 'Pod', ids, ['pod', 'pods'], byId.get(owner)?.name)
+  }
+
+  // Claims used by exactly one pod group collapse with it.
+  if (members.size > 0) {
+    const sources = new Map<string, Set<string>>()
+    for (const e of edges) {
+      if (byId.get(e.to)?.kind !== 'PVC' || !byId.has(e.from)) continue
+      const s = sources.get(e.to)
+      if (s) s.add(rep.get(e.from) ?? e.from)
+      else sources.set(e.to, new Set([rep.get(e.from) ?? e.from]))
+    }
+    const claimBuckets = new Map<string, string[]>()
+    for (const [pvc, s] of sources) {
+      if (s.size !== 1) continue
+      const [g] = s
+      if (!members.has(g)) continue
+      const b = claimBuckets.get(g)
+      if (b) b.push(pvc)
+      else claimBuckets.set(g, [pvc])
+    }
+    for (const [g, ids] of claimBuckets) {
+      if (ids.length > o.maxClaims) addGroup(`${GROUP}claims:${g}`, 'PVC', ids, ['claim', 'claims'])
+    }
+  }
+
+  const nodeIds: string[] = []
+  for (const n of byId.values()) if (n.kind === 'Node') nodeIds.push(n.id)
+  if (nodeIds.length > o.maxNodes) addGroup(`${GROUP}nodes`, 'Node', nodeIds, ['node', 'nodes'])
+
+  const out: MapEdge[] = []
+  const at = new Map<string, number>()
+  for (const e of edges) {
+    if (!byId.has(e.from) || !byId.has(e.to)) continue
+    const from = rep.get(e.from) ?? e.from
+    const to = rep.get(e.to) ?? e.to
+    if (from === to) continue
+    const k = `${from}\u0000${to}`
+    const i = at.get(k)
+    if (i === undefined) {
+      at.set(k, out.length)
+      out.push({ ...e, from, to, merged: 1 })
+      continue
+    }
+    const m = out[i]
+    m.merged = (m.merged ?? 1) + 1
+    if (e.ready !== undefined || m.ready !== undefined) m.ready = (m.ready ?? 0) + (e.ready ?? 0)
+    if (e.notReady !== undefined || m.notReady !== undefined) m.notReady = (m.notReady ?? 0) + (e.notReady ?? 0)
+    if (e.terminating !== undefined || m.terminating !== undefined) m.terminating = (m.terminating ?? 0) + (e.terminating ?? 0)
+    // A merged link is as solid as its strongest member.
+    if (e.how && (!m.how || (HOW_RANK[e.how] ?? 3) < (HOW_RANK[m.how] ?? 3))) m.how = e.how
+  }
+
+  const kept: MapNode[] = []
+  for (const n of byId.values()) if (!rep.has(n.id)) kept.push(n)
+  return { nodes: [...kept, ...groups], edges: out, members, hidden: rep.size }
+}
+
+/** "316 pods of 2 workloads and 275 nodes", for the note above a collapsed map. */
+export function groupedText(groups: MapNode[]): string {
+  const sum = (kind: GraphKind) => groups.filter((g) => g.kind === kind && g.group).reduce((s, g) => s + (g.group?.count ?? 0), 0)
+  const owners = groups.filter((g) => g.kind === 'Pod' && g.group).length
+  const parts: string[] = []
+  const pods = sum('Pod')
+  if (pods) parts.push(`${pods} ${pods === 1 ? 'pod' : 'pods'} of ${owners} ${owners === 1 ? 'owner' : 'owners'}`)
+  const claims = sum('PVC')
+  if (claims) parts.push(`${claims} volume ${claims === 1 ? 'claim' : 'claims'}`)
+  const nodes = sum('Node')
+  if (nodes) parts.push(`${nodes} ${nodes === 1 ? 'node' : 'nodes'}`)
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : (parts[0] ?? '')
 }
