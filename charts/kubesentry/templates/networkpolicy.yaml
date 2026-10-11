@@ -1,0 +1,173 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy -}}
+{{- $agentNS := include "kubesentry.agentNamespace" . -}}
+{{- $webPort := include "kubesentry.webPort" . | int -}}
+{{- $web := $np.ingress.web -}}
+{{- $ingest := $np.ingress.ingest -}}
+{{- $ops := $np.ingress.ops -}}
+{{- $eg := $np.egress -}}
+# Server pods: only the listed peers reach each listener. A listener with no
+# allowed peers is closed (kubectl port-forward still works: it does not cross
+# the pod network).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kubesentry.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kubesentry.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $eg.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    {{- if or $web.fromCIDRs $web.fromNamespaces }}
+    # Web (UI and API).
+    - ports:
+        - port: {{ $webPort }}
+          protocol: TCP
+      from:
+        {{- range $web.fromCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- range $web.fromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- if or .Values.agent.enabled $ingest.fromCIDRs $ingest.fromNamespaces }}
+    # Ingest (agent reports, audit webhook).
+    - ports:
+        - port: 8081
+          protocol: TCP
+      from:
+        {{- if .Values.agent.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "kubesentry.agentSelectorLabels" . | nindent 14 }}
+          {{- if ne $agentNS .Release.Namespace }}
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $agentNS }}
+          {{- end }}
+        {{- end }}
+        {{- range $ingest.fromCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- range $ingest.fromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- if or $ops.fromCIDRs $ops.fromNamespaces }}
+    # Ops (/metrics).
+    - ports:
+        - port: 9090
+          protocol: TCP
+      from:
+        {{- range $ops.fromCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- range $ops.fromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+    {{- end }}
+  {{- if $eg.enabled }}
+  egress:
+    {{- if $eg.dns }}
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- with $eg.https.toCIDRs }}
+    # Kubernetes API server, AWS APIs (STS, CloudWatch Logs, AMP) and the IdP.
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- range $eg.https.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- if $eg.podIdentityAgent }}
+    # EKS Pod Identity agent (credentials for the pod's IAM role).
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+        - ipBlock:
+            cidr: fd00:ec2::23/128
+      ports:
+        - port: 80
+          protocol: TCP
+    {{- end }}
+    {{- with $eg.postgres.toCIDRs }}
+    # Postgres (audit store).
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ $eg.postgres.port }}
+          protocol: TCP
+    {{- end }}
+    {{- with $eg.redis.toCIDRs }}
+    # Redis (oauth2-proxy sessions).
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ $eg.redis.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if or $eg.prometheus.toCIDRs $eg.prometheus.toNamespaces }}
+    # In-cluster Prometheus.
+    - to:
+        {{- range $eg.prometheus.toCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- range $eg.prometheus.toNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        {{- range $eg.prometheus.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
+    {{- with $eg.extra }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,1147 @@
+---
+# Source: kubesentry/templates/agent.yaml
+# The agent needs hostPID, which only the "privileged" Pod Security level
+# allows. Keeping it in its own namespace lets the server's namespace enforce
+# "restricted".
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubesentry-agent
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+
+---
+# Source: kubesentry/templates/networkpolicy.yaml
+# Server pods: only the listed peers reach each listener. A listener with no
+# allowed peers is closed (kubectl port-forward still works: it does not cross
+# the pod network).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Web (UI and API).
+    - ports:
+        - port: 4180
+          protocol: TCP
+      from:
+        - ipBlock:
+            cidr: 10.20.0.0/22
+        - ipBlock:
+            cidr: 10.20.4.0/22
+        - ipBlock:
+            cidr: 10.20.8.0/22
+    # Ingest (agent reports, audit webhook).
+    - ports:
+        - port: 8081
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesentry
+              app.kubernetes.io/instance: kubesentry
+              app.kubernetes.io/component: agent
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubesentry-agent
+    # Ops (/metrics).
+    - ports:
+        - port: 9090
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: amazon-cloudwatch
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Kubernetes API server, AWS APIs (STS, CloudWatch Logs, AMP) and the IdP.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - port: 443
+          protocol: TCP
+    # Postgres (audit store).
+    - to:
+        - ipBlock:
+            cidr: 10.20.32.0/22
+        - ipBlock:
+            cidr: 10.20.36.0/22
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Redis (oauth2-proxy sessions).
+    - to:
+        - ipBlock:
+            cidr: 10.20.40.0/22
+      ports:
+        - port: 6379
+          protocol: TCP
+
+---
+# Source: kubesentry/templates/pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: server
+
+---
+# Source: kubesentry/templates/agent.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry-agent
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: agent
+# The agent never talks to the Kubernetes API.
+automountServiceAccountToken: false
+
+---
+# Source: kubesentry/templates/serviceaccount.yaml
+# IRSA: annotate with eks.amazonaws.com/role-arn. EKS Pod Identity: no
+# annotation; associate a role with this ServiceAccount
+# (aws eks create-pod-identity-association, docs/deploy-eks.md).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/kubesentry-prod-eks
+automountServiceAccountToken: false
+
+---
+# Source: kubesentry/templates/secrets.yaml
+# API token (-api-token): break-glass access to /api/
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubesentry-api
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+type: Opaque
+data:
+  token: <generated>
+
+---
+# Source: kubesentry/templates/secrets.yaml
+# Agent token (-agent-token): authenticates node agents' reports
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+type: Opaque
+data:
+  token: <generated>
+
+---
+# Source: kubesentry/templates/secrets.yaml
+# Agent token (-agent-token): authenticates node agents' reports
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry-agent
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+type: Opaque
+data:
+  token: <generated>
+
+---
+# Source: kubesentry/templates/configmap.yaml
+# IdP group -> Kubernetes groups, read by -auth-group-map-file. kubesentry
+# adds the mapped groups to the signed-in user's identity before asking the
+# API server what they may see.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubesentry-auth
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+data:
+  group-map.json: |
+    {
+      "payments-engineers": [
+        "payments-viewers"
+      ],
+      "platform-team": [
+        "platform-admins"
+      ]
+    }
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Read-only access to everything kubesentry watches. Secrets are deliberately
+# absent: kubesentry never reads them (the cert-manager page uses Certificate
+# status, not the issued Secret).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "persistentvolumes", "services", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  # Optional: without cert-manager the Certificates page reports it as not installed.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
+    verbs: ["get", "list", "watch"]
+  # Per-user scoping asks the API server what each signed-in user may see, and
+  # the startup probe checks kubesentry's own access per resource.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
+    verbs: ["create"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/auditevents: audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-audit-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["auditevents"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/processes: processes inside pods, per namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-process-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["processes"]
+    verbs: ["get"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/agents: node agent health; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-agents-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["agents"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubesentry
+subjects:
+  - kind: ServiceAccount
+    name: kubesentry
+    namespace: kubesentry
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# EKS aws-auth: this one ConfigMap only, to flag system:masters mappings.
+# list and watch with resourceNames work for a field-selected informer.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubesentry-aws-auth
+  namespace: kube-system
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["aws-auth"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubesentry-aws-auth
+  namespace: kube-system
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubesentry-aws-auth
+subjects:
+  - kind: ServiceAccount
+    name: kubesentry
+    namespace: kubesentry
+
+---
+# Source: kubesentry/templates/services.yaml
+# Web: the UI and /api/. The oauth2-proxy sidecar when enabled, else kubesentry.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: web
+      port: 4180
+      targetPort: web
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Ingest: POST /agent/report and /audit/webhook, token-authenticated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ingest
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Headless ingest: one DNS record per ready replica, so agents post every
+# report to each replica (-server-fanout).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ingest-headless
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Ops: /metrics, /healthz, /readyz (and /debug/pprof/ with server.pprof).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ops
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ops
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ops
+      port: 9090
+      targetPort: ops
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/agent.yaml
+# Node agent: reports the processes inside pods. It reads
+# /proc/<pid>/{cgroup,stat,statm,cmdline} of pod processes only, never
+# environment variables, files or memory, and redacts command lines. hostPID is
+# its only host access: it is not privileged, runs as non-root and mounts
+# nothing from the host.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry-agent
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: agent
+spec:
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubesentry
+        app.kubernetes.io/instance: kubesentry
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/version: "0.1.0"
+    spec:
+      serviceAccountName: kubesentry-agent
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostPID: true
+      priorityClassName: system-node-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  # Fargate runs no DaemonSets; its virtual nodes would leave pods Pending.
+                  - key: eks.amazonaws.com/compute-type
+                    operator: NotIn
+                    values: ["fargate"]
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/byrongary/kubesentry-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -server=http://kubesentry-ingest.kubesentry.svc:8081
+            - -server-fanout=kubesentry-ingest-headless.kubesentry.svc
+            - -interval=15s
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-agent
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 20m
+              memory: 32Mi
+
+---
+# Source: kubesentry/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubesentry
+        app.kubernetes.io/instance: kubesentry
+        app.kubernetes.io/component: server
+        app.kubernetes.io/version: "0.1.0"
+      annotations:
+        kubectl.kubernetes.io/default-container: server
+        checksum/group-map: dbf1c18857fd60a8bc21fd9e3648fb9c1691817d5538dfcb10b1435b2070270c
+    spec:
+      serviceAccountName: kubesentry
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - topologyKey: topology.kubernetes.io/zone
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesentry
+              app.kubernetes.io/instance: kubesentry
+              app.kubernetes.io/component: server
+          matchLabelKeys:
+            - pod-template-hash
+        - topologyKey: kubernetes.io/hostname
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesentry
+              app.kubernetes.io/instance: kubesentry
+              app.kubernetes.io/component: server
+          matchLabelKeys:
+            - pod-template-hash
+      containers:
+        - name: server
+          image: ghcr.io/byrongary/kubesentry:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr=127.0.0.1:8080
+            - -ingest-addr=:8081
+            - -ops-addr=:9090
+            - -cluster-name=prod-eks
+            - -auth-mode=proxy
+            - -auth-user-header=X-Forwarded-Email
+            - -auth-groups-header=X-Forwarded-Groups
+            - -auth-trusted-proxy-cidrs=127.0.0.1/32,::1/128
+            - -auth-group-map-file=/etc/kubesentry/auth/group-map.json
+            - -authz-qps=200
+            - -authz-cache-ttl=5m
+            - -authz-deny-ttl=1m
+            - -authz-share-by-groups=true
+            - -system-namespaces-add=cert-manager,external-secrets,monitoring,kubesentry-agent
+            - -ebs-prices=gp2=0.1,gp3=0.08,io2=0.125
+            - -prometheus-url=https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012
+            - -prometheus-sigv4=true
+            - -prometheus-selector=cluster="prod-eks"
+            - -aws-region=us-east-1
+            - -audit-store=postgres
+            - -pg-schema=prod_eks
+            - -audit-retention=30d
+            - -audit-redact-exec-args=true
+            - -cloudwatch=true
+            - -cloudwatch-log-group=/aws/eks/prod-eks/cluster
+            - -cloudwatch-start=24h
+            - -aws-auth=true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The Go GC works to stay under the container's memory limit.
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: server
+                  resource: limits.memory
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: KUBESENTRY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-api
+                  key: token
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-agent
+                  key: token
+            - name: KUBESENTRY_PG_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-pg
+                  key: dsn
+            - name: PGSSLMODE
+              value: "verify-full"
+            - name: PGSSLROOTCERT
+              value: /etc/kubesentry/pg-ca/global-bundle.pem
+          ports:
+            - name: ingest
+              containerPort: 8081
+              protocol: TCP
+            - name: ops
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              # Keep serving while the load balancer deregisters this pod.
+              sleep:
+                seconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          resources:
+            limits:
+              memory: 1536Mi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: auth-group-map
+              mountPath: /etc/kubesentry/auth
+              readOnly: true
+            - name: pg-ca
+              mountPath: /etc/kubesentry/pg-ca
+              readOnly: true
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
+          imagePullPolicy: IfNotPresent
+          args:
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://127.0.0.1:8080
+            - --provider=oidc
+            - --oidc-issuer-url=https://example.okta.com/oauth2/default
+            - --client-id=0oa1example2kubesentry3
+            - --redirect-url=https://kubesentry.prod.example.com/oauth2/callback
+            - --scope=openid email profile groups
+            - --oidc-groups-claim=groups
+            - --oidc-email-claim=email
+            - --code-challenge-method=S256
+            - --email-domain=*
+            - --allowed-group=platform-team
+            - --allowed-group=payments-engineers
+            # Identity reaches kubesentry only in these headers, and only from loopback.
+            - --pass-user-headers=true
+            - --set-xauthrequest=true
+            - --skip-auth-strip-headers=true
+            # API calls get 401 instead of a login redirect.
+            - --api-route=^/api/
+            # Behind the ALB: trust its X-Forwarded-Proto/Host for redirects.
+            - --reverse-proxy=true
+            - --skip-provider-button=true
+            - --silence-ping-logging=true
+            - --cookie-name=_kubesentry
+            - --cookie-secure=true
+            - --cookie-expire=12h
+            - --cookie-refresh=1h
+            - --cookie-samesite=lax
+            - --session-store-type=redis
+            - --redis-connection-url=rediss://master.kubesentry-sessions.abcdef.use1.cache.amazonaws.com:6379
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-oauth2
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-oauth2
+                  key: cookie-secret
+            - name: OAUTH2_PROXY_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-redis
+                  key: redis-password
+          ports:
+            - name: web
+              containerPort: 4180
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: web
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: web
+            periodSeconds: 20
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              # Keep serving while the load balancer deregisters this pod.
+              sleep:
+                seconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 20m
+              memory: 32Mi
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: auth-group-map
+          configMap:
+            name: kubesentry-auth
+        - name: pg-ca
+          configMap:
+            name: rds-ca
+
+---
+# Source: kubesentry/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:111122223333:certificate/00000000-0000-0000-0000-000000000000
+    alb.ingress.kubernetes.io/healthcheck-path: /ping
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/success-codes: "200"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kubesentry
+                port:
+                  name: web
+      host: "kubesentry.prod.example.com"
+
+---
+# Source: kubesentry/templates/apf.yaml
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  priorityLevelConfiguration:
+    name: kubesentry
+  matchingPrecedence: 1000
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount:
+            name: kubesentry
+            namespace: kubesentry
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+          clusterScope: true
+          namespaces: ["*"]
+      nonResourceRules:
+        - verbs: ["*"]
+          nonResourceURLs: ["*"]
+
+---
+# Source: kubesentry/templates/apf.yaml
+# API Priority and Fairness: kubesentry's requests (informer LISTs and WATCHes,
+# SubjectAccessReviews) get their own priority level, so a burst from kubesentry
+# queues behind its own share instead of competing with controllers and users.
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 20
+    lendablePercent: 50
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 16
+        handSize: 4
+        queueLengthLimit: 50
+
+---
+# Source: kubesentry/templates/prometheusrule.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  groups:
+    - name: kubesentry
+      rules:
+        - alert: KubesentrySnapshotStale
+          expr: max by (namespace, pod) (kubesentry_snapshot_age_seconds{namespace="kubesentry"}) > 120
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is serving a stale view of the cluster.
+            description: >-
+              {{ $labels.pod }} has served a snapshot older than 120s for 5 minutes.
+              Its informers are not keeping up with the API server, or the API server is unreachable.
+        - alert: KubesentryCloudWatchLag
+          expr: max by (namespace) (kubesentry_cloudwatch_lag_seconds{namespace="kubesentry"}) > 300
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's CloudWatch audit reader is behind.
+            description: >-
+              Audit events from CloudWatch Logs are more than 300s behind.
+              Check for throttling (FilterLogEvents quota), IAM errors, and that one replica holds the reader lock.
+        - alert: KubesentryPostgresErrors
+          expr: sum by (namespace, pod) (rate(kubesentry_audit_store_errors_total{namespace="kubesentry"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot write audit events to Postgres.
+            description: >-
+              {{ $labels.pod }} has failed audit store operations for 10 minutes.
+              Events queue in memory and the webhook answers 503 once the queue is full.
+        - alert: KubesentryAuthzReviewErrors
+          expr: |
+            sum by (namespace) (rate(kubesentry_authz_reviews_total{namespace="kubesentry",result="error"}[5m]))
+              / sum by (namespace) (rate(kubesentry_authz_reviews_total{namespace="kubesentry"}[5m]))
+              > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's SubjectAccessReviews are failing.
+            description: >-
+              More than 5% of SubjectAccessReviews failed over 10 minutes, so users see
+              less than their RBAC allows. Check API server health and APF throttling of kubesentry's ServiceAccount.
+        - alert: KubesentryAgentNodesDropped
+          expr: |
+            max by (namespace) (kubesentry_agent_nodes_reporting{namespace="kubesentry"})
+              < 0.8 * max by (namespace) (max_over_time(kubesentry_agent_nodes_reporting{namespace="kubesentry"}[1h]))
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fewer nodes report processes to kubesentry.
+            description: >-
+              Nodes reporting processes dropped by more than 20% within an hour.
+              Agents may be failing, or the cluster scaled down. Compare with the agent DaemonSet's ready count.
+
+---
+# Source: kubesentry/templates/servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  namespaceSelector:
+    matchNames:
+      - kubesentry
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: server
+      kubesentry.io/listener: ops
+  endpoints:
+    - port: ops
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

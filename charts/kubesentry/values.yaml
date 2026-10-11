@@ -1,0 +1,650 @@
+# Default values for kubesentry.
+#
+# Every server flag has a value here. Values left at null (or "", or an empty
+# list) leave the flag off, so the server's own default applies; the comment
+# next to each one names the flag and that default. Profiles:
+#   deploy/kind/values-kind.yaml          local kind cluster (dev only)
+#   charts/kubesentry/examples/values-eks.yaml   EKS with SSO, AMP, CloudWatch audit and RDS
+# docs/deploy-eks.md walks through an EKS install.
+
+# -- Overrides the chart name in resource names.
+nameOverride: ""
+# -- Overrides the full resource name prefix. With the release name
+# "kubesentry", resources are called kubesentry, kubesentry-ingest, and so on.
+fullnameOverride: ""
+# -- Labels added to every resource.
+commonLabels: {}
+
+# -- Shown in the UI header (-cluster-name). Falls back to eks.clusterName.
+clusterName: ""
+
+image:
+  repository: ghcr.io/byrongary/kubesentry
+  # -- Defaults to the chart's appVersion.
+  tag: ""
+  # -- sha256:... digest; when set it pins the image and the tag is only informative.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Server replicas. More than one needs audit.store=postgres when any audit
+# source is enabled (the chart refuses otherwise): each replica keeps its own
+# informers and snapshot, agents report to every replica (agent.fanout), and
+# audit events go through the shared Postgres store.
+replicas: 1
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    # Never drop below the desired count; a new pod becomes ready (caches
+    # synced, first snapshot built) before an old one stops.
+    maxUnavailable: 0
+    maxSurge: 1
+
+# -- Server container resources. GOMEMLIMIT is set from limits.memory, so the
+# Go GC works to stay under it. See docs/deploy-eks.md for sizing per cluster size.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Pod security context. Compatible with the Pod Security "restricted" level.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Security context of the kubesentry container (merged over these defaults).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# -- Seconds a terminating pod keeps serving before it is signalled, so a load
+# balancer (ALB target-type ip) deregisters it first. Uses the native preStop
+# sleep action (Kubernetes 1.30+); 0 disables it. Keep it above the target
+# group's deregistration delay that applies to in-flight requests.
+preStopSleepSeconds: 15
+# -- Must exceed preStopSleepSeconds plus the server's shutdown time.
+terminationGracePeriodSeconds: 45
+
+# -- Probes, all against the ops listener: readiness on /readyz (503 until the
+# informer caches have synced and the first snapshot exists), liveness on /healthz.
+probes:
+  readiness:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# -- Extra server flags, appended after the generated ones, e.g. ["-audit-journal=/data/audit.jsonl"].
+extraArgs: []
+# -- Extra environment variables for the server container.
+extraEnv: []
+# -- Extra volumes for the server pod.
+extraVolumes: []
+# -- Extra volume mounts for the server container.
+extraVolumeMounts: []
+# -- Extra containers in the server pod.
+extraContainers: []
+
+serviceAccount:
+  # -- Create the server's ServiceAccount.
+  create: true
+  # -- Name of the ServiceAccount; defaults to the full name.
+  name: ""
+  # -- Annotations, e.g. for IRSA:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/kubesentry
+  # EKS Pod Identity needs no annotation: create a pod identity association for
+  # this ServiceAccount instead (docs/deploy-eks.md).
+  annotations: {}
+
+rbac:
+  # -- Create the read-only ClusterRole and binding for the server. It covers
+  # everything kubesentry watches, plus creating SubjectAccessReviews; it never
+  # includes Secrets.
+  create: true
+  # -- ClusterRoles for kubesentry's virtual kubesentry.io resources, to bind to
+  # your users and groups. No such API exists; RBAC grants them and kubesentry
+  # checks them with SubjectAccessReviews. aggregateTo adds the
+  # rbac.authorization.k8s.io/aggregate-to-<role> label for each listed
+  # built-in role (view, edit, admin). Aggregating into view also reaches edit
+  # and admin, which include view.
+  viewerRoles:
+    create: true
+    # list auditevents.kubesentry.io: audit events, per namespace through a
+    # RoleBinding, events without a namespace through a ClusterRoleBinding.
+    auditViewer:
+      aggregateTo: []
+    # get processes.kubesentry.io: the processes inside a namespace's pods.
+    processViewer:
+      aggregateTo: []
+    # list agents.kubesentry.io (cluster-wide): node agent health.
+    agentsViewer:
+      aggregateTo: []
+
+# -- Server listener and tuning flags beyond the ones grouped elsewhere.
+server:
+  # -- -pprof: serve /debug/pprof/ on the ops listener.
+  pprof: false
+  # -- -cache (true): false lists from the API server on every request (debugging only).
+  cache: null
+  # -- -kube-qps (50) and -kube-burst (100): client-go limits for informers.
+  kubeQPS: null
+  kubeBurst: null
+  # -- -snapshot-min-interval (2s) and -snapshot-max-delay (10s): view rebuild debounce.
+  snapshotMinInterval: null
+  snapshotMaxDelay: null
+  # -- -rate-limit (20/s) and -rate-burst (40) per identity; -max-inflight (512) in total.
+  rateLimit: null
+  rateBurst: null
+  maxInflight: null
+  # -- -system-principal-prefixes (system:,eks:): users and groups that are
+  # components, not people.
+  systemPrincipalPrefixes: []
+  # -- -builtin-rbac-prefixes (system:,eks:,kubeadm:): platform-created RBAC.
+  builtinRBACPrefixes: []
+  # -- -node-label-keys-add: node labels to keep beyond the built-in allowlist.
+  nodeLabelKeysAdd: []
+
+# -- TLS for the server's listeners (-tls-cert, -tls-key) from a
+# kubernetes.io/tls Secret, e.g. one cert-manager issues. Its certificate must
+# name <fullname>-ingest.<namespace>.svc, the name agents connect to (fan-out
+# included). Agents then use https and verify against agent.tls; with
+# oauth2Proxy, the sidecar reaches kubesentry over https on loopback. The ops
+# listener stays plain HTTP for kubelet probes and Prometheus.
+tls:
+  enabled: false
+  existingSecret: ""
+
+service:
+  type: ClusterIP
+  # -- Annotations for the web Service (the one the Ingress points at).
+  annotations: {}
+
+# -- Bearer tokens. Each is generated once into a Secret and kept across
+# upgrades (Helm lookup), unless existingSecret names a Secret you manage, for
+# example with External Secrets. GitOps tools that render without cluster access
+# (helm template, Argo CD) cannot look secrets up and would generate new tokens
+# on every sync: use existingSecret there.
+tokens:
+  # -- API token (-api-token): the break-glass identity with cluster-wide scope.
+  # In proxy mode it still works from inside the pod network, for example
+  # through kubectl port-forward to the pod's port 8080. Set enabled: false to
+  # remove it.
+  api:
+    enabled: true
+    existingSecret: ""
+    key: token
+  # -- Agent token (-agent-token): created when agent.enabled. With
+  # agent.namespace set, the Secret must exist in both namespaces.
+  agent:
+    existingSecret: ""
+    key: token
+  # -- Audit webhook token (-audit-token): created when audit.sources.webhook.enabled.
+  audit:
+    existingSecret: ""
+    key: token
+
+auth:
+  # -- -auth-mode: proxy, token or none. Empty picks proxy when oauth2Proxy.enabled,
+  # otherwise token. "proxy" without the sidecar trusts identity headers from
+  # trustedProxyCIDRs (an SSO proxy you run elsewhere). "none" is refused: it
+  # is loopback-only and the chart exposes the web port.
+  mode: ""
+  # -- -auth-user-header and -auth-groups-header: identity headers set by the proxy.
+  userHeader: X-Forwarded-Email
+  groupsHeader: X-Forwarded-Groups
+  # -- -auth-username-prefix and -auth-groups-prefix: match the prefixes your
+  # API server (or EKS OIDC identity provider) applies, so RoleBindings written
+  # for kubectl users also apply in kubesentry, e.g. "oidc:".
+  usernamePrefix: ""
+  groupsPrefix: ""
+  # -- IdP group to Kubernetes groups, written to a ConfigMap and passed as
+  # -auth-group-map-file. Useful when the IdP sends group IDs (Entra ID object
+  # IDs) or names that differ from your RBAC subjects, e.g.
+  #   "4f6b0b8e-...": ["platform-admins"]
+  #   "team-payments": ["payments-viewers", "payments-oncall"]
+  groupMap: {}
+  # -- -auth-trusted-proxy-cidrs: only these addresses may send identity
+  # headers. Forced to loopback (127.0.0.1/32,::1/128) when oauth2Proxy.enabled.
+  trustedProxyCIDRs: []
+  # -- -authz-qps: SubjectAccessReview budget.
+  authzQPS: 200
+  # -- -authz-cache-ttl and -authz-deny-ttl: how long allowed and denied reviews are cached.
+  authzCacheTTL: 5m
+  authzDenyTTL: 1m
+  # -- -authz-share-by-groups: cache reviews per RBAC-relevant group set rather
+  # than per user. Fewer reviews when thousands of users share a few groups;
+  # only correct when no RoleBinding names individual users.
+  shareByGroups: false
+
+# -- oauth2-proxy sidecar for SSO. When enabled, the sidecar owns the web port
+# (4180) and kubesentry listens on 127.0.0.1:8080 in proxy mode, trusting
+# identity headers only from loopback. The sidecar strips any client-supplied
+# X-Forwarded-* identity headers before they reach kubesentry.
+oauth2Proxy:
+  enabled: false
+  image:
+    repository: quay.io/oauth2-proxy/oauth2-proxy
+    tag: v7.15.5
+    pullPolicy: IfNotPresent
+  # -- oauth2-proxy provider: oidc (Okta, Cognito, Keycloak, Google Workspace...),
+  # or entra-id for Microsoft Entra ID (handles group overage through Graph).
+  provider: oidc
+  # -- OIDC issuer, e.g. https://example.okta.com/oauth2/default,
+  # https://login.microsoftonline.com/<tenant-id>/v2.0,
+  # https://cognito-idp.<region>.amazonaws.com/<user-pool-id>.
+  issuerURL: ""
+  clientID: ""
+  # -- Secret with the client secret and the cookie secret (16, 24 or 32 bytes,
+  # e.g. `openssl rand -base64 32 | tr -- '+/' '-_'`). Required.
+  existingSecret: ""
+  clientSecretKey: client-secret
+  cookieSecretKey: cookie-secret
+  # -- https://<host>/oauth2/callback. Defaults to the ingress host.
+  redirectURL: ""
+  # -- OAuth scopes. Entra ID with group overage needs "openid email profile User.Read".
+  scope: openid email profile
+  # -- Claim holding the user's groups (Cognito: cognito:groups).
+  groupsClaim: groups
+  emailClaim: email
+  # -- PKCE method; Okta, Entra ID and Cognito support S256. Empty disables PKCE.
+  codeChallengeMethod: S256
+  # -- --email-domain: allowed email domains ("*" for any; restrict with allowedGroups).
+  emailDomains: ["*"]
+  # -- --allowed-group: only members of these IdP groups may sign in.
+  allowedGroups: []
+  cookie:
+    name: _kubesentry
+    # -- Requires HTTPS in front (the ALB terminates TLS).
+    secure: true
+    expire: 12h
+    # -- Re-validate the session (and re-read groups) this often; needs refresh
+    # tokens from the IdP (Okta: offline_access scope). Empty disables.
+    refresh: ""
+    sameSite: lax
+  # -- Session storage. cookie keeps the session in the browser; users in many
+  # groups (Entra ID, large Okta orgs) can exceed header limits on the ALB.
+  # redis keeps only a ticket in the cookie (ElastiCache works; use rediss:// for TLS).
+  sessionStore:
+    type: cookie
+    redis:
+      connectionURL: ""
+      useCluster: false
+      clusterConnectionURLs: []
+      # -- Secret holding the Redis password (or AUTH token), optional.
+      existingSecret: ""
+      passwordKey: redis-password
+  extraArgs: []
+  extraEnv: []
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+
+prometheus:
+  # -- -prometheus-url. Empty: discover an in-cluster Prometheus (autodiscover),
+  # or use prometheus.amp.
+  url: ""
+  # -- -prometheus-autodiscover (true): find a Prometheus Service in the cluster
+  # when url is empty; a Service annotated kubesentry.io/prometheus=true wins.
+  autodiscover: true
+  # -- -prometheus-service: pin discovery to namespace/name:port,
+  # e.g. monitoring/kps-kube-prometheus-stack-prometheus:9090.
+  service: ""
+  # -- -prometheus-selector: extra label matchers added to every query, for a
+  # Prometheus shared by several clusters, e.g. cluster="prod".
+  selector: ""
+  # -- -prometheus-ksm-limits: read memory limits from kube-state-metrics
+  # instead of pod specs.
+  ksmLimits: false
+  # -- Bearer token for Prometheus (PROMETHEUS_TOKEN) from an existing Secret.
+  bearerTokenSecret:
+    name: ""
+    key: token
+  # -- -leak-scan-interval (5m) and -leak-scan-window (24h): the background leak scanner.
+  leakScan:
+    interval: null
+    window: null
+  # -- Amazon Managed Service for Prometheus. Queries are SigV4-signed with the
+  # pod's AWS identity (IRSA or Pod Identity); see docs/deploy-eks.md for IAM.
+  amp:
+    enabled: false
+    # -- The workspace endpoint without /api/v1, e.g.
+    # https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-...
+    workspaceURL: ""
+    # -- -aws-region; defaults to eks.region, then the region in workspaceURL.
+    region: ""
+
+audit:
+  # -- -audit-store: memory (default; per replica, lost on restart) or postgres.
+  store: memory
+  # -- -audit-retention for the Postgres store: daily partitions older than
+  # this are dropped. Accepts h and d units, e.g. 720h or 30d.
+  retention: 30d
+  # -- -audit-redact-exec-args: drop exec command arguments from stored request URIs.
+  redactExecArgs: false
+  # -- -audit-max-events (50000): events kept by the memory store.
+  maxEvents: null
+  postgres:
+    # -- Secret with a Postgres DSN, passed as KUBESENTRY_PG_DSN, e.g.
+    # postgres://kubesentry:PASSWORD@db.xxxx.us-east-1.rds.amazonaws.com:5432/kubesentry
+    existingSecret: ""
+    dsnKey: dsn
+    # -- -pg-schema: one schema per cluster when clusters share a database.
+    schema: kubesentry
+    # -- Sets PGSSLMODE (an sslmode in the DSN wins). verify-full checks the
+    # server certificate and host name: with RDS, provide the RDS CA bundle in
+    # sslRootCert. Use disable only for a Postgres without TLS inside the cluster.
+    sslmode: verify-full
+    # -- CA bundle for verify-full (PGSSLROOTCERT), from a ConfigMap or a Secret,
+    # e.g. the RDS global bundle https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+    sslRootCert:
+      configMap: ""
+      secret: ""
+      key: global-bundle.pem
+  sources:
+    # -- POST /audit/webhook on the ingest listener, authenticated with the
+    # audit token. For self-managed API servers (--audit-webhook-config-file)
+    # and bulk imports.
+    webhook:
+      enabled: false
+    # -- Native EKS reader: polls the cluster's CloudWatch Logs audit stream.
+    # Needs EKS control-plane audit logging and logs:FilterLogEvents (docs/deploy-eks.md).
+    # With several replicas, only the holder of a Postgres advisory lock reads.
+    cloudwatch:
+      enabled: false
+      # -- -cloudwatch-log-group; defaults to /aws/eks/<eks.clusterName>/cluster.
+      logGroup: ""
+      # -- -cloudwatch-stream-prefix (kube-apiserver-audit).
+      streamPrefix: ""
+      # -- -cloudwatch-start (24h): how far back to read on first start.
+      start: ""
+      # -- -cloudwatch-endpoint: override the endpoint (VPC endpoint or tests).
+      endpoint: ""
+    # -- Follow an API server audit log file (-audit-log-file). Only for clusters
+    # where kubesentry can run on a control-plane node (kind, kubeadm).
+    file:
+      path: ""
+      # -- -audit-from-start: read existing content instead of starting at the end.
+      fromStart: false
+      # -- Mount this host directory read-only at the same path (hostPath). It
+      # usually needs root and a privileged Pod Security level; dev only.
+      hostPathDir: ""
+
+eks:
+  # -- EKS cluster name: -cluster-name (unless clusterName is set) and the
+  # default CloudWatch log group /aws/eks/<name>/cluster.
+  clusterName: ""
+  # -- AWS region (-aws-region and AWS_REGION) for CloudWatch and AMP.
+  region: ""
+  awsAuth:
+    # -- -aws-auth: read kube-system/aws-auth to flag system:masters mappings.
+    # Adds a Role in kube-system limited to that one ConfigMap.
+    read: false
+
+systemNamespaces:
+  # -- -system-namespaces: replaces the built-in list (kube-*, local-path-storage,
+  # amazon-cloudwatch, amazon-guardduty, aws-observability, karpenter).
+  # kubesentry's own namespaces are always added. A namespace label
+  # kubesentry.io/system="true"|"false" overrides either list.
+  replace: []
+  # -- -system-namespaces-add: extends the list.
+  add: []
+
+# -- Thresholds between ok, warn and crit. null keeps the server default (in brackets).
+# Durations use Go syntax (90s, 5m, 24h, 168h).
+thresholds:
+  restartWarn: null       # -restart-warn (3) restarts summed over a pod's containers
+  restartCrit: null       # -restart-crit (10)
+  oomRecent: null         # -oom-recent (24h) an OOM kill within this is crit
+  pendingGrace: null      # -pending-grace (5m)
+  notReadyGrace: null     # -not-ready-grace (5m)
+  terminatingGrace: null  # -terminating-grace (5m) beyond the pod's grace period
+  recentPod: null         # -recent-pod (24h) finished pods newer than this stay on the map
+  activityWindow: null    # -activity-window (168h) audit look-back on the pod page
+  pvcMinAge: null         # -pvc-min-age (24h) ignore unused claims younger than this
+  leakCritHours: null     # -leak-crit-hours (6) hours to the memory limit that make a leak crit
+  leakMinSlope: null      # -leak-min-slope (1 MiB/h) minimum growth, as the server parses it
+  leakMinR2: null         # -leak-min-r2 (0.8)
+  leakDropRatio: null     # -leak-drop-ratio (0.7) a drop below this ratio is a restart
+  leakMinPoints: null     # -leak-min-points (6)
+  certCritCap: null       # -cert-crit-cap (168h)
+  certWarnCap: null       # -cert-warn-cap (720h)
+
+# -- Storage cost estimates for unused volumes, in USD per GiB-month. A
+# StorageClass annotation kubesentry.io/price-per-gib-month wins over all of these.
+pricing:
+  # -- -pvc-default-price: price for classes nothing else prices. null: no estimate.
+  defaultPrice: null
+  # -- -ebs-prices by EBS volume type, e.g. {gp3: 0.0912, io2: 0.143} outside us-east-1.
+  ebsPrices: {}
+  # -- -pvc-class-prices by StorageClass name.
+  classPrices: {}
+
+# -- Node agent DaemonSet: reports the processes inside pods. Needs hostPID,
+# which the Pod Security baseline and restricted levels reject.
+agent:
+  enabled: true
+  # -- Namespace for the agent; empty uses the release namespace. A separate
+  # namespace labelled pod-security.kubernetes.io/enforce=privileged lets the
+  # server's namespace enforce restricted.
+  namespace: ""
+  # -- Create agent.namespace with namespaceLabels (Helm then owns it, and
+  # deletes it on uninstall).
+  createNamespace: false
+  namespaceLabels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged
+  image:
+    repository: ghcr.io/byrongary/kubesentry-agent
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # -- -interval between reports.
+  interval: 15s
+  # -- -jitter (0.2): ±fraction of the interval, so agents do not report in lockstep.
+  jitter: null
+  # -- -gzip (true): compress reports.
+  gzip: null
+  # -- -max-processes (5000) per node.
+  maxProcesses: null
+  # -- -server-fanout: post every report to each server replica through the
+  # headless ingest Service, so every replica has every node's processes.
+  fanout: true
+  # -- CA for verifying the server (-ca-file) when tls.enabled. Defaults to the
+  # ca.crt in tls.existingSecret when the agent shares the release namespace.
+  tls:
+    caSecret: ""
+    caConfigMap: ""
+    caKey: ca.crt
+  serviceAccount:
+    create: true
+    name: ""
+  priorityClassName: system-node-critical
+  # -- Run on every node, tainted ones included.
+  tolerations:
+    - operator: Exists
+  nodeSelector: {}
+  # -- The agent always requires kubernetes.io/os=linux and skips Fargate
+  # (eks.amazonaws.com/compute-type=fargate). excludeLabels adds more NotIn
+  # terms, e.g. KWOK fake nodes: [{key: type, values: [kwok]}].
+  nodeAffinity:
+    excludeLabels: []
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  podAnnotations: {}
+  podLabels: {}
+  # -- Non-root and read-only; hostPID is the only host access. On SELinux-enforcing
+  # nodes (Bottlerocket) see docs/deploy-eks.md.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  extraArgs: []
+  extraEnv: []
+
+# -- PodDisruptionBudget for the server, created when replicas > 1.
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# -- NetworkPolicy for the server pods. Needs a CNI that enforces it (on EKS,
+# the VPC CNI with enableNetworkPolicy=true). Each allowed peer list is empty
+# by default: turning the policy on without filling them closes that port.
+networkPolicy:
+  enabled: false
+  ingress:
+    # -- Web port (4180 with oauth2Proxy, else 8080), e.g. the ALB subnets'
+    # CIDRs for target-type ip, or an ingress controller's namespace.
+    web:
+      fromCIDRs: []
+      # -- Namespace names, matched on kubernetes.io/metadata.name.
+      fromNamespaces: []
+    # -- Ingest port 8081. The chart's agent pods are always allowed; add API
+    # servers sending audit webhooks or bulk importers here.
+    ingest:
+      fromCIDRs: []
+      fromNamespaces: []
+    # -- Ops port 9090 (/metrics), e.g. your Prometheus namespace. Kubelet
+    # probes come from the node; most CNIs (the VPC CNI included) allow those
+    # regardless. If yours does not, add the node CIDRs here.
+    ops:
+      fromNamespaces: []
+      fromCIDRs: []
+  egress:
+    # -- Also restrict egress. Off: egress stays open.
+    enabled: false
+    # -- DNS to kube-dns / CoreDNS in kube-system.
+    dns: true
+    # -- 443 (and 6443) for the Kubernetes API server and AWS APIs (STS,
+    # CloudWatch Logs, AMP) and the IdP. 0.0.0.0/0 unless you route AWS APIs
+    # through VPC endpoints and know the API server's addresses.
+    https:
+      toCIDRs: ["0.0.0.0/0"]
+      ports: [443, 6443]
+    # -- EKS Pod Identity: the node-local agent that hands out credentials
+    # (169.254.170.23:80, and fd00:ec2::23 on IPv6 clusters). IRSA needs only https.
+    podIdentityAgent: false
+    postgres:
+      toCIDRs: []
+      port: 5432
+    redis:
+      toCIDRs: []
+      port: 6379
+    prometheus:
+      toCIDRs: []
+      toNamespaces: []
+      ports: [9090]
+    # -- Raw egress rules appended to the policy.
+    extra: []
+
+# -- Spread server replicas across zones and nodes. labelSelector and
+# matchLabelKeys (pod-template-hash) are filled in.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+  whenUnsatisfiable: ScheduleAnyway
+  topologyKeys:
+    - topology.kubernetes.io/zone
+    - kubernetes.io/hostname
+
+# -- Ingress for the web Service. AWS Load Balancer Controller example:
+#   className: alb
+#   annotations:
+#     alb.ingress.kubernetes.io/scheme: internal          # or internet-facing
+#     alb.ingress.kubernetes.io/target-type: ip
+#     alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+#     alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:111122223333:certificate/...
+#     alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+#     alb.ingress.kubernetes.io/healthcheck-path: /ping    # oauth2-proxy; use /healthz without it
+#     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=10
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  pathType: Prefix
+  # -- TLS at the Ingress itself (not needed with an ALB certificate-arn).
+  tls: []
+
+metrics:
+  # -- prometheus-operator ServiceMonitor for the ops listener's /metrics.
+  # Rendered only when the monitoring.coreos.com/v1 API is available.
+  serviceMonitor:
+    enabled: false
+    # -- Labels your Prometheus selects ServiceMonitors by, e.g. release: kps.
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    relabelings: []
+    metricRelabelings: []
+  # -- PrometheusRule with kubesentry's alerts.
+  prometheusRule:
+    enabled: false
+    labels: {}
+    # -- Label matchers selecting kubesentry's series; defaults to namespace="<release namespace>".
+    matchers: ""
+    # -- Alert when the served view is older than this.
+    snapshotStaleSeconds: 120
+    # -- Alert when the CloudWatch reader lags more than this (only with the CloudWatch source).
+    cloudwatchLagSeconds: 300
+    # -- Alert when more than this fraction of SubjectAccessReviews fail.
+    authzErrorRatio: 0.05
+    # -- Alert when nodes reporting processes drop by more than this fraction within an hour.
+    agentDropRatio: 0.2
+    # -- Extra rules appended to the group.
+    extraRules: []
+
+# -- API Priority and Fairness: a FlowSchema and PriorityLevelConfiguration
+# that isolate kubesentry's ServiceAccount from other API server clients.
+apf:
+  enabled: false
+  matchingPrecedence: 1000
+  nominalConcurrencyShares: 20
+  lendablePercent: 50
+  queues: 16
+  handSize: 4
+  queueLengthLimit: 50

@@ -1,0 +1,105 @@
+{{- $fullname := include "kubesentry.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $agentNS := include "kubesentry.agentNamespace" . -}}
+{{- $mode := include "kubesentry.authMode" . -}}
+{{- $webPort := include "kubesentry.webPort" . -}}
+kubesentry {{ include "kubesentry.imageTag" (dict "image" .Values.image "root" .) }} is installed in namespace {{ $ns }} ({{ .Values.replicas }} replica{{ if gt (int .Values.replicas) 1 }}s{{ end }}, auth mode {{ $mode }}).
+
+1. Open the UI
+{{- if and .Values.ingress.enabled .Values.ingress.host }}
+   https://{{ .Values.ingress.host }}/
+{{- else }}
+   kubectl -n {{ $ns }} port-forward svc/{{ $fullname }} {{ $webPort }}:{{ $webPort }}
+   then http://localhost:{{ $webPort }}/
+{{- end }}
+{{- if .Values.oauth2Proxy.enabled }}
+   Sign-in goes through oauth2-proxy ({{ .Values.oauth2Proxy.provider }}, {{ .Values.oauth2Proxy.issuerURL }}).
+   Each user sees what their Kubernetes RBAC lets them list. Grant kubesentry's own
+   data with the ClusterRoles {{ $fullname }}-audit-viewer, {{ $fullname }}-process-viewer
+   and {{ $fullname }}-agents-viewer (docs/deploy-eks.md, "Granting access").
+{{- else if eq $mode "proxy" }}
+   Identity headers ({{ .Values.auth.userHeader }}, {{ .Values.auth.groupsHeader }}) are trusted only from
+   {{ join ", " .Values.auth.trustedProxyCIDRs }}.
+{{- end }}
+{{- if .Values.tokens.api.enabled }}
+   API token{{ if eq $mode "proxy" }} (break-glass: kubectl -n {{ $ns }} port-forward deploy/{{ $fullname }} 8080){{ end }}:
+     kubectl -n {{ $ns }} get secret {{ include "kubesentry.apiTokenSecret" . }} -o jsonpath='{.data.{{ .Values.tokens.api.key }}}' | base64 -d
+{{- end }}
+
+2. Tokens
+{{- $tokens := list -}}
+{{- if .Values.tokens.api.enabled }}{{ $tokens = append $tokens (list "api" .Values.tokens.api.existingSecret (include "kubesentry.apiTokenSecret" .)) }}{{ end -}}
+{{- if include "kubesentry.agentTokenWanted" . }}{{ $tokens = append $tokens (list "agent" .Values.tokens.agent.existingSecret (include "kubesentry.agentTokenSecret" .)) }}{{ end -}}
+{{- if .Values.audit.sources.webhook.enabled }}{{ $tokens = append $tokens (list "audit" .Values.tokens.audit.existingSecret (include "kubesentry.auditTokenSecret" .)) }}{{ end -}}
+{{- range $tokens }}
+{{- $name := index . 2 }}
+{{- if index . 1 }}
+   {{ index . 0 }}: from your Secret {{ $name }}
+{{- else if lookup "v1" "Secret" $ns $name }}
+   {{ index . 0 }}: kept from the existing Secret {{ $name }}
+{{- else }}
+   {{ index . 0 }}: generated into Secret {{ $name }} (kept on upgrade; GitOps tools that cannot look Secrets up should use tokens.{{ index . 0 }}.existingSecret)
+{{- end }}
+{{- end }}
+{{- if not $tokens }}
+   none
+{{- end }}
+{{- if .Values.audit.sources.webhook.enabled }}
+   Audit webhook: POST {{ include "kubesentry.ingestURL" . }}/audit/webhook with the audit token.
+{{- end }}
+
+3. Data sources
+{{- if .Values.prometheus.amp.enabled }}
+   Prometheus: Amazon Managed Prometheus {{ .Values.prometheus.amp.workspaceURL }} (SigV4 with the pod's AWS role)
+{{- else if .Values.prometheus.url }}
+   Prometheus: {{ .Values.prometheus.url }}
+{{- else if .Values.prometheus.autodiscover }}
+   Prometheus: discovered in the cluster{{ with .Values.prometheus.service }} ({{ . }}){{ end }}; check /readyz on the ops port
+{{- else }}
+   Prometheus: none; leak detection is off
+{{- end }}
+   Audit store: {{ .Values.audit.store }}{{ if eq .Values.audit.store "memory" }} (per replica, lost on restart){{ end }}; sources: {{ default "none" (include "kubesentry.auditSources" .) }}
+{{- if .Values.audit.sources.cloudwatch.enabled }}
+   CloudWatch log group: {{ default (printf "/aws/eks/%s/cluster" .Values.eks.clusterName) .Values.audit.sources.cloudwatch.logGroup }}
+   (needs EKS control-plane audit logging and logs:FilterLogEvents for the pod's role)
+{{- end }}
+{{- if .Values.agent.enabled }}
+
+4. Node agent
+   DaemonSet {{ $fullname }}-agent in namespace {{ $agentNS }} reports to {{ include "kubesentry.ingestURL" . }}{{ if .Values.agent.fanout }} and fans out to every replica{{ end }}.
+   It needs hostPID, which only the Pod Security "privileged" level allows:
+     kubectl label namespace {{ $agentNS }} pod-security.kubernetes.io/enforce=privileged --overwrite
+{{- if ne $agentNS $ns }}
+   The server's namespace can then enforce "restricted":
+     kubectl label namespace {{ $ns }} pod-security.kubernetes.io/enforce=restricted --overwrite
+{{- else }}
+   It shares the server's namespace, so that namespace cannot enforce "restricted".
+   Set agent.namespace to a separate namespace to split them.
+{{- end }}
+{{- end }}
+{{- $warnings := list -}}
+{{- if and .Values.metrics.serviceMonitor.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor")) -}}
+{{- $warnings = append $warnings "metrics.serviceMonitor.enabled, but the monitoring.coreos.com/v1 ServiceMonitor API is not installed: no ServiceMonitor was created." -}}
+{{- end -}}
+{{- if and .Values.metrics.prometheusRule.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule")) -}}
+{{- $warnings = append $warnings "metrics.prometheusRule.enabled, but the monitoring.coreos.com/v1 PrometheusRule API is not installed: no alerts were created." -}}
+{{- end -}}
+{{- with .Values.audit.sources.file.hostPathDir -}}
+{{- $warnings = append $warnings (printf "The server mounts the host directory %s to read the API server's audit log, which usually needs root and a privileged namespace. Development clusters only." .) -}}
+{{- end -}}
+{{- if and (eq .Values.audit.store "memory") (include "kubesentry.auditSources" .) -}}
+{{- $warnings = append $warnings "Audit events are kept in memory and lost when the pod restarts. Use audit.store=postgres to keep them." -}}
+{{- end -}}
+{{- if and (eq .Values.audit.store "postgres") (eq .Values.audit.postgres.sslmode "disable") -}}
+{{- $warnings = append $warnings "audit.postgres.sslmode=disable: audit events travel to Postgres unencrypted." -}}
+{{- end -}}
+{{- if and .Values.agent.enabled (not .Values.tls.enabled) -}}
+{{- $warnings = append $warnings "Agents report over plain http inside the cluster. Set tls.enabled to encrypt the ingest listener." -}}
+{{- end -}}
+{{- with $warnings }}
+
+Warnings
+{{- range . }}
+   - {{ . }}
+{{- end }}
+{{- end }}
