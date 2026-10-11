@@ -7,6 +7,7 @@ package kube
 
 import (
 	"fmt"
+	"net/http"
 
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -21,6 +22,9 @@ type ClientOptions struct {
 	QPS       float32
 	Burst     int
 	UserAgent string
+	// Observe, if set, is told about every API request (for
+	// kubesentry_kube_requests_total), including those of NewReviewer.
+	Observe RequestObserver
 }
 
 // Defaults for ClientOptions.
@@ -66,6 +70,9 @@ func ConnectWith(kubeconfig string, o ClientOptions) (*Clients, error) {
 		return nil, fmt.Errorf("load kube config: %w", err)
 	}
 	cfg.QPS, cfg.Burst, cfg.UserAgent = o.QPS, o.Burst, o.UserAgent
+	if o.Observe != nil {
+		cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper { return observingTransport{next: rt, observe: o.Observe} })
+	}
 
 	typed := rest.CopyConfig(cfg)
 	typed.ContentType = "application/vnd.kubernetes.protobuf"
