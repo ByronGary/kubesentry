@@ -182,6 +182,10 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if $o.enabled }}
+            - name: web-socket
+              mountPath: {{ include "kubesentry.webSocketDir" . }}
+            {{- end }}
             {{- if .Values.auth.groupMap }}
             - name: auth-group-map
               mountPath: /etc/kubesentry/auth
@@ -211,13 +215,9 @@ spec:
           imagePullPolicy: {{ $o.image.pullPolicy }}
           args:
             - --http-address=0.0.0.0:4180
-            {{- if .Values.tls.enabled }}
-            # kubesentry's certificate names the Service, not the loopback address.
-            - --upstream=https://127.0.0.1:8080
-            - --ssl-upstream-insecure-skip-verify=true
-            {{- else }}
-            - --upstream=http://127.0.0.1:8080
-            {{- end }}
+            # kubesentry listens only on this socket, in a volume only these two
+            # containers mount; it trusts identity headers on it and nowhere else.
+            - --upstream=unix://{{ include "kubesentry.webSocket" . }}
             - --provider={{ $o.provider }}
             {{- with $o.issuerURL }}
             - --oidc-issuer-url={{ . }}
@@ -240,7 +240,7 @@ spec:
             {{- range $o.allowedGroups }}
             - --allowed-group={{ . }}
             {{- end }}
-            # Identity reaches kubesentry only in these headers, and only from loopback.
+            # Identity reaches kubesentry only in these headers, and only over the socket.
             - --pass-user-headers=true
             - --set-xauthrequest=true
             - --skip-auth-strip-headers=true
@@ -320,6 +320,9 @@ spec:
             {{- toYaml $o.securityContext | nindent 12 }}
           resources:
             {{- toYaml $o.resources | nindent 12 }}
+          volumeMounts:
+            - name: web-socket
+              mountPath: {{ include "kubesentry.webSocketDir" . }}
         {{- end }}
         {{- with .Values.extraContainers }}
         {{- toYaml . | nindent 8 }}
@@ -328,6 +331,14 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi
+        {{- if $o.enabled }}
+        # The web socket between oauth2-proxy and kubesentry (mode 0660; both
+        # run with the pod's fsGroup).
+        - name: web-socket
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- end }}
         {{- if .Values.auth.groupMap }}
         - name: auth-group-map
           configMap:

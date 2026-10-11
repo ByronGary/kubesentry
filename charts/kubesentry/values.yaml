@@ -158,6 +158,13 @@ server:
   rateLimit: null
   rateBurst: null
   maxInflight: null
+  # -- -max-inflight-per-identity (4): requests one user may have in flight on
+  # the expensive routes (/oom, pod diagnostics, audit summary); more get 429.
+  maxInflightPerIdentity: null
+  # -- -allowed-hosts: Host header patterns (host[:port], *.domain) the web
+  # listener answers; others get 403. Empty answers any Host. Behind the ALB,
+  # e.g. [kubesentry.example.com].
+  allowedHosts: []
   # -- -system-principal-prefixes (system:,eks:): users and groups that are
   # components, not people.
   systemPrincipalPrefixes: []
@@ -169,9 +176,10 @@ server:
 # -- TLS for the server's listeners (-tls-cert, -tls-key) from a
 # kubernetes.io/tls Secret, e.g. one cert-manager issues. Its certificate must
 # name <fullname>-ingest.<namespace>.svc, the name agents connect to (fan-out
-# included). Agents then use https and verify against agent.tls; with
-# oauth2Proxy, the sidecar reaches kubesentry over https on loopback. The ops
-# listener stays plain HTTP for kubelet probes and Prometheus.
+# included). Agents then use https and verify against agent.tls. With
+# oauth2Proxy, the sidecar reaches kubesentry over a Unix socket inside the pod,
+# which is plain HTTP. The ops listener stays plain HTTP for kubelet probes and
+# Prometheus.
 tls:
   enabled: false
   existingSecret: ""
@@ -188,9 +196,11 @@ service:
 # on every sync: use existingSecret there.
 tokens:
   # -- API token (-api-token): the break-glass identity with cluster-wide scope.
-  # In proxy mode it still works from inside the pod network, for example
-  # through kubectl port-forward to the pod's port 8080. Set enabled: false to
-  # remove it.
+  # In token mode, use it through the web port (or kubectl port-forward to the
+  # pod's port 8080). With the oauth2Proxy sidecar kubesentry has no TCP web
+  # port, so the token works only from inside the pod; for break-glass access
+  # while SSO is down, upgrade with oauth2Proxy.enabled=false (token mode) and
+  # port-forward. Set enabled: false to remove it.
   api:
     enabled: true
     existingSecret: ""
@@ -211,9 +221,17 @@ auth:
   # trustedProxyCIDRs (an SSO proxy you run elsewhere). "none" is refused: it
   # is loopback-only and the chart exposes the web port.
   mode: ""
-  # -- -auth-user-header and -auth-groups-header: identity headers set by the proxy.
+  # -- -auth-user-header and -auth-groups-header: identity headers set by the
+  # proxy. The schema allows only headers oauth2-proxy sets and strips from
+  # client requests (X-Forwarded-Email, X-Forwarded-User,
+  # X-Forwarded-Preferred-Username; X-Forwarded-Groups), since any other header
+  # could arrive from the client unchanged. Groups are comma-separated, so group
+  # names containing commas are not supported.
   userHeader: X-Forwarded-Email
   groupsHeader: X-Forwarded-Groups
+  # -- Allow other userHeader/groupsHeader values, for an SSO proxy of your own
+  # that sets them and strips client-supplied copies.
+  allowCustomHeaders: false
   # -- -auth-username-prefix and -auth-groups-prefix: match the prefixes your
   # API server (or EKS OIDC identity provider) applies, so RoleBindings written
   # for kubectl users also apply in kubesentry, e.g. "oidc:".
@@ -225,9 +243,13 @@ auth:
   #   "4f6b0b8e-...": ["platform-admins"]
   #   "team-payments": ["payments-viewers", "payments-oncall"]
   groupMap: {}
-  # -- -auth-trusted-proxy-cidrs: only these addresses may send identity
-  # headers. Forced to loopback (127.0.0.1/32,::1/128) when oauth2Proxy.enabled.
+  # -- -auth-trusted-proxy-cidrs: with auth.mode=proxy and no sidecar, only
+  # these addresses may send identity headers. Unused with oauth2Proxy.enabled:
+  # the sidecar talks to kubesentry over a Unix socket, the only path trusted.
   trustedProxyCIDRs: []
+  # -- -auth-allow-any-proxy: permit 0.0.0.0/0 or ::/0 in trustedProxyCIDRs,
+  # only when a network policy admits nothing but the proxy to the web port.
+  allowAnyProxy: false
   # -- -authz-qps: SubjectAccessReview budget.
   authzQPS: 200
   # -- -authz-cache-ttl and -authz-deny-ttl: how long allowed and denied reviews are cached.
@@ -239,9 +261,12 @@ auth:
   shareByGroups: false
 
 # -- oauth2-proxy sidecar for SSO. When enabled, the sidecar owns the web port
-# (4180) and kubesentry listens on 127.0.0.1:8080 in proxy mode, trusting
-# identity headers only from loopback. The sidecar strips any client-supplied
-# X-Forwarded-* identity headers before they reach kubesentry.
+# (4180) and kubesentry, in proxy mode, listens only on a Unix socket in an
+# emptyDir the two containers share (/var/run/kubesentry/web.sock, mode 0660):
+# identity headers are trusted on that socket and nowhere else, so kubectl
+# port-forward cannot reach kubesentry around the proxy. The sidecar strips any
+# client-supplied X-Forwarded-* identity headers before they reach kubesentry.
+# oauth2-proxy supports Unix socket upstreams since v7.6.0.
 oauth2Proxy:
   enabled: false
   image:

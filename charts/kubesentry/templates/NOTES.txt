@@ -22,7 +22,13 @@ kubesentry {{ include "kubesentry.imageTag" (dict "image" .Values.image "root" .
    {{ join ", " .Values.auth.trustedProxyCIDRs }}.
 {{- end }}
 {{- if .Values.tokens.api.enabled }}
+{{- if .Values.oauth2Proxy.enabled }}
+   API token (break-glass): kubesentry listens only on a Unix socket shared with oauth2-proxy, so the
+   token works only from inside the pod. While SSO is down, upgrade with oauth2Proxy.enabled=false
+   (token mode on port 8080), port-forward, and use:
+{{- else }}
    API token{{ if eq $mode "proxy" }} (break-glass: kubectl -n {{ $ns }} port-forward deploy/{{ $fullname }} 8080){{ end }}:
+{{- end }}
      kubectl -n {{ $ns }} get secret {{ include "kubesentry.apiTokenSecret" . }} -o jsonpath='{.data.{{ .Values.tokens.api.key }}}' | base64 -d
 {{- end }}
 

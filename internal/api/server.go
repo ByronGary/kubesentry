@@ -82,6 +82,16 @@ type Server struct {
 	Authorizer auth.Authorizer
 	// SignOutURL is where the UI's "Sign out" goes (proxy mode).
 	SignOutURL string
+	// AllowedHosts, if set, are the Host header patterns (ParseAllowedHosts)
+	// the web listener answers; other Hosts get 403. Nil means
+	// LoopbackHosts when Authenticator is auth.NoneAuthenticator (every
+	// local caller is trusted, so DNS rebinding must not reach it), else
+	// any Host.
+	AllowedHosts []string
+	// LongInflightPerIdentity caps the requests one identity may have in
+	// flight at once on the expensive routes (/oom, pod diagnostics, audit
+	// summary); more get 429 with Retry-After. Zero disables it.
+	LongInflightPerIdentity int
 
 	// ClusterInfo overrides what /info says about the cluster: a non-empty
 	// Name always wins, the rest fills in when the view knows nothing.
@@ -204,7 +214,7 @@ func (s *Server) Serve(p Parts) http.Handler {
 		if s.AccessLog != nil {
 			accessLog = WithAccessLog(s.AccessLog)
 		}
-		mux.Handle("/", Compose(WithRequestID(), accessLog, WithSecurityHeaders())(web))
+		mux.Handle("/", Compose(WithRequestID(), accessLog, WithSecurityHeaders(), WithAllowedHosts(s.allowedHosts()))(web))
 	}
 	return mux
 }

@@ -94,6 +94,10 @@ token
 {{- end -}}
 {{- end -}}
 
+{{/* Unix socket between the oauth2-proxy sidecar and kubesentry, in a shared emptyDir. */}}
+{{- define "kubesentry.webSocketDir" -}}/var/run/kubesentry{{- end -}}
+{{- define "kubesentry.webSocket" -}}{{ include "kubesentry.webSocketDir" . }}/web.sock{{- end -}}
+
 {{/* Container port behind the web Service. */}}
 {{- define "kubesentry.webPort" -}}
 {{- if .Values.oauth2Proxy.enabled -}}4180{{- else -}}8080{{- end -}}
@@ -189,6 +193,13 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if and (eq $mode "proxy") (not $v.oauth2Proxy.enabled) (empty $v.auth.trustedProxyCIDRs) -}}
 {{- fail "kubesentry: auth.mode=proxy without oauth2Proxy.enabled needs auth.trustedProxyCIDRs, the addresses of the SSO proxy allowed to send identity headers. Otherwise enable the oauth2Proxy sidecar." -}}
 {{- end -}}
+{{- if and (eq $mode "proxy") (not $v.oauth2Proxy.enabled) (not $v.auth.allowAnyProxy) -}}
+{{- range $v.auth.trustedProxyCIDRs -}}
+{{- if hasSuffix "/0" (trim .) -}}
+{{- fail (printf "kubesentry: auth.trustedProxyCIDRs contains %s, which lets anyone who reaches the web port claim any identity. Name the SSO proxy's addresses, or set auth.allowAnyProxy=true if a network policy admits only the proxy." .) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if and $v.audit.sources.cloudwatch.enabled (not $v.eks.clusterName) (not $v.audit.sources.cloudwatch.logGroup) -}}
 {{- fail "kubesentry: audit.sources.cloudwatch.enabled needs eks.clusterName (log group /aws/eks/<name>/cluster) or an explicit audit.sources.cloudwatch.logGroup." -}}
 {{- end -}}
@@ -234,10 +245,12 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- $a := list -}}
 {{- /* listeners */ -}}
 {{- if $v.oauth2Proxy.enabled -}}
-{{- $a = append $a "-addr=127.0.0.1:8080" -}}
+{{- /* Only the sidecar, which shares the socket's volume, reaches the web listener: no TCP web port at all. */ -}}
+{{- $a = append $a (printf "-addr=unix://%s" (include "kubesentry.webSocket" .)) -}}
 {{- else -}}
 {{- $a = append $a "-addr=:8080" -}}
 {{- end -}}
+{{- with $v.server.allowedHosts }}{{ $a = append $a (printf "-allowed-hosts=%s" (join "," .)) }}{{ end -}}
 {{- $a = append $a "-ingest-addr=:8081" -}}
 {{- $a = append $a "-ops-addr=:9090" -}}
 {{- if $v.server.pprof }}{{ $a = append $a "-pprof=true" }}{{ end -}}
@@ -251,10 +264,10 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if eq $mode "proxy" -}}
 {{- $a = append $a (printf "-auth-user-header=%s" $v.auth.userHeader) -}}
 {{- $a = append $a (printf "-auth-groups-header=%s" $v.auth.groupsHeader) -}}
-{{- if $v.oauth2Proxy.enabled -}}
-{{- $a = append $a "-auth-trusted-proxy-cidrs=127.0.0.1/32,::1/128" -}}
-{{- else -}}
+{{- if not $v.oauth2Proxy.enabled -}}
+{{- /* With the sidecar the socket is the only trusted path; CIDRs apply to an SSO proxy elsewhere. */ -}}
 {{- $a = append $a (printf "-auth-trusted-proxy-cidrs=%s" (join "," $v.auth.trustedProxyCIDRs)) -}}
+{{- if $v.auth.allowAnyProxy }}{{ $a = append $a "-auth-allow-any-proxy=true" }}{{ end -}}
 {{- end -}}
 {{- with $v.auth.usernamePrefix }}{{ $a = append $a (printf "-auth-username-prefix=%s" .) }}{{ end -}}
 {{- with $v.auth.groupsPrefix }}{{ $a = append $a (printf "-auth-groups-prefix=%s" .) }}{{ end -}}
@@ -267,7 +280,7 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- /* server tuning */ -}}
 {{- $s := $v.server -}}
 {{- if not (kindIs "invalid" $s.cache) }}{{ $a = append $a (printf "-cache=%t" $s.cache) }}{{ end -}}
-{{- range $flag, $val := dict "kube-qps" $s.kubeQPS "kube-burst" $s.kubeBurst "snapshot-min-interval" $s.snapshotMinInterval "snapshot-max-delay" $s.snapshotMaxDelay "rate-limit" $s.rateLimit "rate-burst" $s.rateBurst "max-inflight" $s.maxInflight -}}
+{{- range $flag, $val := dict "kube-qps" $s.kubeQPS "kube-burst" $s.kubeBurst "snapshot-min-interval" $s.snapshotMinInterval "snapshot-max-delay" $s.snapshotMaxDelay "rate-limit" $s.rateLimit "rate-burst" $s.rateBurst "max-inflight" $s.maxInflight "max-inflight-per-identity" $s.maxInflightPerIdentity -}}
 {{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
 {{- end -}}
 {{- with $s.systemPrincipalPrefixes }}{{ $a = append $a (printf "-system-principal-prefixes=%s" (join "," .)) }}{{ end -}}

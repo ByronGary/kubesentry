@@ -162,6 +162,8 @@
         "rateLimit": { "$ref": "#/definitions/numberOrNull" },
         "rateBurst": { "$ref": "#/definitions/intOrNull" },
         "maxInflight": { "$ref": "#/definitions/intOrNull" },
+        "maxInflightPerIdentity": { "$ref": "#/definitions/intOrNull" },
+        "allowedHosts": { "$ref": "#/definitions/stringList" },
         "systemPrincipalPrefixes": { "$ref": "#/definitions/stringList" },
         "builtinRBACPrefixes": { "$ref": "#/definitions/stringList" },
         "nodeLabelKeysAdd": { "$ref": "#/definitions/stringList" }
@@ -195,10 +197,28 @@
     "auth": {
       "type": "object",
       "additionalProperties": false,
+      "if": {
+        "properties": { "allowCustomHeaders": { "const": true } },
+        "required": ["allowCustomHeaders"]
+      },
+      "else": {
+        "$comment": "oauth2-proxy sets these and strips client-supplied copies; other headers could come from the client",
+        "properties": {
+          "userHeader": {
+            "enum": [
+              "X-Forwarded-Email", "X-Forwarded-User", "X-Forwarded-Preferred-Username",
+              "x-forwarded-email", "x-forwarded-user", "x-forwarded-preferred-username"
+            ]
+          },
+          "groupsHeader": { "enum": ["X-Forwarded-Groups", "x-forwarded-groups"] }
+        }
+      },
       "properties": {
         "mode": { "enum": ["", "proxy", "token", "none"] },
         "userHeader": { "type": "string", "minLength": 1 },
         "groupsHeader": { "type": "string", "minLength": 1 },
+        "allowCustomHeaders": { "type": "boolean" },
+        "allowAnyProxy": { "type": "boolean" },
         "usernamePrefix": { "type": "string" },
         "groupsPrefix": { "type": "string" },
         "groupMap": {

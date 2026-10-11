@@ -171,33 +171,101 @@ func TestResponseCacheBypassedBeforeFirstView(t *testing.T) {
 
 // -auth-mode=none (and token mode without a token on loopback) trusts every
 // loopback connection. A web page using DNS rebinding reaches the loopback
-// listener from the user's browser with its own Host name; nothing checks it.
-func TestProbeNoneModeRefusesForeignHost(t *testing.T) {
+// listener from the user's browser with its own Host name, so Host names
+// other than the loopback ones are refused, as kubectl proxy's
+// --accept-hosts does.
+func TestNoneModeRefusesForeignHost(t *testing.T) {
 	s := tenantServer(t)
 	s.Authenticator = auth.NoneAuthenticator{}
+	s.UI = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
 	h := s.Handler()
-	req := httptest.NewRequest(http.MethodGet, "http://rebind.attacker.example:8080/api/v1/pods", nil)
-	req.RemoteAddr = "127.0.0.1:51234"
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code == http.StatusOK {
-		nss, _ := namespacesIn(rec.Body.Bytes())
-		t.Errorf("Host rebind.attacker.example from loopback got 200 with namespaces %v; want the Host refused (as kubectl proxy's --accept-hosts does)", nss)
+	send := func(url string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, url, nil)
+		req.RemoteAddr = "127.0.0.1:51234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	for _, url := range []string{"http://rebind.attacker.example:8080/api/v1/pods", "http://rebind.attacker.example/", "http://127.0.0.1.nip.io:8080/api/v1/pods"} {
+		if rec := send(url); rec.Code != http.StatusForbidden {
+			nss, _ := namespacesIn(rec.Body.Bytes())
+			t.Errorf("%s from loopback = %d with namespaces %v; want 403", url, rec.Code, nss)
+		}
+	}
+	for _, url := range []string{"http://localhost:8080/api/v1/pods", "http://127.0.0.1:9999/api/v1/pods", "http://[::1]:8080/api/v1/pods", "http://localhost/"} {
+		if rec := send(url); rec.Code != http.StatusOK {
+			t.Errorf("%s = %d, want 200", url, rec.Code)
+		}
+	}
+	// Probes answer whatever the Host (kubelet uses the pod IP).
+	if rec := send("http://10.0.0.5:8080/healthz"); rec.Code != http.StatusOK {
+		t.Errorf("healthz with a pod IP Host = %d", rec.Code)
+	}
+	// An explicit allowlist replaces the default, in any mode.
+	s.AllowedHosts = []string{"kubesentry.internal"}
+	h = s.Handler()
+	if rec := send("http://localhost:8080/api/v1/pods"); rec.Code != http.StatusForbidden {
+		t.Errorf("localhost with an explicit allowlist = %d, want 403", rec.Code)
+	}
+	if rec := send("http://kubesentry.internal/api/v1/pods"); rec.Code != http.StatusOK {
+		t.Errorf("allowed host = %d", rec.Code)
 	}
 }
 
-// Proxy mode trusts identity headers from any loopback connection. kubectl
-// port-forward (and a DNS-rebinding page behind it) arrives from loopback.
-func TestProbeProxyModeLoopbackIsNotTheProxy(t *testing.T) {
-	a := auth.HeaderAuthenticator{UserHeader: "X-Forwarded-Email", GroupsHeader: "X-Forwarded-Groups",
+// Proxy mode once trusted identity headers from any loopback connection,
+// and kubectl port-forward (and a DNS-rebinding page behind it) arrives
+// from loopback. With the web listener on a Unix socket shared with the
+// sidecar (TrustProxyConn), loopback TCP is not the proxy.
+func TestProxyModeLoopbackIsNotTheProxy(t *testing.T) {
+	s := tenantServer(t)
+	s.Authenticator = auth.HeaderAuthenticator{UserHeader: "X-Forwarded-Email", GroupsHeader: "X-Forwarded-Groups", TrustProxyConn: true,
 		TrustedProxies: []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}}
-	req := httptest.NewRequest(http.MethodGet, "http://rebind.attacker.example:8080/api/v1/pods", nil)
-	req.RemoteAddr = "127.0.0.1:40000"
-	req.Header.Set("X-Forwarded-Email", "platform-admin@corp.example")
-	req.Header.Set("X-Forwarded-Groups", "platform-admins")
-	if id, ok := a.Authenticate(req); ok {
-		t.Logf("loopback caller became %q with groups %v without any secret shared with the proxy", id.User, id.Groups)
-		t.Errorf("identity headers accepted from a loopback peer with a foreign Host and no proxy secret")
+	h := s.Handler()
+	send := func(viaSocket bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "http://rebind.attacker.example:8080/api/v1/pods", nil)
+		req.RemoteAddr = "127.0.0.1:40000"
+		if viaSocket {
+			req = req.WithContext(auth.WithProxyConn(req.Context()))
+			req.RemoteAddr = "@"
+		}
+		req.Header.Set("X-Forwarded-Email", "alice")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := send(false); rec.Code != http.StatusUnauthorized {
+		t.Errorf("identity headers over loopback TCP = %d, want 401", rec.Code)
+	}
+	if rec := send(true); rec.Code != http.StatusOK {
+		t.Errorf("identity headers over the proxy's socket = %d, want 200", rec.Code)
+	}
+}
+
+func TestParseAllowedHosts(t *testing.T) {
+	hosts, err := ParseAllowedHosts(" Kubesentry.Example.com , *.corp.example:443,[::1]:8080, 10.0.0.5 ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for host, want := range map[string]bool{
+		"kubesentry.example.com": true, "KUBESENTRY.example.com:8443": true, "kubesentry.example.com.": true,
+		"a.corp.example:443": true, "a.b.corp.example:443": true, "corp.example:443": false, "a.corp.example:80": false,
+		"[::1]:8080": true, "[::1]:8081": false, "10.0.0.5:1": true, "evil.example": false, "": false,
+		"kubesentry.example.com.evil.example": false,
+	} {
+		if got := hostAllowed(hosts, host); got != want {
+			t.Errorf("%q allowed = %v, want %v", host, got, want)
+		}
+	}
+	if hosts, _ := ParseAllowedHosts("*"); !hostAllowed(hosts, "anything.example") {
+		t.Error("* should allow every host")
+	}
+	if hosts, err := ParseAllowedHosts(""); err != nil || hosts != nil {
+		t.Errorf("empty = %v, %v", hosts, err)
+	}
+	for _, bad := range []string{"a/b", "host:port", "a.*.example", "user@host", "*.:x"} {
+		if _, err := ParseAllowedHosts(bad); err == nil {
+			t.Errorf("%q should be refused", bad)
+		}
 	}
 }
 

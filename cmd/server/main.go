@@ -84,8 +84,10 @@ func run(cfg *config) error {
 		SignOutURL:  cfg.signOutURL,
 		ClusterInfo: model.ClusterInfo{Name: cfg.clusterName},
 		RateLimit:   cfg.rateLimit, RateBurst: cfg.rateBurst, MaxInflight: cfg.maxInflight,
-		AccessLog:     slog.Default(),
-		Authenticator: authn,
+		LongInflightPerIdentity: cfg.maxInflightPerIdentity,
+		AccessLog:               slog.Default(),
+		Authenticator:           authn,
+		AllowedHosts:            cfg.webAllowedHosts(),
 	}
 
 	// Views: the informer cache feeding a debounced snapshot manager, or a
@@ -242,11 +244,20 @@ func serve(ctx context.Context, stop context.CancelFunc, cfg *config, srv *api.S
 			MaxHeaderBytes: 256 << 10,
 		}
 		servers[i] = hs
-		ln, err := net.Listen("tcp", l.addr)
+		ln, unix, err := listen(l.addr)
 		if err != nil {
 			return fmt.Errorf("%s listener: %w", l.name, err)
 		}
-		slog.Info("kubesentry listening", "listener", l.name, "addr", ln.Addr().String(), "tls", l.tls, "version", version)
+		where := ln.Addr().String()
+		if unix {
+			// Only containers mounting the socket's volume (the oauth2-proxy
+			// sidecar) can connect: its connections are the proxy's. The
+			// socket never leaves the pod, so it is plain HTTP.
+			hs.ConnContext = func(ctx context.Context, _ net.Conn) context.Context { return auth.WithProxyConn(ctx) }
+			l.tls = false
+			where = l.addr
+		}
+		slog.Info("kubesentry listening", "listener", l.name, "addr", where, "tls", l.tls, "version", version)
 		go func() {
 			var err error
 			if l.tls {

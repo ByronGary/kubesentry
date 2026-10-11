@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -32,14 +33,16 @@ const (
 var allActors = map[string]bool{"user": true, "serviceaccount": true, "system": true}
 
 // guard requires "Authorization: Bearer <token>" when token is non-empty.
+// It compares fixed-length digests in constant time, so neither the token's
+// content nor its length shows in the response time.
 func guard(token string, next http.HandlerFunc) http.HandlerFunc {
 	if token == "" {
 		return next
 	}
-	want := []byte("Bearer " + token)
+	want := sha256.Sum256([]byte("Bearer " + token))
 	return func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
+		got := sha256.Sum256([]byte(r.Header.Get("Authorization")))
+		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
