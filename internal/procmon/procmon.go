@@ -30,4 +30,7 @@ type Report struct {
 	Node      string    `json:"node"`
 	Time      time.Time `json:"time"`
 	Processes []Process `json:"processes"`
+	// Bytes is the size of the report as received, set by DecodeReport (the
+	// compressed size when gzipped). It is not part of the wire format.
+	Bytes int64 `json:"-"`
 }
