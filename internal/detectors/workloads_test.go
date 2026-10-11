@@ -82,6 +82,9 @@ func TestSummarizeWorkloadsPodsAndOrder(t *testing.T) {
 		// Terminated pods are not counted and their restarts are ignored.
 		{Namespace: "a", Name: "web-old", Phase: "Failed", Labels: map[string]string{"app": "web"},
 			Containers: []model.ContainerStatus{{Name: "web", RestartCount: 50}}},
+		// A terminating pod is on its way out: not counted, as in Deployment status.
+		{Namespace: "a", Name: "web-going", Phase: "Running", Labels: map[string]string{"app": "web"}, DeletedAt: podNow.Add(-time.Minute),
+			Containers: []model.ContainerStatus{{Name: "web", RestartCount: 9}}},
 		{Namespace: "a", Name: "etl-x", Phase: "Pending", Labels: map[string]string{"job": "etl"}},
 		{Namespace: "a", Name: "sync-29000000-q", Phase: "Running", Labels: map[string]string{"job": "sync"}},
 		{Namespace: "b", Name: "fine-1", Phase: "Running", Labels: map[string]string{"app": "fine"}},

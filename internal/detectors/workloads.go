@@ -62,7 +62,9 @@ func SummarizeWorkloadsWith(ws []model.Workload, a *Assoc, p Policy, now time.Ti
 						s.OOMKilled = true
 					}
 				}
-				if !isLive(pod) {
+				// Terminating pods are on their way out; Deployment status leaves
+				// them out too. A stuck termination is the containers check's job.
+				if !isLive(pod) || !pod.DeletedAt.IsZero() {
 					continue
 				}
 				s.Pods++
