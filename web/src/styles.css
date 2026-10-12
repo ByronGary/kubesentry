@@ -202,7 +202,8 @@ input, select { font: inherit; color: var(--ink); background: var(--surface); bo
 .container-block h3 { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; margin-bottom: 4px; font-weight: 500; }
 
 /* Tables */
-.table-wrap { overflow-x: auto; border-top: 1px solid var(--rule); }
+/* position: relative keeps visually hidden (absolute) labels inside the scroller, so they cannot widen the page. */
+.table-wrap { position: relative; overflow-x: auto; border-top: 1px solid var(--rule); }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th { text-align: left; font-weight: 600; color: var(--pencil); font-size: 13px; padding: 8px 12px 8px 6px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
 td { padding: 9px 12px 9px 6px; border-bottom: 1px solid var(--rule); vertical-align: top; }
@@ -360,7 +361,7 @@ td.cmd { max-width: 420px; color: var(--pencil); }
 .list-status .linklike:disabled { color: var(--pencil); cursor: default; text-decoration: none; }
 .load-more { margin: 12px 0 0; }
 .group-more { margin: 6px 0 0 34px; }
-.vt { overflow: auto; max-height: min(72vh, 820px); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); overscroll-behavior: contain; }
+.vt { position: relative; overflow: auto; max-height: min(72vh, 820px); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); overscroll-behavior: contain; }
 .vt-table { table-layout: fixed; width: 100%; }
 .vt-table th { position: sticky; top: 0; z-index: 1; background: var(--page); box-shadow: inset 0 -1px 0 var(--rule); border-bottom: 0; overflow: hidden; text-overflow: ellipsis; }
 .vt-table td { padding-top: 0; padding-bottom: 0; border-bottom: 0; box-shadow: inset 0 -1px 0 var(--rule); vertical-align: middle; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -392,7 +393,8 @@ th[aria-sort='none'] .vt-arrow { opacity: 0.35; }
 .disclose { font: inherit; color: inherit; background: none; border: 0; padding: 2px 0; cursor: pointer; display: inline-flex; align-items: baseline; gap: 6px; text-align: left; max-width: 100%; overflow-wrap: anywhere; }
 .disclose:hover { color: var(--trace); }
 .disclose-mark { display: inline-block; width: 1em; color: var(--pencil); flex: none; }
-.pool-facts { display: grid; gap: 8px; margin: 6px 0 4px; }
+/* One shrinkable column: an auto track would take the meters' intrinsic width (three 220 px columns) on a phone. */
+.pool-facts { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin: 6px 0 4px; }
 .pool-line { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 14px; font-size: 14px; }
 .pool-meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 24px; max-width: 900px; }
 .zone { margin: 14px 0 0 16px; }
