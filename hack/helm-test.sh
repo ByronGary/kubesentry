@@ -127,6 +127,7 @@ refuses schema-custom-user-header --set auth.userHeader=X-Remote-User
 refuses guardrail-cloudwatch-group --set audit.sources.cloudwatch.enabled=true
 # The schema rejects values the server would not understand.
 refuses schema-auth-mode --set auth.mode=sso
+refuses schema-production-label --set 'alerts.production.labelKey=bad key'
 
 if [ "$failed" -ne 0 ]; then
   echo "helm tests FAILED"

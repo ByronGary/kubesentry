@@ -303,6 +303,9 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if not (kindIs "invalid" $v.pricing.defaultPrice) }}{{ $a = append $a (printf "-pvc-default-price=%s" (include "kubesentry.scalar" $v.pricing.defaultPrice)) }}{{ end -}}
 {{- with $v.pricing.ebsPrices }}{{ $a = append $a (printf "-ebs-prices=%s" (include "kubesentry.kvList" .)) }}{{ end -}}
 {{- with $v.pricing.classPrices }}{{ $a = append $a (printf "-pvc-class-prices=%s" (include "kubesentry.kvList" .)) }}{{ end -}}
+{{- /* owners and production namespaces */ -}}
+{{- with $v.alerts.ownerAnnotation }}{{ $a = append $a (printf "-owner-annotation=%s" .) }}{{ end -}}
+{{- with $v.alerts.production.labelKey }}{{ $a = append $a (printf "-production-label=%s=%s" . (toString $v.alerts.production.labelValue)) }}{{ end -}}
 {{- /* prometheus */ -}}
 {{- $p := $v.prometheus -}}
 {{- $region := include "kubesentry.awsRegion" . -}}

@@ -180,6 +180,24 @@ func TestConvertNodePlacement(t *testing.T) {
 	}
 }
 
+// Namespaces keep kubesentry.io/* annotations (owner, routing hints) and an
+// owner annotation configured outside kubesentry.io/, and nothing else.
+func TestConvertNamespaceAnnotations(t *testing.T) {
+	ns := fixture[*corev1.Namespace](t, "app")
+	got := convertNamespace(ns, newNamespaceAnnotationFilter(nil))
+	want := map[string]string{"kubesentry.io/owner": "team-payments", "kubesentry.io/slack-channel": "#payments"}
+	if !reflect.DeepEqual(got.Annotations, want) || got.Labels["pod-security.kubernetes.io/enforce"] != "restricted" {
+		t.Errorf("namespace: %+v", got)
+	}
+	got = convertNamespace(ns, newNamespaceAnnotationFilter([]string{"example.com/owner"}))
+	if got.Annotations["example.com/owner"] != "payments@example.com" || len(got.Annotations) != 3 {
+		t.Errorf("with -owner-annotation example.com/owner: %v", got.Annotations)
+	}
+	if got := convertNamespace(fixture[*corev1.Namespace](t, "kube-system"), newNamespaceAnnotationFilter(nil)); got.Annotations != nil {
+		t.Errorf("kube-system annotations = %v, want none", got.Annotations)
+	}
+}
+
 func TestConvertPVDriverAndClassParameters(t *testing.T) {
 	cases := map[string]struct{ source, driver, handle string }{
 		"pv-csi":      {"csi:ebs.csi.aws.com", "ebs.csi.aws.com", "vol-0abc"},

@@ -32,6 +32,8 @@ type profile struct {
 type Metrics struct {
 	start    time.Time
 	profiles map[model.ContainerKey]profile
+	pods     []model.Pod // the cluster's, read-only: the leak scan joins OOM kills
+	scan     leakScan
 }
 
 // NewMetrics assigns a memory profile to every container in the cluster.
@@ -42,7 +44,7 @@ func NewMetrics(c *Cluster, start time.Time) *Metrics {
 		{Namespace: "prod", Pod: "payments-worker-5c6d7f9b8-q8wzn", Container: "worker"}: {leak, 220, 1024},
 		{Namespace: "staging", Pod: "search-indexer-0", Container: "indexer"}:            {creeper, 400, 0},
 	}
-	m := &Metrics{start: start, profiles: map[model.ContainerKey]profile{}}
+	m := &Metrics{start: start, profiles: map[model.ContainerKey]profile{}, pods: c.pods}
 	for _, p := range c.pods {
 		if p.Phase != "Running" {
 			continue // nothing is scraped from a pod that is not running

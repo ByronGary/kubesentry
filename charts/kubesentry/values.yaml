@@ -493,6 +493,18 @@ pricing:
   # -- -pvc-class-prices by StorageClass name.
   classPrices: {}
 
+# -- Who owns a namespace and which namespaces are production. The Overview
+# filters and attributes by owner and counts exec into production; alerting
+# routes by the same annotation and label.
+alerts:
+  # -- -owner-annotation: the namespace annotation naming the owning team.
+  # Every kubesentry.io/* namespace annotation is kept for routing hints.
+  ownerAnnotation: kubesentry.io/owner
+  production:
+    # -- -production-label: namespaces labelled labelKey=labelValue are production.
+    labelKey: environment
+    labelValue: production
+
 # -- Node agent DaemonSet: reports the processes inside pods. Needs hostPID,
 # which the Pod Security baseline and restricted levels reject.
 agent:

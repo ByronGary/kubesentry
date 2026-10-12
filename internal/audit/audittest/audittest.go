@@ -262,6 +262,50 @@ func Query(rng *rand.Rand, span time.Duration) audit.Query {
 	return q
 }
 
+// TagQuery returns a random tag count query over events from Events.
+func TagQuery(rng *rand.Rand, span time.Duration) audit.TagCountQuery {
+	pick := func(p int) bool { return rng.Intn(p) == 0 }
+	q := audit.TagCountQuery{Tags: []string{}}
+	if pick(4) {
+		q.Since = Base.Add(time.Duration(rng.Int63n(int64(span) + 1)))
+	}
+	for _, t := range Tags {
+		if pick(3) {
+			q.Tags = append(q.Tags, t)
+		}
+	}
+	if pick(6) {
+		q.Tags = append(q.Tags, q.Tags...) // a tag asked twice counts once
+	}
+	if pick(2) {
+		q.Actors = map[string]bool{"user": true, "serviceaccount": pick(2), "system": pick(3)}
+	}
+	if pick(3) {
+		q.Namespaces = map[string]bool{}
+		for _, ns := range Namespaces {
+			if pick(2) {
+				q.Namespaces[ns] = true
+			}
+		}
+		q.ClusterScoped = pick(2)
+	}
+	if pick(2) {
+		q.Subset = map[string]bool{}
+		for _, ns := range Namespaces {
+			if pick(3) {
+				q.Subset[ns] = true
+			}
+		}
+	}
+	if pick(2) {
+		q.Latest = 1 + rng.Intn(8)
+		if pick(2) {
+			q.LatestTags = []string{Tags[rng.Intn(len(Tags))], Tags[rng.Intn(len(Tags))]}
+		}
+	}
+	return q
+}
+
 // Records applies the store semantics to a sequence of added events: each is
 // normalized, and records are keyed by (AuditID, Time), where a later add of
 // an equal or higher stage rank replaces the record.

@@ -768,6 +768,12 @@ func (a *Assoc) pvcsIn(ns string) []*model.PVC {
 	return nil
 }
 
+// RootOf is the workload a pod's findings are grouped under, as the security
+// checks group them: a Job's CronJob when it has one, otherwise the owner
+// itself (the real kind behind a Controller). Static and bare pods group by
+// pod: ("Pod", name).
+func (a *Assoc) RootOf(p *model.Pod) (kind, name string) { return a.rootOf(p) }
+
 // rootOf is the owner findings are grouped under: a Job's CronJob when it has
 // one, otherwise the owner itself. Static and bare pods group by pod.
 func (a *Assoc) rootOf(p *model.Pod) (kind, name string) {

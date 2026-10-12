@@ -233,13 +233,22 @@ func (c *Cluster) addInventory(now time.Time) {
 		Source: "csi:ebs.csi.aws.com", Driver: "ebs.csi.aws.com", VolumeHandle: "vol-0" + hexOf("reports-archive")[:16], Created: at(310 * day),
 	})
 
+	// Owners on the namespace annotation, prod labelled production; kube-system
+	// has no owner.
+	owner := func(team string, routing ...string) map[string]string {
+		a := map[string]string{"kubesentry.io/owner": team}
+		if len(routing) > 0 {
+			a["kubesentry.io/slack-channel"] = routing[0]
+		}
+		return a
+	}
 	c.namespaces = []model.Namespace{
-		{Name: "prod", Phase: "Active", Created: at(400 * day),
-			Labels: map[string]string{"pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/warn": "restricted"}},
-		{Name: "staging", Phase: "Active", Created: at(400 * day)},
-		{Name: "data", Phase: "Active", Labels: psa("privileged"), Created: at(300 * day)},
-		{Name: "monitoring", Phase: "Active", Created: at(400 * day)},
-		{Name: "ci", Phase: "Active", Labels: psa("restricted"), Created: at(400 * day)},
+		{Name: "prod", Phase: "Active", Created: at(400 * day), Annotations: owner("team-shop", "#shop-oncall"),
+			Labels: map[string]string{"pod-security.kubernetes.io/enforce": "baseline", "pod-security.kubernetes.io/warn": "restricted", "environment": "production"}},
+		{Name: "staging", Phase: "Active", Created: at(400 * day), Annotations: owner("team-shop"), Labels: map[string]string{"environment": "staging"}},
+		{Name: "data", Phase: "Active", Labels: psa("privileged"), Annotations: owner("team-data", "#data-eng"), Created: at(300 * day)},
+		{Name: "monitoring", Phase: "Active", Annotations: owner("team-platform"), Created: at(400 * day)},
+		{Name: "ci", Phase: "Active", Labels: psa("restricted"), Annotations: owner("team-platform"), Created: at(400 * day)},
 		{Name: "kube-system", Phase: "Active", Created: at(400 * day)},
 	}
 

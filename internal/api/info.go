@@ -21,6 +21,8 @@ type infoResponse struct {
 	Processes bool `json:"processes"` // process monitoring is enabled
 	Inventory bool `json:"inventory"` // map, workloads, nodes, storage and security routes exist
 	Certs     bool `json:"certs"`     // the certificates route exists (cert-manager may still be absent)
+	// Version is the server's build version (cmd/server's main.version).
+	Version string `json:"version,omitempty"`
 
 	Identity     *infoIdentity   `json:"identity,omitempty"`
 	SignOutURL   string          `json:"signOutURL,omitempty"`
@@ -80,7 +82,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	resp := infoResponse{
 		Demo: s.Demo, Metrics: s.metrics() != nil, Audit: s.Audit != nil, Processes: s.Processes != nil,
-		Inventory: s.hasInventory(), Certs: s.hasCerts(), SignOutURL: s.SignOutURL,
+		Inventory: s.hasInventory(), Certs: s.hasCerts(), SignOutURL: s.SignOutURL, Version: s.Version,
 	}
 
 	// The view comes first: its RBAC index proposes the namespaces the

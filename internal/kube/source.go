@@ -31,8 +31,11 @@ type Source struct {
 type SourceOptions struct {
 	AWSAuth          bool     // read kube-system/aws-auth
 	NodeLabelKeysAdd []string // extra node label keys to keep ("prefix*" matches by prefix)
-	ClusterName      string
-	Now              func() time.Time
+	// NamespaceAnnotationKeysAdd are namespace annotations kept besides
+	// kubesentry.io/* (the owner annotation, when configured elsewhere).
+	NamespaceAnnotationKeysAdd []string
+	ClusterName                string
+	Now                        func() time.Time
 }
 
 // NewSource wraps a clientset and an optional dynamic client.
@@ -46,6 +49,10 @@ func NewSourceWithOptions(cs kubernetes.Interface, dyn dynamic.Interface, o Sour
 }
 
 func (s *Source) nodeLabels() labelFilter { return newNodeLabelFilter(s.opts.NodeLabelKeysAdd) }
+
+func (s *Source) namespaceAnnotations() labelFilter {
+	return newNamespaceAnnotationFilter(s.opts.NamespaceAnnotationKeysAdd)
+}
 
 // collect pages through a list and converts each item.
 func collect[O, T any](what string, list func(metav1.ListOptions) ([]O, string, error), conv func(*O) T) ([]T, error) {

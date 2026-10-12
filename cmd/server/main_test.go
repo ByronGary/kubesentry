@@ -49,6 +49,10 @@ func TestFlagsDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := detectors.DefaultPolicy()
+	if p.OwnerAnnotation != "kubesentry.io/owner" || p.ProductionLabel != (detectors.LabelMatch{Key: "environment", Value: "production"}) ||
+		c.namespaceAnnotationKeys() != nil {
+		t.Errorf("owner annotation %q, production label %+v, extra annotation keys %v", p.OwnerAnnotation, p.ProductionLabel, c.namespaceAnnotationKeys())
+	}
 	if p.Thresholds != d.Thresholds || p.Pricing.DefaultPrice != nil || p.Pricing.EBSPrices["gp3"] != 0.08 ||
 		strings.Join(p.SystemPrincipalPrefixes, ",") != "system:,eks:" || strings.Join(p.BuiltinRBACPrefixes, ",") != "system:,eks:,kubeadm:" {
 		t.Errorf("default policy = %+v", p)
@@ -62,7 +66,7 @@ func TestFlagsMapOntoPolicy(t *testing.T) {
 		"-system-principal-prefixes=system:,eks:,okta:", "-builtin-rbac-prefixes=system:",
 		"-restart-warn=5", "-restart-crit=20", "-oom-recent=2d", "-not-ready-grace=10m", "-activity-window=14d", "-cert-warn-cap=45d",
 		"-pvc-default-price=0.1", "-pvc-class-prices=fast=0.2", "-ebs-prices=gp3=0.0952,io2=0.149",
-		"-audit-retention=90d", "-pvc-min-age=2d",
+		"-audit-retention=90d", "-pvc-min-age=2d", "-owner-annotation=example.com/team", "-production-label=tier=prod",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +94,11 @@ func TestFlagsMapOntoPolicy(t *testing.T) {
 	if c.auditRetention != 90*24*time.Hour || c.pvcMinAge != 48*time.Hour {
 		t.Errorf("retention %v min age %v", c.auditRetention, c.pvcMinAge)
 	}
+	// An owner annotation outside kubesentry.io/ is kept by the informers too.
+	if p.OwnerAnnotation != "example.com/team" || p.ProductionLabel != (detectors.LabelMatch{Key: "tier", Value: "prod"}) ||
+		strings.Join(c.namespaceAnnotationKeys(), ",") != "example.com/team" {
+		t.Errorf("owner %q production %+v keys %v", p.OwnerAnnotation, p.ProductionLabel, c.namespaceAnnotationKeys())
+	}
 	if _, err := parseFlags([]string{"-ebs-prices=gp3"}, io.Discard); err != nil {
 		t.Fatal(err) // parsed lazily
 	}
@@ -112,6 +121,10 @@ func TestFlagValidation(t *testing.T) {
 		{"-cloudwatch"},
 		{"-kube-qps=0"},
 		{"-audit-retention=forever"},
+		{"-owner-annotation=not a key"},
+		{"-owner-annotation="},
+		{"-production-label=production"},
+		{"-production-label=env=not valid"},
 		{"stray"},
 	}
 	t.Setenv("KUBESENTRY_API_TOKEN", "")
