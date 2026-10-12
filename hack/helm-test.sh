@@ -104,11 +104,15 @@ echo "== helm lint"
 lint default
 lint kind -f deploy/kind/values-kind.yaml
 lint eks -f "$CHART/examples/values-eks.yaml"
+lint dashboards --set metrics.grafanaDashboards.enabled=true
 
 echo "== golden renders"
 golden default
 golden kind -f deploy/kind/values-kind.yaml
 golden eks -f "$CHART/examples/values-eks.yaml"
+# Grafana dashboard ConfigMaps, with the budget and queue lines filled from values.
+golden dashboards --set metrics.grafanaDashboards.enabled=true \
+  --set metrics.grafanaDashboards.annotations.grafana_folder=kubesentry --set auth.authzQPS=300
 
 echo "== refused configurations"
 # Two replicas would each keep a partial, different audit history.

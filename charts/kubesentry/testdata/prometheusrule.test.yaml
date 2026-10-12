@@ -1,0 +1,231 @@
+# promtool unit tests for the chart's PrometheusRule, rendered with
+# examples/values-eks.yaml (every optional rule on, default thresholds).
+# hack/check-rules.sh renders the rules next to this file and runs:
+#   promtool test rules prometheusrule.test.yaml
+rule_files:
+  - kubesentry-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # p90 of view rebuilds: 9.5s on "slow" (every build lands in the 5-10s
+  # bucket), under a second on "fast".
+  - name: snapshot build slow
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="slow",le="1"}'
+        values: '0x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="slow",le="5"}'
+        values: '0x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="slow",le="10"}'
+        values: '0+1x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="slow",le="+Inf"}'
+        values: '0+1x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="fast",le="1"}'
+        values: '0+1x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="fast",le="5"}'
+        values: '0+1x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="fast",le="10"}'
+        values: '0+1x60'
+      - series: 'kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry",pod="fast",le="+Inf"}'
+        values: '0+1x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentrySnapshotBuildSlow
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: KubesentrySnapshotBuildSlow
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: slow}
+            exp_annotations:
+              summary: kubesentry takes too long to rebuild its view of the cluster.
+              description: >-
+                On slow, 90% of view rebuilds over 15 minutes took up to 9.5s (threshold 5s), so changes reach
+                the UI late and CPU is spent on rebuilds. Usually the cluster grew past the replica's CPU or memory,
+                or object churn is high.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotbuildslow
+
+  # 45,000 of 50,000 queued on "a" (above 80%), 1,000 on "b".
+  - name: audit queue filling
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_audit_queue_depth{namespace="kubesentry",pod="a"}'
+        values: '45000x30'
+      - series: 'kubesentry_audit_queue_depth{namespace="kubesentry",pod="b"}'
+        values: '1000x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentryAuditQueueFilling
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KubesentryAuditQueueFilling
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry's audit write queue is nearly full.
+              description: >-
+                a has held 45k audit events waiting for Postgres for 10 minutes, more than 80% of its 50000-event
+                queue. When it is full, the audit webhook answers 503 and the CloudWatch reader falls behind (nothing
+                is lost).
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryauditqueuefilling
+
+  # 180 reviews/s on "a" (budget 200/s, alert above 160/s), 50/s on "b".
+  - name: authorization budget
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_authz_reviews_total{namespace="kubesentry",pod="a",result="allowed"}'
+        values: '0+6000x40'
+      - series: 'kubesentry_authz_reviews_total{namespace="kubesentry",pod="a",result="denied"}'
+        values: '0+4800x40'
+      - series: 'kubesentry_authz_reviews_total{namespace="kubesentry",pod="b",result="allowed"}'
+        values: '0+3000x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryAuthzBudgetNearLimit
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KubesentryAuthzBudgetNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry is close to its SubjectAccessReview budget.
+              description: >-
+                a sends 180 SubjectAccessReviews per second, above 80% of its budget of 200/s (auth.authzQPS, per
+                replica). At the budget, reviews queue and pages slow down for every user while CPU stays low.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryauthzbudgetnearlimit
+
+  # A day at 80% hits (2 hits and 0.5 misses per second), then hits drop to
+  # 0.1/s: 17% over 30 minutes, under half the day's ratio.
+  - name: response cache hit rate collapse
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_http_cache_total{namespace="kubesentry",pod="a",result="hit"}'
+        values: '0+120x1440 172806+6x100'
+      - series: 'kubesentry_http_cache_total{namespace="kubesentry",pod="a",result="miss"}'
+        values: '0+30x1541'
+      - series: 'kubesentry_http_cache_total{namespace="kubesentry",pod="a",result="skip"}'
+        values: '0+600x1541'
+    alert_rule_test:
+      - eval_time: 23h
+        alertname: KubesentryCacheHitRateCollapsed
+        exp_alerts: []
+      - eval_time: 25h10m
+        alertname: KubesentryCacheHitRateCollapsed
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry}
+            exp_annotations:
+              summary: kubesentry's response cache hit rate collapsed.
+              description: >-
+                The response cache in kubesentry answered 16.67% of lookups from cache over 30 minutes, less than
+                50% of its hit ratio over the last day. Every miss runs the handler and its authorization checks, so
+                CPU and SubjectAccessReviews rise.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycachehitratecollapsed
+
+  # oom: a quarter of requests answered 429. auth_recheck's 429s are users
+  # pressing the button, not a capacity problem. audit_events: half 503.
+  - name: rejected requests per route
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="oom",code="200"}'
+        values: '0+180x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="oom",code="429"}'
+        values: '0+60x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="auth_recheck",code="429"}'
+        values: '0+60x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="pods",code="200"}'
+        values: '0+600x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="audit_events",code="200"}'
+        values: '0+30x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="audit_events",code="503"}'
+        values: '0+30x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryRateLimited
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryRateLimited
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, route: oom}
+            exp_annotations:
+              summary: kubesentry is answering 429 Too Many Requests on a route.
+              description: >-
+                The oom route has answered 429 at 1.00/s, more than 5% of its requests, for 15 minutes. Users hit the
+                per-identity cap on expensive routes (server.maxInflightPerIdentity), usually because the backend
+                behind it (Prometheus or Postgres) is slow.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryratelimited
+      - eval_time: 30m
+        alertname: KubesentryServiceUnavailable
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, route: audit_events}
+            exp_annotations:
+              summary: kubesentry is answering 503 Service Unavailable on a route.
+              description: >-
+                The audit_events route has answered 503 at 0.50/s, more than 5% of its requests, for 15 minutes:
+                route timeouts, an overloaded audit store, a full audit write queue (ingest_audit_webhook), or an
+                ingest route without its token.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryserviceunavailable
+
+  # The server crash-loops; the agent restarts every 2 minutes without ever
+  # reaching CrashLoopBackOff; a pod of another release crash-loops too.
+  - name: crash loops of the release's pods only
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_waiting_reason{namespace="kubesentry",pod="kubesentry-7d9f8c6b5-x2x4z",container="server",reason="CrashLoopBackOff"}'
+        values: '1x30'
+      - series: 'kube_pod_container_status_restarts_total{namespace="kubesentry-agent",pod="kubesentry-agent-p8q7r",container="agent"}'
+        values: '0+0.5x30'
+      - series: 'kube_pod_container_status_waiting_reason{namespace="kubesentry",pod="postgres-0",container="postgres",reason="CrashLoopBackOff"}'
+        values: '1x30'
+      - series: 'kube_pod_container_status_waiting_reason{namespace="payments",pod="kubesentry-lookalike-0",container="server",reason="CrashLoopBackOff"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentryCrashLooping
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: KubesentryCrashLooping
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: kubesentry-7d9f8c6b5-x2x4z, container: server}
+            exp_annotations:
+              summary: A kubesentry container is crash-looping.
+              description: >-
+                server in kubesentry/kubesentry-7d9f8c6b5-x2x4z is in CrashLoopBackOff or restarted at least 3 times
+                in 30 minutes. A restarting server rebuilds its caches; with the memory audit store it also loses its
+                audit history.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycrashlooping
+          - exp_labels: {severity: warning, namespace: kubesentry-agent, pod: kubesentry-agent-p8q7r, container: agent}
+            exp_annotations:
+              summary: A kubesentry container is crash-looping.
+              description: >-
+                agent in kubesentry-agent/kubesentry-agent-p8q7r is in CrashLoopBackOff or restarted at least 3 times
+                in 30 minutes. A restarting server rebuilds its caches; with the memory audit store it also loses its
+                audit history.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycrashlooping
+
+  # One OOM kill 10 minutes ago on the server; an old one on oauth2-proxy
+  # (no restart in the last 30 minutes) is not reported again.
+  - name: OOM kills
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="kubesentry",pod="kubesentry-7d9f8c6b5-x2x4z",container="server",reason="OOMKilled"}'
+        values: '_x49 1x30'
+      - series: 'kube_pod_container_status_restarts_total{namespace="kubesentry",pod="kubesentry-7d9f8c6b5-x2x4z",container="server"}'
+        values: '0x49 1x30'
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="kubesentry",pod="kubesentry-7d9f8c6b5-x2x4z",container="oauth2-proxy",reason="OOMKilled"}'
+        values: '1x80'
+      - series: 'kube_pod_container_status_restarts_total{namespace="kubesentry",pod="kubesentry-7d9f8c6b5-x2x4z",container="oauth2-proxy"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: KubesentryOOMKilled
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: KubesentryOOMKilled
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: kubesentry-7d9f8c6b5-x2x4z, container: server}
+            exp_annotations:
+              summary: A kubesentry container was OOM-killed.
+              description: >-
+                server in kubesentry/kubesentry-7d9f8c6b5-x2x4z restarted in the last 30 minutes after running out of
+                memory. Its memory limit is too small for the cluster's size or for the agents' report bursts.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryoomkilled

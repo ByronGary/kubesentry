@@ -29,6 +29,19 @@
       "maximum": 1,
       "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?|\\.[0-9]+)$"
     },
+    "fraction": {
+      "description": "A fraction between 0 and 1; --set passes decimals as strings, so numeric strings are accepted too",
+      "type": ["number", "string"],
+      "minimum": 0,
+      "maximum": 1,
+      "pattern": "^(0(\\.[0-9]+)?|1(\\.0+)?|\\.[0-9]+)$"
+    },
+    "positiveNumber": {
+      "description": "A number above 0; numeric strings are accepted too",
+      "type": ["number", "string"],
+      "exclusiveMinimum": 0,
+      "pattern": "^([0-9]*[1-9][0-9]*(\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
+    },
     "intOrNull": { "type": ["integer", "null"], "minimum": 0 },
     "stringList": { "type": "array", "items": { "type": "string" } },
     "stringMap": { "type": "object", "additionalProperties": { "type": "string" } },
@@ -631,11 +644,41 @@
             "enabled": { "type": "boolean" },
             "labels": { "$ref": "#/definitions/stringMap" },
             "matchers": { "type": "string" },
+            "runbookBaseURL": { "type": "string", "pattern": "^https?://[^#]+$" },
             "snapshotStaleSeconds": { "type": "integer", "minimum": 1 },
+            "snapshotBuildSeconds": { "$ref": "#/definitions/positiveNumber" },
             "cloudwatchLagSeconds": { "type": "integer", "minimum": 1 },
             "authzErrorRatio": { "$ref": "#/definitions/fractionOrNull" },
+            "authzBudgetRatio": { "$ref": "#/definitions/fraction" },
+            "cacheHitCollapseRatio": { "$ref": "#/definitions/fraction" },
+            "cacheMinLookupsPerSecond": { "$ref": "#/definitions/positiveNumber" },
+            "rejectedRatio": { "$ref": "#/definitions/fraction" },
+            "rejectedMinPerSecond": { "$ref": "#/definitions/positiveNumber" },
+            "auditQueueRatio": { "$ref": "#/definitions/fraction" },
+            "auditQueueCapacity": { "type": "integer", "minimum": 1 },
             "agentDropRatio": { "$ref": "#/definitions/fractionOrNull" },
+            "kubeStateMetrics": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "matchers": { "type": "string" },
+                "restarts": { "type": "integer", "minimum": 1 }
+              }
+            },
             "extraRules": { "$ref": "#/definitions/objectList" }
+          }
+        },
+        "grafanaDashboards": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "namespace": { "type": "string", "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$" },
+            "label": { "type": "string", "minLength": 1 },
+            "labelValue": { "type": "string" },
+            "labels": { "$ref": "#/definitions/stringMap" },
+            "annotations": { "$ref": "#/definitions/stringMap" }
           }
         }
       }
