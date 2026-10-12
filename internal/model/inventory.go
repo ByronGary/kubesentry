@@ -168,10 +168,14 @@ type StorageClass struct {
 
 // Namespace is a core/v1 Namespace.
 type Namespace struct {
-	Name    string
-	Phase   string
-	Labels  map[string]string
-	Created time.Time
+	Name   string
+	Phase  string
+	Labels map[string]string
+	// Annotations keeps only kubesentry.io/* keys (the owner and alert
+	// routing hints) plus the configured owner annotation; see internal/kube
+	// for the allowlist.
+	Annotations map[string]string
+	Created     time.Time
 }
 
 // RBAC holds the cluster's roles and bindings.

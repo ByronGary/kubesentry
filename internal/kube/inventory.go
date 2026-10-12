@@ -494,17 +494,21 @@ func convertStorageClass(c *storagev1.StorageClass) model.StorageClass {
 }
 
 func (s *Source) ListNamespaces(ctx context.Context) ([]model.Namespace, error) {
+	ann := s.namespaceAnnotations()
 	return collect("namespaces", func(o metav1.ListOptions) ([]corev1.Namespace, string, error) {
 		l, err := s.cs.CoreV1().Namespaces().List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertNamespace)
+	}, func(n *corev1.Namespace) model.Namespace { return convertNamespace(n, ann) })
 }
 
-func convertNamespace(n *corev1.Namespace) model.Namespace {
-	return model.Namespace{Name: n.Name, Phase: string(n.Status.Phase), Labels: n.Labels, Created: n.CreationTimestamp.Time}
+// convertNamespace keeps the namespace's labels and only the annotations
+// ann allows (kubesentry.io/* and the owner annotation).
+func convertNamespace(n *corev1.Namespace, ann labelFilter) model.Namespace {
+	return model.Namespace{Name: n.Name, Phase: string(n.Status.Phase), Labels: n.Labels, Annotations: ann.filter(n.Annotations),
+		Created: n.CreationTimestamp.Time}
 }
 
 func (s *Source) listRoles(ctx context.Context) ([]model.Role, error) {

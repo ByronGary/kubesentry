@@ -241,6 +241,9 @@ func fixtureObjects() []runtime.Object {
 		Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive}}
 	nsApp.Labels["kubesentry.io/system"] = "false"
 	nsApp.Labels["pod-security.kubernetes.io/enforce"] = "restricted"
+	nsApp.Annotations["kubesentry.io/owner"] = "team-payments"
+	nsApp.Annotations["kubesentry.io/slack-channel"] = "#payments"
+	nsApp.Annotations["example.com/owner"] = "payments@example.com"
 	nsSys := &corev1.Namespace{ObjectMeta: meta("", "kube-system", "ns-sys"), Status: corev1.NamespaceStatus{Phase: corev1.NamespaceActive}}
 
 	data := &corev1.PersistentVolumeClaim{ObjectMeta: meta("app", "data", "pvc-data"),

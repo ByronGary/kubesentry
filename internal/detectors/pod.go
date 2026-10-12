@@ -200,6 +200,38 @@ func PodReason(p *model.Pod) string {
 	return ""
 }
 
+// Pod states counted on the Overview. They do not overlap: a crash-looping
+// pod in phase Running is failing, not running.
+const (
+	PodFailing = "failing"
+	PodPending = "pending"
+	PodRunning = "running"
+)
+
+// PodState sorts a pod for the Overview's counts, with the map's verdicts:
+// failing when the map shows it critical (the node failed it, it failed,
+// or a container is stuck in CrashLoopBackOff, ImagePullBackOff and the
+// like); pending when it has been Pending longer than PendingGrace; running
+// when it runs. Finished pods count only while the map still shows them
+// (RecentPod). reason is PodReason, or "Failed" or "Pending" when that says
+// nothing; state is "" for every other pod (completed, starting, unknown).
+func PodState(p *model.Pod, t Thresholds, now time.Time) (state, reason string) {
+	if !shownPod(p, t.RecentPod, now) {
+		return "", ""
+	}
+	lvl, _ := podLevelReason(p)
+	stuck, _, _ := stuckContainers(p)
+	switch {
+	case lvl != "" || p.Phase == "Failed" || len(stuck) > 0:
+		return PodFailing, first(PodReason(p), "Failed")
+	case p.Phase == "Pending" && (p.Created.IsZero() || now.Sub(p.Created) > t.PendingGrace):
+		return PodPending, first(PodReason(p), "Pending")
+	case p.Phase == "Running":
+		return PodRunning, ""
+	}
+	return "", ""
+}
+
 // appContainers sums restarts over a pod's app containers and sidecars,
 // leaving ordinary init containers out, and counts those containers.
 func appContainers(p *model.Pod) (restarts int32, n int) {

@@ -22,13 +22,13 @@ import (
 )
 
 // convertAny converts a fixture with the conversion the Cache and Source use.
-func convertAny(t testing.TB, obj runtime.Object, labels labelFilter) any {
+func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	t.Helper()
 	switch o := obj.(type) {
 	case *corev1.Pod:
 		return convertPod(o)
 	case *corev1.Node:
-		return convertNode(o, labels)
+		return convertNode(o, f.nodeLabels)
 	case *corev1.PersistentVolumeClaim:
 		return convertPVC(o)
 	case *corev1.PersistentVolume:
@@ -36,7 +36,7 @@ func convertAny(t testing.TB, obj runtime.Object, labels labelFilter) any {
 	case *storagev1.StorageClass:
 		return convertStorageClass(o)
 	case *corev1.Namespace:
-		return convertNamespace(o)
+		return convertNamespace(o, f.nsAnnotations)
 	case *corev1.Service:
 		return convertService(o)
 	case *discoveryv1.EndpointSlice:
@@ -82,9 +82,9 @@ func convertAny(t testing.TB, obj runtime.Object, labels labelFilter) any {
 
 func allFixtures() []runtime.Object { return append(fixtureObjects(), certObjects()...) }
 
-func transformed(obj runtime.Object, labels labelFilter) runtime.Object {
+func transformed(obj runtime.Object, f filters) runtime.Object {
 	c := obj.DeepCopyObject()
-	transformObject(c, labels)
+	transformObject(c, f)
 	return c
 }
 
@@ -100,7 +100,7 @@ func describe(obj runtime.Object) string {
 }
 
 func TestTransformPreservesConvert(t *testing.T) {
-	for _, labels := range []labelFilter{newNodeLabelFilter(nil), newNodeLabelFilter([]string{"example.com/*"})} {
+	for _, labels := range []filters{newFilters(nil, nil), newFilters([]string{"example.com/*"}, []string{"example.com/owner"})} {
 		for _, obj := range allFixtures() {
 			want := convertAny(t, obj, labels)
 			got := convertAny(t, transformed(obj, labels), labels)
@@ -112,7 +112,7 @@ func TestTransformPreservesConvert(t *testing.T) {
 }
 
 func TestTransformIdempotent(t *testing.T) {
-	labels := newNodeLabelFilter([]string{"example.com/rack"})
+	labels := newFilters([]string{"example.com/rack"}, []string{"example.com/owner"})
 	for _, obj := range allFixtures() {
 		once := transformed(obj, labels)
 		twice := transformed(once, labels)
@@ -140,7 +140,7 @@ func jsonSize(t *testing.T, v any) int {
 // TestTransformStrips checks the transform drops what it promises to, and
 // logs how much smaller the stored objects get.
 func TestTransformStrips(t *testing.T) {
-	labels := newNodeLabelFilter(nil)
+	labels := newFilters(nil, nil)
 	pod := fixturePods()[0]
 	before := jsonSize(t, pod)
 	p := transformed(pod, labels).(*corev1.Pod)
