@@ -50,7 +50,16 @@ func tenantInventory() model.Inventory {
 	inv.Certs.Installed = true
 	inv.Certs.Issuers = append(inv.Certs.Issuers, model.Issuer{Kind: "ClusterIssuer", Name: "le", Type: "acme", Ready: "True"})
 	for i, ns := range tenants {
-		inv.Namespaces = append(inv.Namespaces, model.Namespace{Name: ns})
+		// team-a and team-b have owners, team-b runs production.
+		owners := map[string]string{"team-a": "team-alpha", "team-b": "team-beta"}
+		n := model.Namespace{Name: ns}
+		if o := owners[ns]; o != "" {
+			n.Annotations = map[string]string{"kubesentry.io/owner": o}
+		}
+		if ns == "team-b" {
+			n.Labels = map[string]string{"environment": "production"}
+		}
+		inv.Namespaces = append(inv.Namespaces, n)
 		dep := model.Workload{Kind: "Deployment", Namespace: ns, Name: "web", UID: "dep-" + ns, Desired: 3, Ready: 3, Updated: 3, Available: 3,
 			Selector: &model.LabelSelector{MatchLabels: map[string]string{"app": "web"}}}
 		inv.Workloads = append(inv.Workloads, dep)

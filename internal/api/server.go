@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -129,6 +130,16 @@ type Server struct {
 	RouteTimeout time.Duration
 	// AccessLog, if set, gets one line per web request: who viewed what.
 	AccessLog *slog.Logger
+
+	// History, if set, keeps the Overview's counters for a day (sparklines
+	// and "new since 24h"); cmd/server records every view built into it.
+	History *snapshot.History
+	// AuditHealth, if set, says why the audit store is degraded (nil while
+	// it is healthy), for the Overview's health strip. It must be cheap.
+	AuditHealth func() error
+	// CloudWatchLag, if set, reports how far the CloudWatch audit reader is
+	// behind; ok is false on a replica that is not reading.
+	CloudWatchLag func() (lag time.Duration, ok bool)
 
 	cacheOnce sync.Once
 	recheckMu sync.Mutex
@@ -262,6 +273,14 @@ var cachedRoutes = map[string][]auth.Capability{
 	"GET /api/v1/security":     {auth.ViewNamespace, auth.ViewRBAC, auth.ViewClusterRBAC},
 	"GET /api/v1/map":          {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/certificates": {auth.ViewNamespace, auth.ViewClusterIssuer},
+	"GET /api/v1/overview":     overviewCaps,
+}
+
+// cacheWindows bounds how long a cached route's response is served, for
+// routes that also show what changes with time rather than with the view
+// (the overview's age, health and activity): the key gains the window.
+var cacheWindows = map[string]time.Duration{
+	"GET /api/v1/overview": overviewCacheWindow,
 }
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
@@ -276,7 +295,11 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 	if len(caps) == 0 || !ok {
 		return "", false
 	}
-	return CacheKeyFunc(s.Authorizer, func() uint64 { return v }, caps...)(r)
+	key, ok := CacheKeyFunc(s.Authorizer, func() uint64 { return v }, caps...)(r)
+	if win := cacheWindows[r.Pattern]; ok && win > 0 {
+		key += "\x00" + strconv.FormatInt(s.now().UnixNano()/int64(win), 10)
+	}
+	return key, ok
 }
 
 // route registers one API route with its per-route middleware: metrics,
@@ -316,6 +339,7 @@ func (s *Server) apiRoutes() http.Handler {
 	s.route(mux, "GET /api/v1/pvcs/unused", "pvcs_unused", t, s.unusedPVCs)
 	s.routeCapped(mux, "GET /api/v1/oom", "oom", long, expensive, s.oom)
 	s.route(mux, "GET /api/v1/pods", "pods", t, s.pods)
+	s.route(mux, "GET /api/v1/overview", "overview", t, s.overview)
 	s.routeCapped(mux, "GET /api/v1/pods/{namespace}/{name}/diagnostics", "pod_diagnostics", long, expensive, s.podDiagnostics)
 	if s.Audit != nil {
 		s.route(mux, "GET /api/v1/audit/events", "audit_events", t, s.auditEvents)
