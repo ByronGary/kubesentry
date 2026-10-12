@@ -70,8 +70,8 @@ check() { # name command...: runs it, prints its output on failure
 }
 
 # promtool check rules prints warnings but exits 0 for some; fail on those too.
-check_rules() { # file
-  promtool check rules --lint=all --lint-fatal "$1" >"$tmp/check" 2>&1 || { cat "$tmp/check"; return 1; }
+check_rules() { # files...
+  promtool check rules ${LINT:---lint=all --lint-fatal} "$@" >"$tmp/check" 2>&1 || { cat "$tmp/check"; return 1; }
   cat "$tmp/check"
   ! grep -qi 'warn' "$tmp/check"
 }
@@ -203,8 +203,20 @@ routes digest alertname=KubesentryUnusedVolume severity=critical owner=payments 
 if [ -n "$kps" ]; then
   echo "== kube-prometheus-stack ($kps) rendered with $PROFILE"
   helm template kps "$kps" --namespace monitoring --kube-version 1.33.0 -f "$PROFILE" >"$tmp/kps.yaml"
-  prometheusrule_specs <"$tmp/kps.yaml" | awk '/^groups:$/ && seen++ { next } { print }' >"$tmp/kps-rules.yaml"
-  check "promtool check rules (every rendered rule)" check_rules kps-rules.yaml
+  # One rule file per PrometheusRule: their list indentation differs.
+  mkdir -p "$tmp/kps"
+  awk -v dir="$tmp/kps" '
+    /^---/                       { keep = 0; spec = 0; next }
+    /^kind: PrometheusRule$/     { keep = 1; n++ }
+    keep && /^spec:$/            { spec = 1; next }
+    keep && spec && /^[^ ]/      { spec = 0 }
+    keep && spec                 { print substr($0, 3) > (dir "/rules-" n ".yaml") }
+  ' "$tmp/kps.yaml"
+  echo "     $(ls "$tmp"/kps | wc -l) PrometheusRule objects rendered"
+  # The stock rules are kubernetes-mixin's, which records some names once per
+  # status-code class on purpose (code_verb:apiserver_request_total:increase1h),
+  # so promtool's duplicate-rule lint is off for them; ours are linted above.
+  LINT=--lint=none check "promtool check rules (every rendered rule)" check_rules $(cd "$tmp" && ls kps/*.yaml)
   awk '/^kind: Secret$/ { s = 1 } /^---/ { s = 0 } s && /^  alertmanager.yaml: / { print $2 }' "$tmp/kps.yaml" \
     | tr -d '"' | base64 -d >"$tmp/kps-alertmanager.yaml"
   check "amtool check-config (rendered)" amtool check-config kps-alertmanager.yaml
