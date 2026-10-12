@@ -1,3 +1,15 @@
 node_modules/
 .kind/
 .claude/worktrees/
+
+# Stress-test output stays local; the headline numbers live in docs/stress-notes.md.
+test/stress/results/
+
+# Build and tooling leftovers
+/server
+/agent
+/demo
+*.test
+*.out
+*.prof
+__pycache__/
