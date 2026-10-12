@@ -30,10 +30,23 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 	go KeepFresh(ctx, procs, cluster, 10*time.Second)
 
 	policy := detectors.DefaultPolicy()
-	views := &snapshot.Manager{Source: cluster, Policy: policy, MinInterval: 30 * time.Second, MaxDelay: time.Minute}
+	// The Overview's history: a believable day before now, then every view.
+	hist := snapshot.NewHistory(snapshot.DefaultHistoryStep, snapshot.DefaultHistoryBuckets)
+	inv, err := cluster.Inventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	PrefillHistory(hist, snapshot.Build(inv, policy, now), now)
+	views := &snapshot.Manager{Source: cluster, Policy: policy, MinInterval: 30 * time.Second, MaxDelay: time.Minute,
+		OnBuild: func(v *snapshot.View, _ time.Duration, err error) {
+			if err == nil {
+				hist.Record(v)
+			}
+		}}
 	go func() { _ = views.Run(ctx) }()
 
 	return &api.Server{
+		History:       hist,
 		Cluster:       cluster,
 		Views:         views,
 		Policy:        policy,
