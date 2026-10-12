@@ -501,3 +501,89 @@ export interface NodesResponse {
   count: number
   items: NodeSummary[]
 }
+
+// ---- Overview dashboard (GET /api/v1/overview?namespace=&owner=) ----
+// Scoped to the caller like every other route; cluster-scoped parts are null
+// when the caller lacks the capability. See docs/proposals/overview-dashboard.md.
+
+export type AttentionSeverity = 'crit' | 'warn'
+
+export interface OverviewResponse {
+  /** Snapshot view version the answer was built from. */
+  version: number
+  builtAt: string
+  ageSeconds: number
+  /** The filter applied, and how many namespaces it covers for this caller. */
+  scope: { namespace?: string; owner?: string; namespaces: number }
+  health: {
+    prometheus: 'ok' | 'unavailable' | 'none'
+    auditStore: 'ok' | 'degraded' | 'none'
+    cloudwatchLagSeconds?: number
+    /** Present with the `agents` capability. */
+    agents?: { reporting: number; stale: number }
+  }
+  /** Null without the `nodes` capability. */
+  nodes: null | {
+    total: number
+    ready: number
+    notReady: number
+    cordoned: number
+    pools: OverviewPool[]
+    zones: { name: string; nodes: number }[]
+  }
+  pods: { total: number; running: number; pending: number; failing: number; byReason: Record<string, number> }
+  workloads: { total: number; unhealthy: number }
+  /** Null when cert-manager is not installed. */
+  certificates: null | { total: number; expiringSoon: number; notReady: number; issuerMissing: number }
+  security: { crit: number; warn: number; newSince24h?: number }
+  /** Top 10 problems, worst first, folded per workload. */
+  attention: AttentionItem[]
+  /** Null without the `audit` capability. Counts over windowHours (24 by default). */
+  activity: null | {
+    windowHours: number
+    exec: number
+    execProduction: number
+    secretReads: number
+    rbacChanges: number
+    denied: number
+    latest: AuditEvent[]
+  }
+  waste: { unusedPVCs: number; monthlyUSD: number; usageBilled: number }
+  /** Owners (namespace annotation kubesentry.io/owner) of the caller's visible namespaces, for the filter. */
+  owners: string[]
+  /** Sidebar badges, keyed by nav item; absent when zero. */
+  badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates', { count: number; severity: AttentionSeverity }>>
+  history: OverviewHistory
+}
+
+export interface OverviewPool {
+  name: string
+  kind: 'nodegroup' | 'karpenter' | 'fargate' | 'other'
+  nodes: number
+  /** Requested / allocatable, percent; absent for Fargate (not metered). */
+  cpuRequestedPct?: number
+  memRequestedPct?: number
+}
+
+export interface AttentionItem {
+  severity: AttentionSeverity
+  /** Check that raised it, e.g. "crashloop", "cert-expiring", "leak", "exposure". */
+  kind: string
+  namespace?: string
+  name: string
+  title: string
+  owner?: string
+  /** When the problem started, if known. */
+  since?: string
+  /** Hash route of the page that explains it, already filtered (e.g. "#/workloads?status=crit&namespace=shop"). */
+  href: string
+}
+
+/** In-process history (24h, fixed buckets) for sparklines; lost on restart, per replica. */
+export interface OverviewHistory {
+  stepSeconds: number
+  /** Time of the first bucket; values are oldest first. */
+  start: string
+  series: Partial<Record<'unhealthyWorkloads' | 'failingPods' | 'securityCrit' | 'securityWarn' | 'certsExpiringSoon', number[]>>
+}
+

@@ -47,6 +47,7 @@ Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only
 | `GET /api/v1/agents` | new: `[{node, lastReport, processes, bytes, stale, dropped?}]` (a bare array); 403 without `ViewAgents`; absent (404) when process monitoring is off |
 | `POST /agent/report` | plain or gzip JSON (`Content-Encoding: gzip`): 413 when the body or the decompressed report exceeds 8 MiB or it lists more processes than the store's per-node cap (20,000; decoding stops there), 415 for another encoding, 400 when invalid. The process store evicts the longest-silent nodes beyond 5000 nodes or 256 MiB of process data |
 | `POST /audit/webhook` | 503 with `Retry-After` when the audit store's write queue is full |
+| `GET /api/v1/overview` | new: the landing dashboard (`OverviewResponse` in `types.ts`), `?namespace=&owner=`. Scoped like every route; `nodes` null without `nodes`, `activity` null without `audit`; counts and owners only from visible namespaces. Memoised per (scope, filter, view version), response-cached. Owner comes from the namespace annotation `kubesentry.io/owner`; production from the namespace label `environment=production` (both configurable) |
 | `POST /api/v1/auth/recheck` | new: forgets the caller's cached authorization decisions and returns `{capabilities}`; at most once a minute per identity (429 otherwise) |
 
 ### Authentication rules
