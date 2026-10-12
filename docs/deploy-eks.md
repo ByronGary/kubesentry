@@ -634,6 +634,8 @@ helm template kubesentry charts/kubesentry -n kubesentry -f values.yaml -s templ
 aws amp create-rule-groups-namespace --workspace-id ws-... --name kubesentry --data fileb://rules.yaml
 ```
 
+`docs/monitoring-eks.md` has a runbook for each of kubesentry's alerts and describes the "kubesentry health" Grafana dashboard (`metrics.grafanaDashboards`). It also covers an example kube-prometheus-stack profile for the cluster itself, with routing by owner.
+
 ## 12. Sizing
 
 These are starting points until the stress report in `test/stress` replaces them with measured numbers. Each replica holds informers for the whole cluster, so its memory grows with object count, not with users.
