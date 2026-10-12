@@ -5,6 +5,7 @@ import {
   groupSecurity,
   imageSummary,
   matches,
+  podStatusFilter,
   readiness,
   reasonStatus,
   securityPartial,
@@ -12,6 +13,7 @@ import {
   shortImage,
   splitSubject,
   splitWorkload,
+  statusMatches,
   waitingReasons,
 } from './inventory'
 import type { PodSummary, SecurityFinding, WorkloadSummary } from './types'
@@ -34,6 +36,13 @@ describe('filterWorkloads', () => {
     expect(filterWorkloads(items, { q: '', namespace: '', kind: '', status: 'warn' }).map((w) => w.name)).toEqual(['web'])
     expect(filterWorkloads(items, { q: 'POSTGRES', namespace: '', kind: '', status: '' }).map((w) => w.name)).toEqual(['db'])
     expect(filterWorkloads(items, { q: 'shop/w', namespace: '', kind: '', status: '' }).map((w) => w.name)).toEqual(['web'])
+  })
+  it('reads "unhealthy" as critical or warning, as the Overview counts them', () => {
+    const more = [...items, wl('Deployment', 'pay', 'api', { status: 'crit' }), wl('Job', 'pay', 'etl', { status: 'unknown' })]
+    expect(filterWorkloads(more, { q: '', namespace: '', kind: '', status: 'unhealthy' }).map((w) => w.name)).toEqual(['web', 'api'])
+    expect(statusMatches('', 'unknown')).toBe(true)
+    expect(statusMatches('crit', 'warn')).toBe(false)
+    expect(statusMatches('unhealthy', 'ok')).toBe(false)
   })
   it('tolerates a null image list', () => {
     expect(filterWorkloads([wl('Job', 'a', 'b', { images: null as never })], { q: 'x', namespace: '', kind: '', status: '' })).toEqual([])
@@ -140,6 +149,21 @@ describe('pods and workloads', () => {
     expect(filterPods(items, 'ip-10-0-1').map((p) => p.name)).toEqual(['web-1'])
     expect(filterPods(items, 'statefulset/').map((p) => p.name)).toEqual(['db-0'])
     expect(filterPods(items, '')).toBe(items)
+  })
+  it('filters pods by status from the address: failing or pending', () => {
+    const items = [
+      pod('web-1'),
+      pod('db-0', { reason: 'CrashLoopBackOff' }),
+      pod('cache-0', { oomKilled: true }),
+      pod('evicted', { phase: 'Failed', reason: 'Evicted' }),
+      pod('new-0', { phase: 'Pending', reason: 'ContainerCreating' }),
+    ]
+    expect(filterPods(items, '', 'failing').map((p) => p.name)).toEqual(['db-0', 'cache-0', 'evicted'])
+    expect(filterPods(items, '', 'pending').map((p) => p.name)).toEqual(['new-0'])
+    expect(filterPods(items, 'db', 'failing').map((p) => p.name)).toEqual(['db-0'])
+    expect(podStatusFilter('failing')).toBe('failing')
+    expect(podStatusFilter('bogus')).toBe('')
+    expect(podStatusFilter(null)).toBe('')
   })
   it('rates reasons: crash loops and image errors are critical, the rest are warnings', () => {
     expect(reasonStatus('CrashLoopBackOff')).toBe('crit')

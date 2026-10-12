@@ -13,6 +13,8 @@ export interface Info {
   certs: boolean
   /** Who is calling, when the server knows (proxy or token mode). */
   identity?: { user: string; groups: string[]; source: 'proxy' | 'token' | 'none' }
+  /** kubesentry build version (main.version), shown in the sidebar footer. */
+  version?: string
   /** Proxy mode: where "Sign out" goes (the oauth2-proxy sign-out path), from -auth-sign-out-url. */
   signOutURL?: string
   /** What this caller may see beyond namespaced data; absent means everything. */
@@ -515,6 +517,8 @@ export interface OverviewResponse {
   ageSeconds: number
   /** The filter applied, and how many namespaces it covers for this caller. */
   scope: { namespace?: string; owner?: string; namespaces: number }
+  /** Namespaces the caller can see (before the filter), sorted, for the namespace picker. */
+  namespaces?: string[]
   health: {
     prometheus: 'ok' | 'unavailable' | 'none'
     auditStore: 'ok' | 'degraded' | 'none'
@@ -547,6 +551,8 @@ export interface OverviewResponse {
     rbacChanges: number
     denied: number
     latest: AuditEvent[]
+    /** Visible namespaces carrying the production label, so the UI can mark production events. */
+    productionNamespaces?: string[]
   }
   waste: { unusedPVCs: number; monthlyUSD: number; usageBilled: number }
   /** Owners (namespace annotation kubesentry.io/owner) of the caller's visible namespaces, for the filter. */
