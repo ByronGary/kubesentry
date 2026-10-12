@@ -49,8 +49,10 @@ type overviewResponse struct {
 	Activity     *overviewActivity `json:"activity"`
 	Waste        overviewWaste     `json:"waste"`
 	Owners       []string          `json:"owners"`
-	Badges       map[string]badge  `json:"badges"`
-	History      overviewHistory   `json:"history"`
+	// Namespaces the caller can see before the filter, sorted, for the picker.
+	Namespaces []string         `json:"namespaces"`
+	Badges     map[string]badge `json:"badges"`
+	History    overviewHistory  `json:"history"`
 }
 
 type overviewScope struct {
@@ -146,7 +148,8 @@ type ovIndex struct {
 	owner      map[string]string // namespace → owner annotation
 	byOwner    map[string][]string
 	production map[string]bool // namespaces carrying the production label
-	namespaces int             // namespaces in the view, as /info counts them
+	names      []string        // namespaces in the view, sorted (as /info counts them)
+	nameSet    map[string]bool
 	groups     map[groupKey]*attnGroup
 	cluster    []*attnGroup // crit cluster-scoped findings (ViewClusterRBAC)
 	nodeGroups []*attnGroup // nodes not ready (ViewNodes)
@@ -191,10 +194,20 @@ func buildOverviewIndex(v *snapshot.View) *ovIndex {
 			idx.production[n.Name] = true
 		}
 	}
-	idx.namespaces = len(v.Inv.Namespaces)
-	if idx.namespaces == 0 {
-		idx.namespaces = len(v.Assoc().Namespaces()) // namespaces unreadable: those holding objects
+	// The namespaces listed, and those holding objects (all there is when
+	// namespaces cannot be read).
+	idx.nameSet = map[string]bool{}
+	for _, n := range v.Inv.Namespaces {
+		idx.nameSet[n.Name] = true
 	}
+	for _, n := range v.Assoc().Namespaces() {
+		idx.nameSet[n] = true
+	}
+	delete(idx.nameSet, "")
+	for n := range idx.nameSet {
+		idx.names = append(idx.names, n)
+	}
+	sort.Strings(idx.names)
 	th := p.Thresholds
 	for i := range v.Inv.Pods {
 		pod := &v.Inv.Pods[i]
@@ -301,21 +314,21 @@ func (o *ovSel) each(idx *ovIndex, f func(ns string, n *ovNS)) {
 	}
 }
 
-// count is how many namespaces the selection covers.
-func (o *ovSel) count(idx *ovIndex) int {
-	switch {
-	case o.filtered:
-		return len(o.set)
-	case o.sc.All:
-		return idx.namespaces
+// visible is every namespace of the view the caller may see, before any
+// filter, sorted. With every namespace it is the index's own slice: do not
+// modify it.
+func (o *ovSel) visible(idx *ovIndex) []string {
+	if o.sc.All {
+		return idx.names
 	}
-	n := 0
+	out := []string{}
 	for ns, held := range o.sc.Namespaces {
-		if held && ns != "" {
-			n++
+		if held && idx.nameSet[ns] {
+			out = append(out, ns)
 		}
 	}
-	return n
+	sort.Strings(out)
+	return out
 }
 
 // keep reports whether the caller sees the counters under k, with the gates
@@ -355,7 +368,7 @@ func (s *Server) overviewSelection(r *http.Request, idx *ovIndex, ns, owner stri
 	}
 	sel.set = map[string]bool{}
 	for _, n := range candidates {
-		if sel.sc.Has(n) {
+		if sel.sc.Has(n) && idx.nameSet[n] {
 			sel.set[n] = true
 		}
 	}
@@ -374,6 +387,7 @@ type ovBase struct {
 	groups       []*attnGroup // sorted worst first
 	waste        overviewWaste
 	owners       []string
+	visible      []string         // the caller's namespaces before the filter
 	badges       map[string]badge // without findings and memory, which leaks change
 	oom          int
 }
@@ -440,7 +454,11 @@ func filterKey(sel *ovSel) string {
 }
 
 func (s *Server) buildOverviewBase(v *snapshot.View, idx *ovIndex, sel *ovSel) *ovBase {
-	b := &ovBase{namespaces: sel.count(idx), pods: overviewPods{ByReason: map[string]int{}}, owners: []string{}, badges: map[string]badge{}}
+	b := &ovBase{pods: overviewPods{ByReason: map[string]int{}}, owners: []string{}, badges: map[string]badge{}, visible: sel.visible(idx)}
+	b.namespaces = len(b.visible)
+	if sel.filtered {
+		b.namespaces = len(sel.set)
+	}
 
 	var sum snapshot.Counts
 	all := sel.keepAll()
@@ -684,7 +702,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		Scope:  overviewScope{Namespace: ns, Owner: owner, Namespaces: base.namespaces},
 		Health: s.overviewHealth(r),
 		Nodes:  base.nodes, Pods: base.pods, Workloads: base.workloads, Certificates: base.certificates,
-		Security: base.security, Waste: base.waste, Owners: base.owners,
+		Security: base.security, Waste: base.waste, Owners: base.owners, Namespaces: base.visible,
 		Badges: make(map[string]badge, len(base.badges)+2),
 	}
 	for k, b := range base.badges {

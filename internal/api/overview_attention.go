@@ -150,7 +150,7 @@ func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
 // Hash routes of the pages that explain an item, with the query parameters
 // those pages read (web/src/pages): Workloads namespace and q, Security
-// check and q, Certificates q, the Map's node view.
+// check and q, Certificates q, Nodes node.
 func workloadHref(ns, name string) string {
 	return "#/workloads?" + url.Values{"namespace": {ns}, "q": {name}}.Encode()
 }
@@ -168,7 +168,7 @@ func certHref(ns, name string) string {
 }
 
 func nodeHref(name string) string {
-	return "#/map?" + url.Values{"view": {"nodes"}, "node": {name}}.Encode()
+	return "#/nodes?" + url.Values{"node": {name}}.Encode()
 }
 
 // buildAttention collects every item the view can raise and folds them into

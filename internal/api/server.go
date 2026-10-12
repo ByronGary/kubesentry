@@ -62,7 +62,9 @@ type Server struct {
 	UI http.Handler
 	// Demo marks the data as synthetic so the UI can say so.
 	Demo bool
-	Now  func() time.Time // defaults to time.Now
+	// Version is the build version /info reports ("" leaves it out).
+	Version string
+	Now     func() time.Time // defaults to time.Now
 
 	// Views hands out the precomputed view every inventory, pod and storage
 	// route is served from (a snapshot.Manager over the informer cache). It

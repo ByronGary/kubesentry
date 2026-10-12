@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
@@ -21,6 +22,9 @@ type overviewActivity struct {
 	RBACChanges    int           `json:"rbacChanges"`
 	Denied         int           `json:"denied"`
 	Latest         []audit.Event `json:"latest"`
+	// ProductionNamespaces are the caller's visible namespaces that carry
+	// the production label, so the UI can mark production events.
+	ProductionNamespaces []string `json:"productionNamespaces"`
 }
 
 const (
@@ -60,7 +64,13 @@ func (s *Server) overviewActivity(r *http.Request, idx *ovIndex, sel *ovSel, now
 	if !s.auditScope(r, &q) {
 		return nil, false
 	}
-	act = &overviewActivity{WindowHours: int(activityWindow / time.Hour), Latest: []audit.Event{}}
+	act = &overviewActivity{WindowHours: int(activityWindow / time.Hour), Latest: []audit.Event{}, ProductionNamespaces: []string{}}
+	for ns := range idx.production {
+		if sel.sc.Has(ns) {
+			act.ProductionNamespaces = append(act.ProductionNamespaces, ns)
+		}
+	}
+	sort.Strings(act.ProductionNamespaces)
 	tq := audit.TagCountQuery{
 		Since: now.Add(-activityWindow), Tags: activityTags, Actors: activityActors,
 		Namespaces: q.Namespaces, ClusterScoped: q.ClusterScoped, Subset: idx.production,

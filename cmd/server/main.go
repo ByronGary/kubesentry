@@ -83,6 +83,7 @@ func run(cfg *config) error {
 		UI:          web.Handler(),
 		SignOutURL:  cfg.signOutURL,
 		ClusterInfo: model.ClusterInfo{Name: cfg.clusterName},
+		Version:     version,
 		RateLimit:   cfg.rateLimit, RateBurst: cfg.rateBurst, MaxInflight: cfg.maxInflight,
 		LongInflightPerIdentity: cfg.maxInflightPerIdentity,
 		AccessLog:               slog.Default(),

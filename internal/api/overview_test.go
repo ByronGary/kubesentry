@@ -116,8 +116,9 @@ func TestOverviewScoping(t *testing.T) {
 	}
 
 	bob, _ := getOverview(t, h, "bob", "/api/v1/overview")
-	if bob.Nodes == nil || bob.Nodes.Total != 2 || bob.Activity != nil || strings.Join(bob.Owners, ",") != "team-beta" {
-		t.Errorf("bob: nodes %+v activity %+v owners %v", bob.Nodes, bob.Activity, bob.Owners)
+	if bob.Nodes == nil || bob.Nodes.Total != 2 || bob.Activity != nil || strings.Join(bob.Owners, ",") != "team-beta" ||
+		strings.Join(bob.Namespaces, ",") != "team-b" {
+		t.Errorf("bob: nodes %+v activity %+v owners %v namespaces %v", bob.Nodes, bob.Activity, bob.Owners, bob.Namespaces)
 	}
 
 	carol, _ := getOverview(t, h, "carol", "/api/v1/overview")
@@ -136,8 +137,12 @@ func TestOverviewScoping(t *testing.T) {
 	if all.Pods.Total != 9 || all.Scope.Namespaces != 3 || all.Security.Crit <= alice.Security.Crit || strings.Join(all.Owners, ",") != "team-alpha,team-beta" {
 		t.Errorf("unrestricted: pods %+v scope %+v security %+v owners %v", all.Pods, all.Scope, all.Security, all.Owners)
 	}
-	if a := all.Activity; a == nil || a.Exec != 3 || a.ExecProduction != 2 || a.RBACChanges != 1 || a.SecretReads != 3 {
+	if a := all.Activity; a == nil || a.Exec != 3 || a.ExecProduction != 2 || a.RBACChanges != 1 || a.SecretReads != 3 ||
+		strings.Join(a.ProductionNamespaces, ",") != "team-b" {
 		t.Errorf("unrestricted activity = %+v", all.Activity)
+	}
+	if strings.Join(all.Namespaces, ",") != "kube-system,team-a,team-b" {
+		t.Errorf("unrestricted namespaces = %v", all.Namespaces)
 	}
 	if all.Health.Agents == nil || all.Health.Agents.Reporting != 3 {
 		t.Errorf("unrestricted health = %+v", all.Health)
@@ -154,7 +159,8 @@ func TestOverviewScoping(t *testing.T) {
 		"/api/v1/overview?owner=team-alpha&namespace=team-b"} {
 		o, _ := getOverview(t, h, "alice", path)
 		if o.Scope.Namespaces != 0 || o.Pods.Total != 0 || len(o.Attention) != 0 || len(o.Badges) != 0 || o.Security != (overviewSecurity{}) ||
-			o.Activity == nil || o.Activity.Exec != 0 || len(o.Activity.Latest) != 0 || strings.Join(o.Owners, ",") != "team-alpha" {
+			o.Activity == nil || o.Activity.Exec != 0 || len(o.Activity.Latest) != 0 || strings.Join(o.Owners, ",") != "team-alpha" ||
+			strings.Join(o.Namespaces, ",") != "team-a" {
 			t.Errorf("%s as alice = %+v", path, o)
 		}
 	}
@@ -288,7 +294,7 @@ func TestOverviewAttentionRankingAndFolding(t *testing.T) {
 		api.Href != "#/workloads?namespace=shop&q=api" {
 		t.Errorf("folded item = %+v", api)
 	}
-	if n := o.Attention[0]; n.Since == nil || n.Namespace != "" || n.Href != "#/map?node=n-down&view=nodes" || n.Owner != "" {
+	if n := o.Attention[0]; n.Since == nil || n.Namespace != "" || n.Href != "#/nodes?node=n-down" || n.Owner != "" {
 		t.Errorf("node item = %+v", n)
 	}
 	if l := o.Attention[2]; !strings.Contains(l.Title, "64 MiB/h") || !strings.Contains(l.Title, "~3h") || l.Href != "#/pods/shop/worker-1" {
@@ -441,8 +447,8 @@ func TestOverviewEncodesTheContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Every field of web/src/types.ts OverviewResponse.
-	for _, k := range []string{"version", "builtAt", "ageSeconds", "scope", "health", "nodes", "pods", "workloads", "certificates", "security",
-		"attention", "activity", "waste", "owners", "badges", "history"} {
+	for _, k := range []string{"version", "builtAt", "ageSeconds", "scope", "namespaces", "health", "nodes", "pods", "workloads", "certificates",
+		"security", "attention", "activity", "waste", "owners", "badges", "history"} {
 		if _, ok := raw[k]; !ok {
 			t.Errorf("response lacks %q", k)
 		}
@@ -460,7 +466,7 @@ func TestOverviewEncodesTheContract(t *testing.T) {
 	}
 	var act map[string]json.RawMessage
 	_ = json.Unmarshal(raw["activity"], &act)
-	for _, k := range []string{"windowHours", "exec", "execProduction", "secretReads", "rbacChanges", "denied", "latest"} {
+	for _, k := range []string{"windowHours", "exec", "execProduction", "secretReads", "rbacChanges", "denied", "latest", "productionNamespaces"} {
 		if _, ok := act[k]; !ok {
 			t.Errorf("activity lacks %q", k)
 		}

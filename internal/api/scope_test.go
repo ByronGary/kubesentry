@@ -277,7 +277,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 			}
 			o.Scope.Namespace = ""
 			raw, _ := json.Marshal(o)
-			if nss, _ := namespacesIn(raw); len(nss) > 0 || o.Scope.Namespaces != 0 {
+			if nss, _ := namespacesIn(raw); len(nss) > 0 || o.Scope.Namespaces != 0 || len(o.Namespaces) != 0 {
 				t.Errorf("%s: carol sees %v: %s", route, nss, raw)
 			}
 			continue
@@ -401,6 +401,16 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	if ov.Activity == nil || ov.Activity.Exec+ov.Activity.SecretReads+ov.Activity.RBACChanges+ov.Activity.Denied != 0 || len(ov.Activity.Latest) != 0 {
 		t.Errorf("alice's activity (team-a holds only deletes) = %+v", ov.Activity)
 	}
+	// The namespace picker and the production marker list only what she
+	// may see (team-b is production, and not hers).
+	if strings.Join(ov.Namespaces, ",") != "team-a" || ov.Activity == nil || len(ov.Activity.ProductionNamespaces) != 0 {
+		t.Errorf("alice's namespaces %v, production namespaces %+v", ov.Namespaces, ov.Activity)
+	}
+	var carolOv overviewResponse
+	getAs(t, h, "carol", "/api/v1/overview", &carolOv)
+	if carolOv.Namespaces == nil || len(carolOv.Namespaces) != 0 {
+		t.Errorf("carol's namespaces = %#v, want []", carolOv.Namespaces)
+	}
 
 	// Single objects elsewhere are not found, rather than forbidden.
 	for _, path := range []string{"/api/v1/map?namespace=team-b", "/api/v1/pods/team-b/web-0/diagnostics", "/api/v1/pods/team-b/web-0/processes", "/api/v1/nodes/n9"} {
@@ -492,8 +502,14 @@ func TestInfoCapabilities(t *testing.T) {
 			t.Errorf("alice capability %s = %v (present %v), want %v", k, got, ok, v)
 		}
 	}
-	if info.Identity == nil || info.Identity.User != "alice" || info.Identity.Source != "proxy" || info.Snapshot == nil {
+	if info.Identity == nil || info.Identity.User != "alice" || info.Identity.Source != "proxy" || info.Snapshot == nil || info.Version != "" {
 		t.Errorf("info = %+v", info)
+	}
+	s.Version = "v1.2.3"
+	info = infoResponse{}
+	getAs(t, s.Handler(), "alice", "/api/v1/info", &info)
+	if info.Version != "v1.2.3" {
+		t.Errorf("info version = %q", info.Version)
 	}
 	getAs(t, h, "bob", "/api/v1/info", &info)
 	if !info.Capabilities["nodes"] || info.Capabilities["audit"] {
