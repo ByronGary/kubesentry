@@ -1,0 +1,657 @@
+# kube-prometheus-stack values for Amazon EKS: the platform monitoring baseline
+# (Layer 1 in docs/proposals/alerting-automation.md). kubesentry's chart does not
+# install any of this; it is an example for your monitoring team, applied next
+# to their own values. docs/monitoring-eks.md explains each block, the sizing,
+# the routing and has a runbook for every alert defined here.
+#
+#   helm upgrade --install kps prometheus-community/kube-prometheus-stack \
+#     --version 92.3.0 -n monitoring --create-namespace \
+#     -f examples/monitoring-eks.yaml -f my-overrides.yaml
+#
+# Written for kube-prometheus-stack 92.3.0 (prometheus-operator v0.94).
+# hack/check-rules.sh checks the rules below with promtool and the Alertmanager
+# configuration with amtool.
+#
+# Placeholders to replace: the receiver channels and the alertmanager-receivers
+# Secret (no URL or key is in this file), the example team "payments", the
+# grafana-admin Secret, the gp3 StorageClass name, and the cluster name. The
+# release name "kps" appears in ServiceMonitor and PrometheusRule selectors:
+# other charts (kubesentry, cert-manager) label their objects release: kps.
+
+# ---------------------------------------------------------------------------
+# EKS noise removal
+# ---------------------------------------------------------------------------
+
+# EKS runs etcd, the scheduler and the controller manager for you. Their
+# endpoints cannot be reached from the cluster, so their targets and rules
+# would fire from day one and never stop (etcdMembersDown, etcdInsufficientMembers,
+# KubeSchedulerDown, KubeControllerManagerDown, TargetDown).
+kubeEtcd:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+
+# kube-proxy binds its metrics to 127.0.0.1:10249 unless told otherwise, so it
+# cannot be scraped and KubeProxyDown fires on every node (501 targets in the
+# stress run). Scraping is off here. To keep kube-proxy metrics instead:
+#   1. Check what it binds:
+#        kubectl -n kube-system get configmap kube-proxy-config -o yaml | grep metricsBindAddress
+#   2. If it shows 127.0.0.1:10249, make it listen on every address and restart it:
+#        kubectl -n kube-system get configmap kube-proxy-config -o yaml \
+#          | sed 's/metricsBindAddress: 127.0.0.1:10249/metricsBindAddress: 0.0.0.0:10249/' \
+#          | kubectl apply -f -
+#        kubectl -n kube-system rollout restart daemonset kube-proxy
+#      Allow TCP 10249 from the Prometheus pods in the node security group.
+#      With kube-proxy as an EKS managed add-on, an add-on update can rewrite
+#      the ConfigMap: update it with --resolve-conflicts PRESERVE.
+#   3. Set kubeProxy.enabled and defaultRules.rules.kubeProxy back to true.
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  rules:
+    # Same components as above: no rules for targets that are not scraped.
+    etcd: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeControllerManager: false
+    kubeProxy: false
+  # Replaced by the gp3-specific disk rules in eks-nodes below.
+  disabled:
+    NodeDiskIOSaturation: true
+
+prometheusOperator:
+  kubeletService:
+    # The operator keeps an Endpoints object listing every node's kubelet.
+    # Fargate pods run on virtual nodes whose kubelet Prometheus cannot reach,
+    # so leave those nodes out; otherwise KubeletDown and TargetDown fire for
+    # every Fargate pod.
+    selector: eks.amazonaws.com/compute-type!=fargate
+
+prometheus-node-exporter:
+  # Fargate cannot run DaemonSets. node-exporter tolerates every NoSchedule
+  # taint, Fargate's included, so without this its pods would sit Pending on
+  # each Fargate virtual node.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values: [fargate]
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  prometheus:
+    monitor:
+      # Put the node name on every node-exporter series, so node alerts carry
+      # a node label: Alertmanager groups by it and mutes them while the node
+      # itself is down (inhibit_rules below).
+      relabelings:
+        - action: replace
+          sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+
+# ---------------------------------------------------------------------------
+# Sizing: about 500 nodes and 10,000 pods
+# ---------------------------------------------------------------------------
+# Measured in the stress run: 102k head series took 695 MiB of RSS (about
+# 7 KiB per series), and with 200m CPU and a 1.5 GiB limit Prometheus still
+# missed rule evaluations in 35 groups. That was with kube-state-metrics cut to
+# one metric and only 6 real nodes scraped. A real 500-node cluster with the
+# trimmed kube-state-metrics below carries an estimated 1.5 to 2.5 million
+# series. docs/monitoring-eks.md has the table for other cluster sizes and how
+# to check the estimate against prometheus_tsdb_head_series.
+
+kubelet:
+  serviceMonitor:
+    # 30s like everything else (the chart's default for cAdvisor is 10s): a
+    # third of the samples, the same series.
+    cAdvisorInterval: 30s
+    # Per-container probe counters (prober_probe_total). No rule uses them, and
+    # at 10,000 pods they are tens of thousands of series.
+    probes: false
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 30s
+    # Evaluate rule groups every minute rather than every 30s, which halves the
+    # evaluation work. Missed evaluations were the first sign of an undersized
+    # Prometheus in the stress run.
+    evaluationInterval: 1m
+    retention: 7d
+    # Keep below the volume size: retention by size includes the WAL.
+    retentionSize: 120GB
+    walCompression: true
+    resources:
+      requests:
+        cpu: "2"
+        memory: 12Gi
+      limits:
+        memory: 16Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # A StorageClass for the EBS CSI driver with type gp3. EKS does not
+          # create one by default; name yours here.
+          storageClassName: gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 150Gi
+    # The defaults select ServiceMonitors, PodMonitors and PrometheusRules
+    # labelled release: kps, so other teams cannot add series or rules by
+    # accident. kubesentry (metrics.serviceMonitor.labels and
+    # metrics.prometheusRule.labels) and cert-manager
+    # (examples/cert-manager-eks.yaml) set that label.
+    ruleSelectorNilUsesHelmValues: true
+    serviceMonitorSelectorNilUsesHelmValues: true
+    podMonitorSelectorNilUsesHelmValues: true
+    # Label every series with the cluster, so a shared AMP workspace or Grafana
+    # can tell clusters apart. The dashboards filter on it.
+    externalLabels:
+      cluster: prod-eks
+
+    # --- Alternative: Amazon Managed Service for Prometheus (AMP) -----------
+    # Keep this Prometheus for scraping and local alerting, and send every
+    # sample to AMP for long retention and Amazon Managed Grafana. The pod's
+    # role (IRSA or Pod Identity) needs aps:RemoteWrite on the workspace; with
+    # IRSA, annotate prometheus.serviceAccount (below) with the role ARN.
+    # Local retention can then drop to a day or two (memory does not change:
+    # it follows the series count).
+    # remoteWrite:
+    #   - url: https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-EXAMPLE/api/v1/remote_write
+    #     sigv4:
+    #       region: us-east-1
+    #     queueConfig:
+    #       capacity: 10000
+    #       maxSamplesPerSend: 2000
+    #       maxShards: 200
+    # retention: 2d
+    # retentionSize: 40GB
+  # serviceAccount:
+  #   annotations:
+  #     eks.amazonaws.com/role-arn: arn:aws:iam::111122223333:role/amp-remote-write
+
+# kube-state-metrics, trimmed to the series the stock rules, the extra rules
+# below, kubesentry's chart rules and the dashboards read. A full
+# kube-state-metrics on a 10,000-pod cluster is several times the series of the
+# rest of this list. hack/check-rules.sh fails if a rule uses a kube_* metric
+# that is not allowed here. Add to the list (regular expressions, matched
+# whole) before writing a rule on another one.
+kube-state-metrics:
+  metricAllowlist:
+    # Pods and containers
+    - kube_pod_info
+    - kube_pod_owner
+    - kube_pod_status_(phase|ready|reason)
+    - kube_pod_container_resource_(requests|limits)
+    - kube_pod_container_status_(waiting_reason|restarts_total|last_terminated_reason)
+    # Workloads
+    - kube_replicaset_owner
+    - kube_deployment_(metadata_generation|spec_replicas|status_condition|status_observed_generation|status_replicas_available|status_replicas_updated)
+    - kube_statefulset_(metadata_generation|replicas|status_current_revision|status_observed_generation|status_replicas_ready|status_replicas_updated|status_update_revision)
+    - kube_daemonset_status_(current_number_scheduled|desired_number_scheduled|number_available|number_misscheduled|updated_number_scheduled)
+    - kube_job_(failed|labels|owner|status_active|status_start_time)
+    - kube_horizontalpodautoscaler_(spec_max_replicas|spec_min_replicas|status_current_replicas|status_desired_replicas)
+    - kube_poddisruptionbudget_status_(current_healthy|desired_healthy|expected_pods)
+    # Nodes
+    - kube_node_(info|role|spec_taint|spec_unschedulable|status_allocatable|status_capacity|status_condition)
+    # Storage and quotas
+    - kube_persistentvolume_status_phase
+    - kube_persistentvolumeclaim_(access_mode|labels)
+    - kube_resourcequota
+    # Namespaces, with the owner annotation and the production label below
+    - kube_namespace_(annotations|labels|status_phase)
+  # The owner annotation and production label kubesentry uses, as labels on
+  # kube_namespace_annotations and kube_namespace_labels
+  # (annotation_kubesentry_io_owner, label_environment). The routing section of
+  # the guide shows how a rule can copy the owner onto its alerts.
+  metricAnnotationsAllowList:
+    - namespaces=[kubesentry.io/owner]
+  metricLabelsAllowlist:
+    - namespaces=[environment]
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+# ---------------------------------------------------------------------------
+# Grafana
+# ---------------------------------------------------------------------------
+grafana:
+  admin:
+    # A Secret you create with admin-user and admin-password, instead of the
+    # chart's well-known default password.
+    existingSecret: grafana-admin
+  sidecar:
+    dashboards:
+      # ConfigMaps labelled grafana_dashboard: "1" in any namespace (the
+      # chart's default) become dashboards: kubesentry's chart ships its own
+      # with metrics.grafanaDashboards.enabled, and
+      # examples/grafana/cluster-health-eks.json goes in one you create. A
+      # grafana_folder annotation picks the folder.
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+
+# ---------------------------------------------------------------------------
+# Alertmanager: routing skeleton
+# ---------------------------------------------------------------------------
+# No URL, key or address is in this file. Receivers read them from files in
+# the Secret alertmanager-receivers, which the operator mounts at
+# /etc/alertmanager/secrets/alertmanager-receivers/. Create it yourself (or
+# with External Secrets), one key per file named below, e.g.:
+#   kubectl -n monitoring create secret generic alertmanager-receivers \
+#     --from-literal=slack-platform-url=https://hooks.slack.com/services/... \
+#     --from-literal=pagerduty-platform-key=... \
+#     --from-literal=slack-payments-url=... --from-literal=pagerduty-payments-key=... \
+#     --from-literal=slack-digest-url=... --from-literal=heartbeat-url=...
+#
+# Routing by owner: kubesentry (phase B) sends its findings with an owner
+# label taken from the namespace annotation kubesentry.io/owner (or the
+# object's), plus severity, namespace, and kubesentry_digest="true" on
+# low-urgency digests. Alerts from Prometheus rules carry no owner and go to the
+# platform team, the default receiver.
+alertmanager:
+  alertmanagerSpec:
+    # Two replicas gossip, so silences and notification state survive a restart
+    # of one and alerts are not sent twice.
+    replicas: 2
+    secrets:
+      - alertmanager-receivers
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 2Gi
+  config:
+    route:
+      receiver: platform
+      group_by: [alertname, namespace]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        # Watchdog always fires. The heartbeat service (healthchecks.io, Dead
+        # Man's Snitch, PagerDuty's heartbeat checks...) raises its own alert
+        # when the pings stop: the whole pipeline is down.
+        - receiver: deadmans-switch
+          matchers: ['alertname = "Watchdog"']
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 5m
+        # kube-prometheus-stack's helper alert that mutes lone info alerts.
+        - receiver: "null"
+          matchers: ['alertname = "InfoInhibitor"']
+        # Low-urgency findings kubesentry sends as digests: one quiet message
+        # per owner a day, never a page, whatever the severity.
+        - receiver: digest
+          matchers: ['kubesentry_digest = "true"']
+          group_by: [owner]
+          group_wait: 10m
+          group_interval: 24h
+          repeat_interval: 24h
+        # One branch per team, matched on the owner label. Copy it for each
+        # value of kubesentry.io/owner you use; owners without a branch fall
+        # through to the platform receivers below.
+        - receiver: team-payments
+          matchers: ['owner = "payments"']
+          routes:
+            - receiver: team-payments-pager
+              matchers: ['severity = "critical"']
+        # Until kubesentry sends owner labels, a team's Prometheus alerts can be
+        # routed by namespace instead (a second branch to the same receivers):
+        # - receiver: team-payments
+        #   matchers: ['namespace =~ "payments|payments-.+"']
+        #   routes:
+        #     - receiver: team-payments-pager
+        #       matchers: ['severity = "critical"']
+        # Critical alerts without an owner page the platform team.
+        - receiver: platform-pager
+          matchers: ['severity = "critical"']
+    inhibit_rules:
+      # A critical alert mutes the warning or info of the same name about the
+      # same thing. A label missing from both alerts counts as equal.
+      - source_matchers: ['severity = "critical"']
+        target_matchers: ['severity =~ "warning|info"']
+        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint]
+      - source_matchers: ['severity = "warning"']
+        target_matchers: ['severity = "info"']
+        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint]
+      # Info alerts reach someone only next to a warning or critical in the
+      # same namespace (kube-prometheus-stack's InfoInhibitor).
+      - source_matchers: ['alertname = "InfoInhibitor"']
+        target_matchers: ['severity = "info"']
+        equal: [namespace]
+      # A node that is down mutes the alerts about things on it. The target must
+      # carry a node label: without node =~ ".+", every alert lacking one would
+      # count as on that node.
+      - source_matchers: ['alertname =~ "KubeNodeNotReady|KubeNodeUnreachable"']
+        target_matchers: ['node =~ ".+"', 'alertname !~ "KubeNodeNotReady|KubeNodeUnreachable"']
+        equal: [node]
+      # An unreachable API server explains the client-side errors that follow
+      # it everywhere, kubesentry's included.
+      - source_matchers: ['alertname = "KubeAPIDown"']
+        target_matchers: ['alertname =~ "KubeAPIErrorBudgetBurn|KubeClientErrors|KubeAggregatedAPIErrors|PrometheusKubernetesListWatchFailures|KubesentrySnapshotStale|KubesentryAuthzReviewErrors"']
+        equal: [cluster]
+    receivers:
+      - name: "null"
+      - name: platform
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/alertmanager-receivers/slack-platform-url
+            channel: "#platform-alerts"
+            send_resolved: true
+            title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.namespace }})'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }} {{ .Annotations.runbook_url }}{{ "\n" }}{{ end }}'
+      - name: platform-pager
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/alertmanager-receivers/pagerduty-platform-key
+            send_resolved: true
+      - name: team-payments
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/alertmanager-receivers/slack-payments-url
+            channel: "#payments-alerts"
+            send_resolved: true
+            title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }} ({{ .CommonLabels.namespace }})'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }} {{ .Annotations.runbook_url }}{{ "\n" }}{{ end }}'
+      - name: team-payments-pager
+        pagerduty_configs:
+          - routing_key_file: /etc/alertmanager/secrets/alertmanager-receivers/pagerduty-payments-key
+            send_resolved: true
+      - name: digest
+        slack_configs:
+          - api_url_file: /etc/alertmanager/secrets/alertmanager-receivers/slack-digest-url
+            channel: "#kubesentry-digest"
+            send_resolved: false
+            title: 'kubesentry digest for {{ .CommonLabels.owner }}: {{ len .Alerts }} findings'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ "\n" }}{{ end }}'
+      - name: deadmans-switch
+        webhook_configs:
+          - url_file: /etc/alertmanager/secrets/alertmanager-receivers/heartbeat-url
+            send_resolved: false
+
+# ---------------------------------------------------------------------------
+# Extra rules: cert-manager, the EKS control plane, nodes on EBS gp3
+# ---------------------------------------------------------------------------
+# kube-prometheus-stack has no cert-manager rules, and its control-plane rules
+# assume a self-managed cluster. Each rule's runbook is in docs/monitoring-eks.md.
+additionalPrometheusRulesMap:
+  cert-manager:
+    groups:
+      - name: cert-manager
+        rules:
+          # cert-manager's certificate metrics need its ServiceMonitor
+          # (examples/cert-manager-eks.yaml). Without it the rules below see
+          # nothing, so say so. job is the Service's app.kubernetes.io/name.
+          - alert: CertManagerMetricsAbsent
+            expr: absent(up{job="cert-manager"} == 1)
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: Prometheus has no cert-manager metrics.
+              description: >-
+                No cert-manager controller target has been up for 15 minutes, so certificate expiry and
+                readiness alerts cannot fire. Check cert-manager's ServiceMonitor and its release: kps label.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagermetricsabsent
+          # Only certificates cert-manager has not renewed on schedule: short-lived
+          # certificates (service meshes, internal CAs) always expire within 14
+          # days and renew on their own; the stress cluster had 117 of them.
+          # namespace is the certificate's (exported_namespace when the
+          # ServiceMonitor does not honour labels).
+          - alert: CertManagerCertificateExpiring
+            expr: |
+              (
+                label_replace(
+                  max by (namespace, exported_namespace, name, issuer_name, issuer_kind) (certmanager_certificate_expiration_timestamp_seconds),
+                  "namespace", "$1", "exported_namespace", "(.+)"
+                ) - time() < 14 * 86400
+              )
+              unless on (namespace, name)
+              (
+                label_replace(
+                  max by (namespace, exported_namespace, name) (certmanager_certificate_renewal_timestamp_seconds),
+                  "namespace", "$1", "exported_namespace", "(.+)"
+                ) + 3600 > time()
+              )
+            for: 1h
+            labels:
+              severity: warning
+            annotations:
+              summary: A certificate expires within 14 days and was not renewed.
+              description: >-
+                Certificate {{ $labels.namespace }}/{{ $labels.name }} (issuer {{ $labels.issuer_kind }}/{{ $labels.issuer_name }})
+                expires in {{ $value | humanizeDuration }}. Its renewal time passed more than an hour ago without a new certificate.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+          - alert: CertManagerCertificateExpiring
+            expr: |
+              (
+                label_replace(
+                  max by (namespace, exported_namespace, name, issuer_name, issuer_kind) (certmanager_certificate_expiration_timestamp_seconds),
+                  "namespace", "$1", "exported_namespace", "(.+)"
+                ) - time() < 3 * 86400
+              )
+              unless on (namespace, name)
+              (
+                label_replace(
+                  max by (namespace, exported_namespace, name) (certmanager_certificate_renewal_timestamp_seconds),
+                  "namespace", "$1", "exported_namespace", "(.+)"
+                ) + 3600 > time()
+              )
+            for: 15m
+            labels:
+              severity: critical
+            annotations:
+              summary: A certificate expires within 3 days and was not renewed.
+              description: >-
+                Certificate {{ $labels.namespace }}/{{ $labels.name }} (issuer {{ $labels.issuer_kind }}/{{ $labels.issuer_name }})
+                expires in {{ $value | humanizeDuration }} and cert-manager has not renewed it. Clients will fail TLS when it expires.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+          - alert: CertManagerCertificateNotReady
+            expr: |
+              label_replace(
+                max by (namespace, exported_namespace, name, issuer_name, issuer_kind) (certmanager_certificate_ready_status{condition!="True"}),
+                "namespace", "$1", "exported_namespace", "(.+)"
+              ) == 1
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: A certificate is not ready.
+              description: >-
+                Certificate {{ $labels.namespace }}/{{ $labels.name }} has not been Ready for 15 minutes
+                (issuer {{ $labels.issuer_kind }}/{{ $labels.issuer_name }}). Issuance or renewal is failing, often because the
+                issuer does not exist; the old certificate, if any, keeps serving until it expires.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificatenotready
+          # The stress run restarted cert-manager 3 to 5 times on failed liveness
+          # probes under load. A restart pauses issuance and renewal.
+          - alert: CertManagerRestarting
+            expr: |
+              max by (namespace, pod, container) (
+                increase(kube_pod_container_status_restarts_total{container=~"cert-manager-(controller|webhook|cainjector)"}[1h])
+              ) >= 2
+            labels:
+              severity: warning
+            annotations:
+              summary: cert-manager is restarting.
+              description: >-
+                {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }} restarted {{ $value | humanize }} times in the
+                last hour. While it is down, certificates are neither issued nor renewed and, for the webhook, cert-manager
+                resources cannot be changed.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagerrestarting
+
+  eks-control-plane:
+    groups:
+      - name: eks-control-plane
+        rules:
+          - alert: KubeAPIServerReadLatencyHigh
+            expr: |
+              histogram_quantile(0.99,
+                sum by (cluster, le) (rate(apiserver_request_sli_duration_seconds_bucket{job="apiserver", verb=~"GET|LIST", scope=~"resource|namespace", subresource!~"proxy|attach|log|exec|portforward"}[5m]))
+              ) > 1
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: The API server is slow to answer reads.
+              description: >-
+                99% of single-object and namespace reads took up to {{ $value | humanizeDuration }} over 15 minutes
+                (threshold 1s). Every controller, kubectl and kubesentry share this latency.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeapiserverreadlatencyhigh
+          - alert: KubeAPIServerWriteLatencyHigh
+            expr: |
+              histogram_quantile(0.99,
+                sum by (cluster, le) (rate(apiserver_request_sli_duration_seconds_bucket{job="apiserver", verb=~"POST|PUT|PATCH|DELETE", subresource!~"proxy|attach|log|exec|portforward"}[5m]))
+              ) > 1
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: The API server is slow to answer writes.
+              description: >-
+                99% of writes took up to {{ $value | humanizeDuration }} over 15 minutes (threshold 1s). Slow writes
+                usually mean etcd is under pressure or admission webhooks are slow.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeapiserverwritelatencyhigh
+          - alert: KubeAPIServerFlowControlRejecting
+            expr: |
+              sum by (cluster, flow_schema, priority_level, reason) (rate(apiserver_flowcontrol_rejected_requests_total[5m])) > 0
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: API Priority and Fairness is rejecting requests.
+              description: >-
+                The API server has answered 429 to requests of flow schema {{ $labels.flow_schema }} (priority level
+                {{ $labels.priority_level }}, reason {{ $labels.reason }}) for 15 minutes, {{ printf "%.2f" $value }} per second.
+                Clients in that flow are throttled; kubesentry has its own flow schema when its chart sets apf.enabled.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeapiserverflowcontrolrejecting
+          # EKS limits the etcd database to 8 GiB; at the limit the cluster stops
+          # accepting writes. apiserver_storage_size_bytes replaced
+          # apiserver_storage_db_total_size_in_bytes in Kubernetes 1.28; either works.
+          - alert: KubeEtcdDatabaseLarge
+            expr: |
+              (max by (cluster) (apiserver_storage_size_bytes) or max by (cluster) (apiserver_storage_db_total_size_in_bytes))
+                > 0.7 * 8 * 1024^3
+            for: 30m
+            labels:
+              severity: warning
+            annotations:
+              summary: The etcd database is over 70% of EKS's 8 GiB limit.
+              description: >-
+                The etcd database is {{ $value | humanize1024 }}B. At 8 GiB the cluster stops accepting writes.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeetcddatabaselarge
+          - alert: KubeEtcdDatabaseLarge
+            expr: |
+              (max by (cluster) (apiserver_storage_size_bytes) or max by (cluster) (apiserver_storage_db_total_size_in_bytes))
+                > 0.85 * 8 * 1024^3
+            for: 15m
+            labels:
+              severity: critical
+            annotations:
+              summary: The etcd database is over 85% of EKS's 8 GiB limit.
+              description: >-
+                The etcd database is {{ $value | humanize1024 }}B. At 8 GiB the cluster stops accepting writes:
+                no deployments, no scaling, no leader elections.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeetcddatabaselarge
+          # A proxy for event volume: events are written through the API server
+          # and kept in etcd for an hour on EKS. Normal churn stays well below this;
+          # sustained bursts are failing probes, crash loops or a controller loop.
+          - alert: KubeEventVolumeHigh
+            expr: |
+              sum by (cluster) (rate(apiserver_request_total{job="apiserver", resource="events", verb=~"POST|PUT|PATCH"}[10m])) > 20
+            for: 30m
+            labels:
+              severity: warning
+            annotations:
+              summary: The cluster is writing an unusual number of events.
+              description: >-
+                Events are written at {{ $value | humanize }} per second for 30 minutes (threshold 20/s). Event churn costs
+                etcd space and API server capacity that every other client shares.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeeventvolumehigh
+
+  eks-nodes:
+    groups:
+      - name: eks-nodes
+        rules:
+          # The stock NodeClockNotSynchronising and NodeClockSkewDetected rules
+          # stay on and warn early. This one pages before token validation
+          # (about 60s of leeway) and SigV4 (5 minutes) start failing.
+          - alert: NodeClockOffsetCritical
+            expr: abs(node_timex_offset_seconds) > 10
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: A node's clock is more than 10 seconds off.
+              description: >-
+                The clock on {{ $labels.node }} ({{ $labels.instance }}) is {{ $value | humanizeDuration }} off. Service
+                account and OIDC token validation, IRSA and SigV4 requests start failing as the offset grows.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeclockoffsetcritical
+          # gp3 baselines: 3,000 IOPS and 125 MiB/s per volume. Raise the numbers
+          # for volumes with provisioned IOPS or throughput. Instance-store NVMe
+          # devices are far faster; leave them out of the device pattern on
+          # instance types that have them.
+          - alert: NodeEBSVolumeIOPSNearLimit
+            expr: |
+              sum by (cluster, node, instance, device) (
+                rate(node_disk_reads_completed_total{device=~"nvme.+|xvd.+"}[5m])
+                + rate(node_disk_writes_completed_total{device=~"nvme.+|xvd.+"}[5m])
+              ) > 0.9 * 3000
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: A volume is close to gp3's baseline IOPS.
+              description: >-
+                {{ $labels.device }} on {{ $labels.node }} has done {{ $value | humanize }} IOPS for 15 minutes, over 90% of
+                gp3's 3,000. Beyond that, EBS queues requests and latency rises.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumeiopsnearlimit
+          - alert: NodeEBSVolumeThroughputNearLimit
+            expr: |
+              sum by (cluster, node, instance, device) (
+                rate(node_disk_read_bytes_total{device=~"nvme.+|xvd.+"}[5m])
+                + rate(node_disk_written_bytes_total{device=~"nvme.+|xvd.+"}[5m])
+              ) > 0.9 * 125 * 1024 * 1024
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: A volume is close to gp3's baseline throughput.
+              description: >-
+                {{ $labels.device }} on {{ $labels.node }} has moved {{ $value | humanize1024 }}B/s for 15 minutes, over 90% of
+                gp3's 125 MiB/s.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumethroughputnearlimit
+          # Replaces the stock NodeDiskIOSaturation (queue above 10 for 30
+          # minutes). At gp3's single-digit-millisecond latency, 3,000 IOPS needs
+          # an average queue of about 3; a sustained queue above 8 means requests
+          # wait for the volume.
+          - alert: NodeEBSVolumeQueueDepthHigh
+            expr: |
+              rate(node_disk_io_time_weighted_seconds_total{device=~"nvme.+|xvd.+"}[5m]) > 8
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: Requests are queuing on a volume.
+              description: >-
+                {{ $labels.device }} on {{ $labels.node }} has averaged {{ $value | humanize }} requests in flight for 15 minutes.
+                The volume is saturated: its IOPS or throughput limit, or the instance's EBS bandwidth.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumequeuedepthhigh
