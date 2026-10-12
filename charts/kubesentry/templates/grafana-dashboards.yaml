@@ -1,0 +1,33 @@
+{{- $gd := .Values.metrics.grafanaDashboards -}}
+{{- if $gd.enabled }}
+{{- $pr := .Values.metrics.prometheusRule -}}
+{{- $qps := include "kubesentry.scalar" (default 200 .Values.auth.authzQPS) -}}
+{{- $queueCap := include "kubesentry.scalar" $pr.auditQueueCapacity -}}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := base $path | trimSuffix ".json" -}}
+{{- /* The dashboards draw budget and capacity lines from hidden constant variables; fill them from the values. */ -}}
+{{- $json := $.Files.Get $path -}}
+{{- $json = regexReplaceAll "(\"name\": \"authz_qps\",\\s*\"query\": \")[^\"]*\"" $json (printf "${1}%s\"" $qps) -}}
+{{- $json = regexReplaceAll "(\"name\": \"audit_queue_cap\",\\s*\"query\": \")[^\"]*\"" $json (printf "${1}%s\"" $queueCap) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubesentry.fullname" $ }}-grafana-{{ trimPrefix "kubesentry-" $name }}
+  namespace: {{ default $.Release.Namespace $gd.namespace }}
+  labels:
+    {{- include "kubesentry.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: dashboards
+    {{ $gd.label }}: {{ $gd.labelValue | quote }}
+    {{- with $gd.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $gd.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ $name }}.json: |-
+    {{- $json | trim | nindent 4 }}
+{{- end }}
+{{- end }}

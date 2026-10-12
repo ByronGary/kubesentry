@@ -1,0 +1,62 @@
+# cert-manager values to go with examples/monitoring-eks.yaml: metrics for the
+# cert-manager rules, and resource requests. A recommendation for your
+# monitoring and platform teams; kubesentry's chart does not install it.
+#
+#   helm upgrade cert-manager jetstack/cert-manager -n cert-manager \
+#     --reuse-values -f examples/cert-manager-eks.yaml
+#
+# Written for cert-manager v1.21. In the stress run cert-manager had no
+# requests or limits, failed its liveness probe under load (HTTP 500 from
+# /livez) and restarted 3 times in the baseline and 5 times after it. The
+# numbers below are starting points, not measurements: compare them with
+# container_memory_working_set_bytes and CPU use after a week.
+
+prometheus:
+  enabled: true
+  servicemonitor:
+    enabled: true
+    # kube-prometheus-stack (release "kps") selects ServiceMonitors with this label.
+    labels:
+      release: kps
+    interval: 60s
+    scrapeTimeout: 30s
+    # Keep the certificate's namespace in exported_namespace (the default); the
+    # rules in examples/monitoring-eks.yaml handle either setting.
+    honorLabels: false
+
+# The controller: one replica holds the leader lease; memory grows with the
+# number of Certificates, CertificateRequests and the Secrets they own.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+
+# Under API server load the leader-election check behind /livez failed for
+# longer than the default tolerance (8 failures, 10s apart). A restart pauses
+# every issuance and renewal, so give it longer before the kubelet kills it.
+livenessProbe:
+  enabled: true
+  periodSeconds: 20
+  timeoutSeconds: 15
+  failureThreshold: 9
+
+webhook:
+  # Every create or update of a cert-manager resource waits on the webhook.
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
+cainjector:
+  # cainjector watches CRDs, webhook configurations and the Secrets they use.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

@@ -666,22 +666,75 @@ metrics:
     scrapeTimeout: 10s
     relabelings: []
     metricRelabelings: []
-  # -- PrometheusRule with kubesentry's alerts.
+  # -- PrometheusRule with kubesentry's alerts. Rendered only when the
+  # monitoring.coreos.com/v1 API is available. docs/monitoring-eks.md has a
+  # runbook for each alert.
   prometheusRule:
     enabled: false
     labels: {}
     # -- Label matchers selecting kubesentry's series; defaults to namespace="<release namespace>".
     matchers: ""
+    # -- Each alert's runbook_url is this URL plus "#<alert name in lower case>".
+    # Point it at your own copy of docs/monitoring-eks.md if you keep runbooks internally.
+    runbookBaseURL: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md
     # -- Alert when the served view is older than this.
     snapshotStaleSeconds: 120
+    # -- Alert when the 90th percentile of view rebuilds over 15 minutes takes longer than this.
+    snapshotBuildSeconds: 5
     # -- Alert when the CloudWatch reader lags more than this (only with the CloudWatch source).
     cloudwatchLagSeconds: 300
     # -- Alert when more than this fraction of SubjectAccessReviews fail.
     authzErrorRatio: 0.05
+    # -- Alert when a replica's SubjectAccessReview rate stays above this
+    # fraction of auth.authzQPS (the per-replica budget; proxy mode only).
+    authzBudgetRatio: 0.8
+    # -- Alert when the response cache hit ratio over 30 minutes falls below
+    # this fraction of its ratio over the last day...
+    cacheHitCollapseRatio: 0.5
+    # -- ...while the cache sees at least this many lookups per second.
+    cacheMinLookupsPerSecond: 0.5
+    # -- Alert when more than this fraction of a route's requests are answered
+    # 429 (or 503)...
+    rejectedRatio: 0.05
+    # -- ...at no less than this many responses per second.
+    rejectedMinPerSecond: 0.05
+    # -- Alert when the Postgres audit write queue holds more than this fraction
+    # of auditQueueCapacity (only with audit.store=postgres).
+    auditQueueRatio: 0.8
+    # -- Capacity of the Postgres audit write queue. The server fixes it at
+    # 50,000 events; keep this in step if that changes.
+    auditQueueCapacity: 50000
     # -- Alert when nodes reporting processes drop by more than this fraction within an hour.
     agentDropRatio: 0.2
+    # -- Crash-loop and OOM alerts for the release's pods (server, oauth2-proxy
+    # and agent containers), from kube-state-metrics series.
+    kubeStateMetrics:
+      enabled: true
+      # -- Extra label matchers for kube-state-metrics series, e.g. job="kube-state-metrics"
+      # or cluster="prod-eks" when one Prometheus holds several clusters.
+      matchers: ""
+      # -- Restarts within 30 minutes that count as a crash loop.
+      restarts: 3
     # -- Extra rules appended to the group.
     extraRules: []
+  # -- Grafana dashboards as ConfigMaps, for the Grafana dashboard sidecar
+  # (kube-prometheus-stack's grafana.sidecar.dashboards). The JSON uses a
+  # ${datasource} variable, so it works with Prometheus or Amazon Managed
+  # Prometheus behind Amazon Managed Grafana.
+  grafanaDashboards:
+    enabled: false
+    # -- Namespace for the ConfigMaps; empty uses the release namespace. The
+    # sidecar must watch it (kube-prometheus-stack searches ALL by default).
+    namespace: ""
+    # -- The label and value the sidecar selects ConfigMaps by
+    # (grafana.sidecar.dashboards.label and labelValue).
+    label: grafana_dashboard
+    labelValue: "1"
+    # -- Extra labels for the ConfigMaps.
+    labels: {}
+    # -- Annotations for the ConfigMaps, e.g. grafana_folder: kubesentry with
+    # the sidecar's folderAnnotation set to grafana_folder.
+    annotations: {}
 
 # -- API Priority and Fairness: a FlowSchema and PriorityLevelConfiguration
 # that isolate kubesentry's ServiceAccount from other API server clients.

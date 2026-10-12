@@ -1,0 +1,289 @@
+# promtool unit tests for the extra rules in examples/monitoring-eks.yaml.
+# hack/check-rules.sh writes each additionalPrometheusRulesMap entry to
+# <name>.yaml next to this file and runs:
+#   promtool test rules monitoring-eks.test.yaml
+# The test clock starts at the Unix epoch, so timestamps are seconds from 0.
+rule_files:
+  - cert-manager.yaml
+  - eks-control-plane.yaml
+  - eks-nodes.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # At 2h: a (90-day certificate, renewal due a day ago, expires in 10 days) warns;
+  # c (expires in 2 days, renewal due a day ago) pages and warns; b (24h certificate,
+  # renewal due at 16h) is fine; d is scraped with honorLabels, so its
+  # namespace label is already the certificate's.
+  - name: certificate expiry
+    interval: 1m
+    input_series:
+      - series: 'certmanager_certificate_expiration_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="a",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '871200x150'
+      - series: 'certmanager_certificate_renewal_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="a",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '-86400x150'
+      - series: 'certmanager_certificate_expiration_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="b",issuer_name="mesh-ca",issuer_kind="Issuer"}'
+        values: '86400x150'
+      - series: 'certmanager_certificate_renewal_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="b",issuer_name="mesh-ca",issuer_kind="Issuer"}'
+        values: '57600x150'
+      - series: 'certmanager_certificate_expiration_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="c",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '180000x150'
+      - series: 'certmanager_certificate_renewal_timestamp_seconds{namespace="cert-manager",exported_namespace="payments",name="c",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '-86400x150'
+      - series: 'certmanager_certificate_expiration_timestamp_seconds{namespace="shop",name="d",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '439200x150'
+      - series: 'certmanager_certificate_renewal_timestamp_seconds{namespace="shop",name="d",issuer_name="letsencrypt",issuer_kind="ClusterIssuer"}'
+        values: '-86400x150'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CertManagerCertificateExpiring
+        exp_alerts:
+          - exp_labels: {severity: critical, namespace: payments, exported_namespace: payments, name: c, issuer_name: letsencrypt, issuer_kind: ClusterIssuer}
+            exp_annotations:
+              summary: A certificate expires within 3 days and was not renewed.
+              description: >-
+                Certificate payments/c (issuer ClusterIssuer/letsencrypt) expires in 2d 1h 30m 0s and cert-manager
+                has not renewed it. Clients will fail TLS when it expires.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+      - eval_time: 2h
+        alertname: CertManagerCertificateExpiring
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: payments, exported_namespace: payments, name: a, issuer_name: letsencrypt, issuer_kind: ClusterIssuer}
+            exp_annotations:
+              summary: A certificate expires within 14 days and was not renewed.
+              description: >-
+                Certificate payments/a (issuer ClusterIssuer/letsencrypt) expires in 10d 0h 0m 0s. Its renewal time
+                passed more than an hour ago without a new certificate.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+          - exp_labels: {severity: warning, namespace: payments, exported_namespace: payments, name: c, issuer_name: letsencrypt, issuer_kind: ClusterIssuer}
+            exp_annotations:
+              summary: A certificate expires within 14 days and was not renewed.
+              description: >-
+                Certificate payments/c (issuer ClusterIssuer/letsencrypt) expires in 2d 0h 0m 0s. Its renewal time
+                passed more than an hour ago without a new certificate.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+          - exp_labels: {severity: critical, namespace: payments, exported_namespace: payments, name: c, issuer_name: letsencrypt, issuer_kind: ClusterIssuer}
+            exp_annotations:
+              summary: A certificate expires within 3 days and was not renewed.
+              description: >-
+                Certificate payments/c (issuer ClusterIssuer/letsencrypt) expires in 2d 0h 0m 0s and cert-manager
+                has not renewed it. Clients will fail TLS when it expires.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+          - exp_labels: {severity: warning, namespace: shop, name: d, issuer_name: letsencrypt, issuer_kind: ClusterIssuer}
+            exp_annotations:
+              summary: A certificate expires within 14 days and was not renewed.
+              description: >-
+                Certificate shop/d (issuer ClusterIssuer/letsencrypt) expires in 5d 0h 0m 0s. Its renewal time
+                passed more than an hour ago without a new certificate.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificateexpiring
+
+  - name: certificate not ready, cert-manager restarting, no cert-manager metrics
+    interval: 1m
+    input_series:
+      - series: 'certmanager_certificate_ready_status{namespace="cert-manager",exported_namespace="payments",name="e",issuer_name="missing",issuer_kind="Issuer",condition="False"}'
+        values: '1x30'
+      - series: 'certmanager_certificate_ready_status{namespace="cert-manager",exported_namespace="payments",name="e",issuer_name="missing",issuer_kind="Issuer",condition="True"}'
+        values: '0x30'
+      - series: 'certmanager_certificate_ready_status{namespace="cert-manager",exported_namespace="payments",name="a",issuer_name="letsencrypt",issuer_kind="ClusterIssuer",condition="True"}'
+        values: '1x30'
+      - series: 'kube_pod_container_status_restarts_total{namespace="cert-manager",pod="cert-manager-5d8f9c7b6-abcde",container="cert-manager-controller"}'
+        values: '0 0 0 0 0 1 1 1 1 1 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CertManagerCertificateNotReady
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: payments, exported_namespace: payments, name: e, issuer_name: missing, issuer_kind: Issuer}
+            exp_annotations:
+              summary: A certificate is not ready.
+              description: >-
+                Certificate payments/e has not been Ready for 15 minutes (issuer Issuer/missing). Issuance or renewal
+                is failing, often because the issuer does not exist; the old certificate, if any, keeps serving until
+                it expires.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagercertificatenotready
+      - eval_time: 20m
+        alertname: CertManagerRestarting
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: cert-manager, pod: cert-manager-5d8f9c7b6-abcde, container: cert-manager-controller}
+            exp_annotations:
+              summary: cert-manager is restarting.
+              description: >-
+                cert-manager-controller in cert-manager/cert-manager-5d8f9c7b6-abcde restarted 2 times in the last
+                hour. While it is down, certificates are neither issued nor renewed and, for the webhook, cert-manager
+                resources cannot be changed.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagerrestarting
+      - eval_time: 20m
+        alertname: CertManagerMetricsAbsent
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Prometheus has no cert-manager metrics.
+              description: >-
+                No cert-manager controller target has been up for 15 minutes, so certificate expiry and readiness
+                alerts cannot fire. Check cert-manager's ServiceMonitor and its release: kps label.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#certmanagermetricsabsent
+
+  - name: cert-manager present
+    interval: 1m
+    input_series:
+      - series: 'up{job="cert-manager",namespace="cert-manager",pod="cert-manager-5d8f9c7b6-abcde"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CertManagerMetricsAbsent
+        exp_alerts: []
+
+  # The newer apiserver_storage_size_bytes: 6.5 GiB is over 70% of 8 GiB but
+  # under 85%. The older name alone, at 7.5 GiB, is over both.
+  - name: etcd database size
+    interval: 1m
+    input_series:
+      - series: 'apiserver_storage_size_bytes{cluster="prod-eks",instance="10.0.0.1:443",storage_cluster_id="etcd-0"}'
+        values: '6979321856x40'
+      - series: 'apiserver_storage_db_total_size_in_bytes{cluster="old-eks",instance="10.0.0.2:443",endpoint="https://etcd"}'
+        values: '8053063680x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: KubeEtcdDatabaseLarge
+        exp_alerts:
+          - exp_labels: {severity: warning, cluster: prod-eks}
+            exp_annotations:
+              summary: The etcd database is over 70% of EKS's 8 GiB limit.
+              description: The etcd database is 6.5GiB. At 8 GiB the cluster stops accepting writes.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeetcddatabaselarge
+          - exp_labels: {severity: warning, cluster: old-eks}
+            exp_annotations:
+              summary: The etcd database is over 70% of EKS's 8 GiB limit.
+              description: The etcd database is 7.5GiB. At 8 GiB the cluster stops accepting writes.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeetcddatabaselarge
+          - exp_labels: {severity: critical, cluster: old-eks}
+            exp_annotations:
+              summary: The etcd database is over 85% of EKS's 8 GiB limit.
+              description: >-
+                The etcd database is 7.5GiB. At 8 GiB the cluster stops accepting writes: no deployments, no scaling,
+                no leader elections.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeetcddatabaselarge
+
+  # Reads of single objects take 1-2s (p99 1.99s); APF rejects a flow at
+  # 0.5/s; events are written at 30/s.
+  - name: API server latency, flow control and event volume
+    interval: 1m
+    input_series:
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="GET",scope="resource",subresource="",resource="pods",le="0.5"}'
+        values: '0x60'
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="GET",scope="resource",subresource="",resource="pods",le="1"}'
+        values: '0x60'
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="GET",scope="resource",subresource="",resource="pods",le="2"}'
+        values: '0+60x60'
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="GET",scope="resource",subresource="",resource="pods",le="+Inf"}'
+        values: '0+60x60'
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="POST",scope="resource",subresource="",resource="pods",le="1"}'
+        values: '0+60x60'
+      - series: 'apiserver_request_sli_duration_seconds_bucket{job="apiserver",verb="POST",scope="resource",subresource="",resource="pods",le="+Inf"}'
+        values: '0+60x60'
+      - series: 'apiserver_flowcontrol_rejected_requests_total{flow_schema="kubesentry",priority_level="kubesentry",reason="queue-full"}'
+        values: '0+30x60'
+      - series: 'apiserver_request_total{job="apiserver",resource="events",verb="POST",code="201"}'
+        values: '0+1800x60'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KubeAPIServerReadLatencyHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: The API server is slow to answer reads.
+              description: >-
+                99% of single-object and namespace reads took up to 1.99s over 15 minutes (threshold 1s). Every
+                controller, kubectl and kubesentry share this latency.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeapiserverreadlatencyhigh
+      - eval_time: 30m
+        alertname: KubeAPIServerWriteLatencyHigh
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubeAPIServerFlowControlRejecting
+        exp_alerts:
+          - exp_labels: {severity: warning, flow_schema: kubesentry, priority_level: kubesentry, reason: queue-full}
+            exp_annotations:
+              summary: API Priority and Fairness is rejecting requests.
+              description: >-
+                The API server has answered 429 to requests of flow schema kubesentry (priority level kubesentry, reason
+                queue-full) for 15 minutes, 0.50 per second. Clients in that flow are throttled; kubesentry has its own
+                flow schema when its chart sets apf.enabled.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeapiserverflowcontrolrejecting
+      - eval_time: 20m
+        alertname: KubeEventVolumeHigh
+        exp_alerts: []
+      - eval_time: 50m
+        alertname: KubeEventVolumeHigh
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: The cluster is writing an unusual number of events.
+              description: >-
+                Events are written at 30 per second for 30 minutes (threshold 20/s). Event churn costs etcd space and
+                API server capacity that every other client shares.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubeeventvolumehigh
+
+  # One node 12s behind; one volume busy on every axis, one idle.
+  - name: node clock and gp3 volumes
+    interval: 1m
+    input_series:
+      - series: 'node_timex_offset_seconds{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100"}'
+        values: '-12x20'
+      - series: 'node_timex_offset_seconds{node="ip-10-0-1-2.ec2.internal",instance="10.0.1.2:9100"}'
+        values: '0.002x20'
+      - series: 'node_disk_reads_completed_total{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100",device="nvme1n1"}'
+        values: '0+90000x40'
+      - series: 'node_disk_writes_completed_total{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100",device="nvme1n1"}'
+        values: '0+78000x40'
+      - series: 'node_disk_read_bytes_total{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100",device="nvme1n1"}'
+        values: '0+3774873600x40'
+      - series: 'node_disk_written_bytes_total{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100",device="nvme1n1"}'
+        values: '0+3774873600x40'
+      - series: 'node_disk_io_time_weighted_seconds_total{node="ip-10-0-1-1.ec2.internal",instance="10.0.1.1:9100",device="nvme1n1"}'
+        values: '0+600x40'
+      - series: 'node_disk_reads_completed_total{node="ip-10-0-1-2.ec2.internal",instance="10.0.1.2:9100",device="nvme0n1"}'
+        values: '0+600x40'
+      - series: 'node_disk_writes_completed_total{node="ip-10-0-1-2.ec2.internal",instance="10.0.1.2:9100",device="nvme0n1"}'
+        values: '0+600x40'
+      - series: 'node_disk_io_time_weighted_seconds_total{node="ip-10-0-1-2.ec2.internal",instance="10.0.1.2:9100",device="nvme0n1"}'
+        values: '0+30x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NodeClockOffsetCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, node: ip-10-0-1-1.ec2.internal, instance: "10.0.1.1:9100"}
+            exp_annotations:
+              summary: A node's clock is more than 10 seconds off.
+              description: >-
+                The clock on ip-10-0-1-1.ec2.internal (10.0.1.1:9100) is 12s off. Service account and OIDC token
+                validation, IRSA and SigV4 requests start failing as the offset grows.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeclockoffsetcritical
+      - eval_time: 25m
+        alertname: NodeEBSVolumeIOPSNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, node: ip-10-0-1-1.ec2.internal, instance: "10.0.1.1:9100", device: nvme1n1}
+            exp_annotations:
+              summary: A volume is close to gp3's baseline IOPS.
+              description: >-
+                nvme1n1 on ip-10-0-1-1.ec2.internal has done 2.8k IOPS for 15 minutes, over 90% of gp3's 3,000.
+                Beyond that, EBS queues requests and latency rises.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumeiopsnearlimit
+      - eval_time: 25m
+        alertname: NodeEBSVolumeThroughputNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, node: ip-10-0-1-1.ec2.internal, instance: "10.0.1.1:9100", device: nvme1n1}
+            exp_annotations:
+              summary: A volume is close to gp3's baseline throughput.
+              description: >-
+                nvme1n1 on ip-10-0-1-1.ec2.internal has moved 120MiB/s for 15 minutes, over 90% of gp3's 125 MiB/s.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumethroughputnearlimit
+      - eval_time: 25m
+        alertname: NodeEBSVolumeQueueDepthHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, node: ip-10-0-1-1.ec2.internal, instance: "10.0.1.1:9100", device: nvme1n1}
+            exp_annotations:
+              summary: Requests are queuing on a volume.
+              description: >-
+                nvme1n1 on ip-10-0-1-1.ec2.internal has averaged 10 requests in flight for 15 minutes. The volume is
+                saturated: its IOPS or throughput limit, or the instance's EBS bandwidth.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#nodeebsvolumequeuedepthhigh

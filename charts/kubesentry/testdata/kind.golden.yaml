@@ -614,6 +614,21 @@ spec:
             description: >-
               {{ $labels.pod }} has served a snapshot older than 120s for 5 minutes.
               Its informers are not keeping up with the API server, or the API server is unreachable.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotstale
+        - alert: KubesentrySnapshotBuildSlow
+          expr: |
+            histogram_quantile(0.9, sum by (namespace, pod, le) (rate(kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry"}[15m])))
+              > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry takes too long to rebuild its view of the cluster.
+            description: >-
+              On {{ $labels.pod }}, 90% of view rebuilds over 15 minutes took up to {{ $value | humanizeDuration }}
+              (threshold 5s), so changes reach the UI late and CPU is spent on rebuilds.
+              Usually the cluster grew past the replica's CPU or memory, or object churn is high.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotbuildslow
         - alert: KubesentryAuthzReviewErrors
           expr: |
             sum by (namespace) (rate(kubesentry_authz_reviews_total{namespace="kubesentry",result="error"}[5m]))
@@ -627,6 +642,66 @@ spec:
             description: >-
               More than 5% of SubjectAccessReviews failed over 10 minutes, so users see
               less than their RBAC allows. Check API server health and APF throttling of kubesentry's ServiceAccount.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryauthzreviewerrors
+        - alert: KubesentryCacheHitRateCollapsed
+          expr: |
+            (
+              sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced"}[30m]))
+                / sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[30m]))
+              < 0.5 * (
+                sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced"}[1d]))
+                  / sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[1d]))
+              )
+            )
+            and
+            sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[30m]))
+              > 0.5
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's response cache hit rate collapsed.
+            description: >-
+              The response cache in {{ $labels.namespace }} answered {{ $value | humanizePercentage }} of lookups
+              from cache over 30 minutes, less than 50% of its hit ratio over the last day.
+              Every miss runs the handler and its authorization checks, so CPU and SubjectAccessReviews rise.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycachehitratecollapsed
+        - alert: KubesentryRateLimited
+          expr: |
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="429",route!="auth_recheck"}[10m]))
+              > 0.05
+            and
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="429",route!="auth_recheck"}[10m]))
+              / sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is answering 429 Too Many Requests on a route.
+            description: >-
+              The {{ $labels.route }} route has answered 429 at {{ printf "%.2f" $value }}/s, more than
+              5% of its requests, for 15 minutes. Users hit the per-identity cap on expensive
+              routes (server.maxInflightPerIdentity), usually because the backend behind it (Prometheus or Postgres) is slow.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryratelimited
+        - alert: KubesentryServiceUnavailable
+          expr: |
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="503"}[10m]))
+              > 0.05
+            and
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="503"}[10m]))
+              / sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is answering 503 Service Unavailable on a route.
+            description: >-
+              The {{ $labels.route }} route has answered 503 at {{ printf "%.2f" $value }}/s, more than
+              5% of its requests, for 15 minutes: route timeouts, an overloaded audit store,
+              a full audit write queue (ingest_audit_webhook), or an ingest route without its token.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryserviceunavailable
         - alert: KubesentryAgentNodesDropped
           expr: |
             max by (namespace) (kubesentry_agent_nodes_reporting{namespace="kubesentry"})
@@ -639,6 +714,35 @@ spec:
             description: >-
               Nodes reporting processes dropped by more than 20% within an hour.
               Agents may be failing, or the cluster scaled down. Compare with the agent DaemonSet's ready count.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryagentnodesdropped
+        - alert: KubesentryCrashLooping
+          expr: |
+            max by (namespace, pod, container) (max_over_time(kube_pod_container_status_waiting_reason{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent",reason="CrashLoopBackOff"}[5m])) >= 1
+            or
+            max by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent"}[30m])) >= 3
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A kubesentry container is crash-looping.
+            description: >-
+              {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }} is in CrashLoopBackOff
+              or restarted at least 3 times in 30 minutes. A restarting server rebuilds its caches; with the memory
+              audit store it also loses its audit history.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycrashlooping
+        - alert: KubesentryOOMKilled
+          expr: |
+            max by (namespace, pod, container) (kube_pod_container_status_last_terminated_reason{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent",reason="OOMKilled"}) == 1
+            and on (namespace, pod, container)
+            max by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent"}[30m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A kubesentry container was OOM-killed.
+            description: >-
+              {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }} restarted in the last
+              30 minutes after running out of memory. Its memory limit is too small for the cluster's size or for the agents' report bursts.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryoomkilled
 
 ---
 # Source: kubesentry/templates/servicemonitor.yaml
