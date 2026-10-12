@@ -250,6 +250,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/security?view=summary",
 		"/api/v1/map", "/api/v1/map?namespace=team-a", "/api/v1/certificates", "/api/v1/pvcs/unused", "/api/v1/audit/events",
 		"/api/v1/nodes", "/api/v1/nodes?summary=true", "/api/v1/nodes/n1", "/api/v1/oom", "/api/v1/audit/summary",
+		"/api/v1/overview", "/api/v1/overview?namespace=team-a", "/api/v1/overview?owner=team-alpha",
 	}
 	for _, route := range routes {
 		seen := 0
@@ -267,7 +268,20 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		}
 
 		// carol holds nothing: empty lists, not errors (a namespace or node
-		// she names is not found).
+		// she names is not found; the overview answers with zeros, echoing
+		// only her own filter).
+		if strings.HasPrefix(route, "/api/v1/overview") && strings.Contains(route, "namespace=") {
+			var o overviewResponse
+			if rec := getAs(t, h, "carol", route, &o); rec.Code != 200 {
+				t.Errorf("%s as carol = %d, want 200", route, rec.Code)
+			}
+			o.Scope.Namespace = ""
+			raw, _ := json.Marshal(o)
+			if nss, _ := namespacesIn(raw); len(nss) > 0 || o.Scope.Namespaces != 0 {
+				t.Errorf("%s: carol sees %v: %s", route, nss, raw)
+			}
+			continue
+		}
 		if strings.Contains(route, "namespace=") || strings.HasPrefix(route, "/api/v1/nodes/") {
 			if rec := getAs(t, h, "carol", route, nil); rec.Code != 404 {
 				t.Errorf("%s as carol = %d, want 404", route, rec.Code)
@@ -362,6 +376,32 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		t.Errorf("alice's oom = %+v", oom)
 	}
 
+	// The overview's aggregates are alice's own: they equal what her list
+	// routes show, and every badge, owner and attention item is team-a's.
+	var ov overviewResponse
+	getAs(t, h, "alice", "/api/v1/overview", &ov)
+	var pods podsResponse
+	getAs(t, h, "alice", "/api/v1/pods?limit=1000", &pods)
+	var wls workloadsResponse
+	getAs(t, h, "alice", "/api/v1/workloads?limit=1000", &wls)
+	var unused unusedPVCResponse
+	getAs(t, h, "alice", "/api/v1/pvcs/unused", &unused)
+	if ov.Scope.Namespaces != 1 || ov.Pods.Total != pods.Count || ov.Workloads.Total != wls.Count || ov.Waste.UnusedPVCs != unused.Count ||
+		ov.Certificates == nil || ov.Certificates.Total != len(certs.Certificates) || ov.Nodes != nil {
+		t.Errorf("alice's overview tiles %+v disagree with her lists: %d pods, %d workloads, %d unused claims, %d certificates",
+			ov, pods.Count, wls.Count, unused.Count, len(certs.Certificates))
+	}
+	if ov.Security.Crit != sec.Counts["crit"] || ov.Security.Warn != sec.Counts["warn"] ||
+		ov.Badges["security"].Count != sec.Counts["crit"]+sec.Counts["warn"] {
+		t.Errorf("alice's overview security %+v / badge %+v, her /security counts %v", ov.Security, ov.Badges["security"], sec.Counts)
+	}
+	if ov.Badges["memory"].Count != len(oom.Events) || ov.Badges["findings"].Count != len(ov.Attention) || strings.Join(ov.Owners, ",") != "team-alpha" {
+		t.Errorf("alice's badges %v, owners %v, attention %+v", ov.Badges, ov.Owners, ov.Attention)
+	}
+	if ov.Activity == nil || ov.Activity.Exec+ov.Activity.SecretReads+ov.Activity.RBACChanges+ov.Activity.Denied != 0 || len(ov.Activity.Latest) != 0 {
+		t.Errorf("alice's activity (team-a holds only deletes) = %+v", ov.Activity)
+	}
+
 	// Single objects elsewhere are not found, rather than forbidden.
 	for _, path := range []string{"/api/v1/map?namespace=team-b", "/api/v1/pods/team-b/web-0/diagnostics", "/api/v1/pods/team-b/web-0/processes", "/api/v1/nodes/n9"} {
 		if rec := getAs(t, h, "alice", path, nil); rec.Code != 404 {
@@ -419,6 +459,12 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		t.Errorf("with ViewRBAC in team-a alice sees %d RBAC findings, counts %v (summary %v), without %v",
 			rbacFindings, withRBAC.Counts, withRBACSummary.Counts, sec.Counts)
 	}
+	// The overview follows the same gate (and the response cache keys on it).
+	var ovRBAC overviewResponse
+	getAs(t, h, "alice", "/api/v1/overview", &ovRBAC)
+	if ovRBAC.Security.Crit != withRBAC.Counts["crit"] || ovRBAC.Security.Warn != withRBAC.Counts["warn"] {
+		t.Errorf("with ViewRBAC alice's overview security = %+v, /security counts %v", ovRBAC.Security, withRBAC.Counts)
+	}
 
 	// The audit store's cluster-wide counts only for callers who may read
 	// audit events.
@@ -462,7 +508,7 @@ func TestInfoCapabilities(t *testing.T) {
 func TestResponseCacheIsolatesCallers(t *testing.T) {
 	s := tenantServer(t)
 	h := s.Handler()
-	for _, path := range []string{"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/nodes", "/api/v1/certificates"} {
+	for _, path := range []string{"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/nodes", "/api/v1/certificates", "/api/v1/overview"} {
 		for i := 0; i < 2; i++ {
 			rec := getAs(t, h, "alice", path, nil)
 			if i == 1 && rec.Header().Get("X-Kubesentry-Cache") != "hit" {
