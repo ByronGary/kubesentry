@@ -2838,6 +2838,8 @@ spec:
             - -ingest-addr=:8081
             - -ops-addr=:9090
             - -auth-mode=token
+            - -owner-annotation=kubesentry.io/owner
+            - -production-label=environment=production
             - -prometheus-autodiscover=true
             - -audit-store=memory
           env:
