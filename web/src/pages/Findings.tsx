@@ -1,6 +1,5 @@
 import { useMemo } from 'react'
 import { can } from '../access'
-import { PrometheusNotice } from '../components/Access'
 import { activityFindings, certFindings, memoryFindings, nothingFoundText, oomFindings, rank, securityFindings, volumeFindings } from '../findings'
 import { plural } from '../format'
 import { securityPartial } from '../inventory'
@@ -46,7 +45,7 @@ export function Findings({ info }: { info: Info }) {
   return (
     <>
       <PageHead title="Findings" lede="What needs a look, most urgent first. Each line opens the place to dig in." />
-      {down && <PrometheusNotice reason={down} />}
+      {/* "Prometheus is unavailable" shows in the notices above the page (App). */}
       <Async state={primary as never} what="findings">
         {() => (
           <>

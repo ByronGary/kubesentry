@@ -13,6 +13,7 @@ import { compareNumber, compareStatus, compareText } from '../virtual'
 
 const KINDS: WorkloadSummary['kind'][] = ['Deployment', 'StatefulSet', 'DaemonSet', 'Job', 'CronJob']
 const STATUSES = [
+  ['unhealthy', 'Critical or warning'],
   ['crit', 'Critical'],
   ['warn', 'Warning'],
   ['ok', 'OK'],

@@ -3,13 +3,24 @@
 import { podHref, workloadHref } from './findings'
 import { ago } from './format'
 import { isWorkloadKind } from './mapLayout'
-import type { PodSummary, SecurityFinding, SecurityResponse, SecuritySeverity, WorkloadSummary } from './types'
+import type { PodSummary, SecurityFinding, SecurityResponse, SecuritySeverity, Status, WorkloadSummary } from './types'
 
 /** Case-insensitive substring match of a search box against any of the fields. */
 export function matches(q: string, ...fields: (string | undefined)[]): boolean {
   const needle = q.trim().toLowerCase()
   if (!needle) return true
   return fields.some((f) => f !== undefined && f.toLowerCase().includes(needle))
+}
+
+/**
+ * A status filter from the address: "" matches everything, "unhealthy" critical
+ * and warnings (what the Overview and the sidebar badges count), anything else
+ * that one status.
+ */
+export function statusMatches(filter: string, s: Status): boolean {
+  if (!filter) return true
+  if (filter === 'unhealthy') return s === 'crit' || s === 'warn'
+  return s === filter
 }
 
 export interface WorkloadFilter {
@@ -24,7 +35,7 @@ export function filterWorkloads(items: WorkloadSummary[], f: WorkloadFilter): Wo
     (w) =>
       (!f.namespace || w.namespace === f.namespace) &&
       (!f.kind || w.kind === f.kind) &&
-      (!f.status || w.status === f.status) &&
+      statusMatches(f.status, w.status) &&
       matches(f.q, `${w.namespace}/${w.name}`, ...(w.images ?? [])),
   )
 }
@@ -38,10 +49,26 @@ export function readiness(w: WorkloadSummary, now: number = Date.now()): { main:
   return { main: `${w.ready}/${w.desired}` }
 }
 
-/** Pods matching a search over name, namespace, node, workload, phase and reason. */
-export function filterPods(items: PodSummary[], q: string): PodSummary[] {
-  if (!q.trim()) return items
-  return items.filter((p) => matches(q, `${p.namespace}/${p.name}`, p.node, p.workload, p.reason, p.phase))
+/** The Pods page's `status` filter: pods failing (crash loops, image errors, evicted, OOMKilled) or still pending. */
+export type PodStatusFilter = '' | 'failing' | 'pending'
+
+export function podStatusFilter(v: string | null | undefined): PodStatusFilter {
+  return v === 'failing' || v === 'pending' ? v : ''
+}
+
+/** Whether a pod counts as failing, as the Overview counts it: a broken waiting reason, the Failed phase (evictions too), or an OOM kill. */
+export function podFailing(p: PodSummary): boolean {
+  return p.oomKilled || p.phase === 'Failed' || reasonStatus(p.reason) === 'crit'
+}
+
+/** Pods matching a search over name, namespace, node, workload, phase and reason, and optionally a status. */
+export function filterPods(items: PodSummary[], q: string, status: PodStatusFilter = ''): PodSummary[] {
+  if (!q.trim() && !status) return items
+  return items.filter(
+    (p) =>
+      (status === '' || (status === 'failing' ? podFailing(p) : p.phase === 'Pending')) &&
+      matches(q, `${p.namespace}/${p.name}`, p.node, p.workload, p.reason, p.phase),
+  )
 }
 
 /** Waiting reasons that mean the pod is broken rather than starting. */

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { apiGet, ApiError } from './api'
-import { isBusy, nextRetry, type Retry } from './retry'
+import { isBusy, nextRetry, refreshDue, type Retry } from './retry'
 
 export interface ApiState<T> {
   data: T | undefined
@@ -127,6 +127,39 @@ export function useApi<T>(path: string | null, refreshMs?: number, options?: Api
 
   const reload = useCallback(() => setTick((t) => t + 1), [])
   return { data, error, loading, reload, retry }
+}
+
+/** Whether the tab is visible; false while it is in the background. */
+export function usePageVisible(): boolean {
+  const [visible, setVisible] = useState(() => typeof document === 'undefined' || document.visibilityState !== 'hidden')
+  useEffect(() => {
+    const on = () => setVisible(document.visibilityState !== 'hidden')
+    document.addEventListener('visibilitychange', on)
+    return () => document.removeEventListener('visibilitychange', on)
+  }, [])
+  return visible
+}
+
+/**
+ * useApi, refreshed every `ms` while the tab is visible. A hidden tab stops
+ * asking; coming back asks once at once when the last answer is an interval
+ * old (retry.ts `refreshDue`). Busy answers are retried as useApi does.
+ */
+export function usePolled<T>(path: string | null, ms: number, options?: ApiOptions<T>): ApiState<T> {
+  const visible = usePageVisible()
+  const state = useApi<T>(path, visible ? ms : undefined, options)
+  const loadedAt = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (state.data !== undefined) loadedAt.current = Date.now()
+  }, [state.data])
+  const { reload } = state
+  const wasVisible = useRef(visible)
+  useEffect(() => {
+    const back = visible && !wasVisible.current
+    wasVisible.current = visible
+    if (back && path && refreshDue(loadedAt.current, Date.now(), ms)) reload()
+  }, [visible, path, ms, reload])
+  return state
 }
 
 /** `value`, once it has stopped changing for `ms`. Keeps typing responsive on big lists. */

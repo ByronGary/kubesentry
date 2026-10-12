@@ -3,7 +3,7 @@ import { capabilityNoun, missingCapabilities } from '../access'
 import { apiPost, ApiError, reloadForSignIn } from '../api'
 import { cooldownLeft, readNumber, readString, RECHECK_COOLDOWN_MS, RECHECK_KEY, sessionStore, sortGroups, sourceText, writeNumber, writeString } from '../auth'
 import { plural } from '../format'
-import { clusterFacts, stalenessText } from '../retention'
+import { stalenessText } from '../retention'
 import { unavailableBanner } from '../sources'
 import type { Info, RecheckResponse } from '../types'
 import { bumpAuth, useNow } from '../useApi'
@@ -77,7 +77,7 @@ export function RecheckButton({ className = 'btn' }: { className?: string }) {
   )
 }
 
-/** The signed-in user in the header, with groups and sign-out in a menu. */
+/** The signed-in user at the foot of the sidebar, with groups, recheck and sign-out in a menu. */
 export function IdentityMenu({ info }: { info: Info }) {
   const id = info.identity
   const ref = useRef<HTMLDetailsElement>(null)
@@ -142,20 +142,6 @@ export function IdentityMenu({ info }: { info: Info }) {
         )}
       </div>
     </details>
-  )
-}
-
-/** Cluster name and version under the top bar, when the server says. */
-export function ClusterBar({ info }: { info: Info }) {
-  const c = clusterFacts(info.cluster)
-  if (!c.name && c.facts.length === 0) return null
-  return (
-    <div className="cluster-bar">
-      <span className="cluster-name">{c.name ?? 'Cluster'}</span>
-      {c.facts.map((f) => (
-        <span key={f} className="muted">{f}</span>
-      ))}
-    </div>
   )
 }
 

@@ -40,24 +40,96 @@ code { background: var(--surface); border: 1px solid var(--rule); border-radius:
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
 .skip { position: absolute; left: -999px; }
-.skip:focus { left: 8px; top: 8px; background: var(--surface); padding: 8px 12px; z-index: 10; }
+.skip:focus { left: 8px; top: 8px; background: var(--surface); padding: 8px 12px; z-index: 40; }
 
-/* Top bar */
-.top { display: flex; align-items: center; gap: 24px; padding: 0 24px; height: 52px; border-bottom: 1px solid var(--rule); background: var(--surface); position: sticky; top: 0; z-index: 5; }
+/*
+ * App shell: a sidebar beside the content. Expanded from 1280 px, an icon rail
+ * from 768 px (either can be chosen with « / »), and below 768 px a drawer
+ * opened from the slim bar. The layout comes from data-layout, set by nav.ts.
+ */
+.shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+.shell[data-layout='rail'] { grid-template-columns: 60px minmax(0, 1fr); }
+.shell[data-layout='drawer'] { grid-template-columns: minmax(0, 1fr); }
+.content { min-width: 0; }
 .brand { display: inline-flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; font-weight: 650; letter-spacing: 0.01em; }
 .logo { color: var(--trace); }
-.top nav { display: flex; gap: 4px; overflow-x: auto; }
-.top nav a { color: var(--pencil); text-decoration: none; padding: 15px 10px 13px; border-bottom: 2px solid transparent; white-space: nowrap; }
-.top nav a:hover { color: var(--ink); }
-.top nav a[aria-current='page'] { color: var(--ink); border-bottom-color: var(--trace); font-weight: 600; }
-.top-end { margin-left: auto; display: flex; align-items: center; gap: 12px; }
 .badge { border: 1px solid var(--rule); border-radius: 999px; padding: 2px 10px; font-size: 13px; color: var(--pencil); white-space: nowrap; }
+.icon { display: block; flex: none; }
+.icon-btn { flex: none; display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; color: var(--pencil); background: transparent; border: 1px solid transparent; border-radius: 5px; cursor: pointer; }
+.icon-btn:hover { color: var(--ink); border-color: var(--rule); }
+
+.sidebar { position: sticky; top: 0; height: 100vh; height: 100dvh; min-width: 0; display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--rule); z-index: 6; }
+.sidebar :focus-visible { outline-offset: -2px; }
+.side-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 52px; padding: 8px 8px 8px 16px; border-bottom: 1px solid var(--rule); }
+.side-scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: 10px 8px 16px; overscroll-behavior: contain; }
+.nav-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 1px; }
+.nav-list[hidden] { display: none; }
+.nav-item { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.nav-link { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 5px; color: var(--pencil); text-decoration: none; font-size: 14px; line-height: 1.3; }
+.nav-link:hover { background: var(--wash); color: var(--ink); }
+.nav-link[aria-current='page'] { background: var(--wash); color: var(--ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--trace); }
+.nav-icon { position: relative; flex: none; display: inline-grid; place-items: center; width: 20px; height: 20px; }
+.nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Count plus severity shape: never colour alone. */
+.nav-badge { flex: none; display: inline-flex; align-items: center; gap: 4px; min-height: 22px; padding: 0 7px; border: 1px solid var(--rule); border-radius: 999px; color: var(--ink); background: var(--page); font-size: 12px; font-variant-numeric: tabular-nums; text-decoration: none; }
+.nav-badge:hover { border-color: var(--pencil); }
+.nav-badge svg, .nav-section-flag svg, .rail-mark svg { display: block; }
+.rail-mark { position: absolute; top: -5px; right: -7px; display: grid; place-items: center; width: 13px; height: 13px; border-radius: 50%; background: var(--surface); }
+.nav-section { margin-top: 14px; }
+.nav-section-toggle { width: 100%; display: flex; align-items: center; gap: 6px; margin-bottom: 2px; padding: 4px 8px; font: inherit; font-size: 11.5px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: var(--pencil); background: none; border: 0; border-radius: 4px; cursor: pointer; text-align: left; }
+.nav-section-toggle:hover { color: var(--ink); }
+.nav-section-toggle > span:first-child { flex: 1; }
+.nav-section-flag { display: inline-flex; align-items: center; }
+.caret { width: 14px; height: 14px; transition: transform 0.15s; }
+.caret.folded { transform: rotate(-90deg); }
+.side-foot { flex: none; position: relative; display: grid; gap: 2px; padding: 8px; border-top: 1px solid var(--rule); }
+.side-btn { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 8px; font: inherit; font-size: 13px; color: var(--pencil); background: none; border: 1px solid transparent; border-radius: 5px; cursor: pointer; text-align: left; }
+.side-btn:hover { color: var(--ink); border-color: var(--rule); }
+.side-version { margin: 2px 8px 0; font-size: 12px; color: var(--pencil); overflow-wrap: anywhere; }
+
+/* The icon rail: labels for screen readers and tooltips only. */
+.shell[data-layout='rail'] .side-head { flex-direction: column; justify-content: center; gap: 6px; padding: 10px 0 8px; }
+.shell[data-layout='rail'] .side-scroll { padding: 8px 6px 16px; }
+.shell[data-layout='rail'] .nav-link { justify-content: center; padding: 9px 0; }
+.shell[data-layout='rail'] .nav-section { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--rule); }
+.nav-section:first-child, .shell[data-layout='rail'] .nav-section:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.shell[data-layout='rail'] .side-foot { padding: 8px 6px; }
+.shell[data-layout='rail'] .side-btn { justify-content: center; padding: 8px 0; }
+
+/* Phone: an off-canvas drawer over a scrim. */
+.shell[data-layout='drawer'] .sidebar { position: fixed; top: 0; bottom: 0; left: 0; height: auto; width: min(300px, 86vw); z-index: 30; transform: translateX(-100%); visibility: hidden; transition: transform 0.2s ease, visibility 0s linear 0.2s; box-shadow: 0 0 32px rgba(0, 0, 0, 0.25); }
+.shell[data-layout='drawer'] .sidebar.open { transform: none; visibility: visible; transition: transform 0.2s ease; }
+.scrim { position: fixed; inset: 0; z-index: 25; background: rgba(5, 12, 20, 0.45); }
+html.drawer-open { overflow: hidden; }
+
+/* The slim bar above the content: cluster name and version; ☰ and the logo on a phone. */
+.appbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 8px 14px; min-height: 44px; padding: 4px 24px; background: var(--surface); border-bottom: 1px solid var(--rule); font-size: 13px; }
+.cluster-facts { margin: 0; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; }
+.cluster-name { font-family: var(--mono); font-weight: 600; }
+.appbar-end { margin-left: auto; }
+
+/* Staleness and unreadable-source notices, under the bar and aligned with the page. */
+.notices { max-width: 1040px; margin: 0 auto; padding: 20px 24px 0; display: grid; gap: 12px; }
+.notices:empty { display: none; }
+.notices .notice { margin: 0; }
+.notices.wide { max-width: 1640px; }
+.notices.tables { max-width: 1280px; }
 
 main { max-width: 1040px; margin: 0 auto; padding: 32px 24px 80px; }
-/* The map gets more room: graphs and node cards use the width. */
+main:focus { outline: none; }
+/* The map and node pages get more room: graphs and node cards use the width. */
 main.wide { max-width: 1640px; }
 /* Pages around big tables: enough for their columns without sideways scrolling on a laptop. */
 main.tables { max-width: 1280px; }
+
+@media (max-width: 767px) {
+  .appbar { padding: 4px 16px 4px 8px; gap: 8px; }
+  .cluster-facts { flex-wrap: nowrap; }
+  .cluster-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cluster-fact { display: none; }
+  .notices { padding: 16px 16px 0; }
+  main { padding: 24px 16px 64px; }
+}
 
 /* Headings */
 h1, h2, h3 { margin: 0; line-height: 1.2; }
@@ -234,31 +306,24 @@ a.map-node:hover .map-name { text-decoration: underline; }
 .node-wl { font-size: 12px; overflow-wrap: anywhere; }
 
 @media (max-width: 640px) {
-  .top { padding: 0 12px; gap: 12px; }
   .page-head { flex-wrap: wrap; align-items: flex-start; }
   .node-grid { grid-template-columns: minmax(0, 1fr); }
   .tally { gap: 6px 18px; }
   .tally .tally-note { margin-left: 0; flex-basis: 100%; }
   .filters label.checkbox { flex: 1 1 100%; align-self: auto; padding-bottom: 0; }
   .filter-group { flex: 1 1 100%; }
-  .brand span { display: none; }
-  main { padding: 24px 16px 64px; }
   h1 { font-size: 1.6rem; }
   .checks li { grid-template-columns: 1fr; gap: 2px; }
   .ledger-row { grid-template-columns: 20px 1fr; }
   .ledger-meta { grid-column: 2; padding: 0; }
-  .badge { display: none; }
   input, select { min-width: 0; width: 100%; }
   .filters label { flex: 1 1 140px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
-.top nav { min-width: 0; }
-.top-end .btn { white-space: nowrap; }
-@media (max-width: 640px) { .top-end .btn { padding: 6px 4px; } }
 .proc-meta { margin: 0 0 8px; }
 td.cmd { max-width: 420px; color: var(--pencil); }
 
-/* Identity menu in the top bar */
+/* Identity menu at the foot of the sidebar: it opens upwards, or beside the rail. */
 .menu { position: relative; }
 .menu > summary { list-style: none; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: var(--pencil); font-size: 13px; padding: 6px 8px; border: 1px solid transparent; border-radius: 4px; max-width: 150px; }
 .menu > summary::-webkit-details-marker { display: none; }
@@ -274,10 +339,13 @@ td.cmd { max-width: 420px; color: var(--pencil); }
 .recheck p { margin: 0; }
 .btn:disabled { opacity: 0.55; cursor: default; }
 .btn:disabled:hover { border-color: var(--rule); }
+.side-foot .menu > summary { max-width: none; width: 100%; gap: 10px; padding: 6px 8px; }
+.side-foot .menu-panel { top: auto; bottom: calc(100% + 6px); left: 0; right: auto; }
+.shell[data-layout='rail'] .side-foot .menu > summary { justify-content: center; padding: 8px 0; }
+.shell[data-layout='rail'] .side-foot .menu-user { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.shell[data-layout='rail'] .side-foot .menu-panel { left: calc(100% + 10px); bottom: 0; }
 
-/* Cluster facts under the top bar, and page-wide notices */
-.cluster-bar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; padding: 5px 24px; font-size: 13px; border-bottom: 1px solid var(--rule); background: var(--page); }
-.cluster-name { font-family: var(--mono); font-weight: 600; }
+/* Page-wide notices */
 .banner { margin-bottom: 20px; }
 .banner-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .banner ul { margin-top: 4px; }
@@ -334,18 +402,7 @@ th[aria-sort='none'] .vt-arrow { opacity: 0.35; }
 .node-rows tr.node-open > td { padding: 0 0 12px; background: var(--surface); }
 .node-rows tr.node-open .node-card { border: 0; background: transparent; }
 
-/* Ten tabs, the account menu and the theme switch: tighten up before the nav has to scroll. */
-@media (max-width: 1440px) {
-  .top { gap: 12px; padding: 0 16px; }
-  .top nav { gap: 0; }
-  .top nav a { padding-left: 7px; padding-right: 7px; }
-  .top-end { gap: 2px; }
-  .menu > summary { max-width: 130px; }
-}
 @media (max-width: 640px) {
-  .cluster-bar { padding: 5px 16px; }
-  .menu-user { display: none; }
-  .menu > summary { padding: 6px 4px; }
   .zone { margin-left: 0; }
   .group-more { margin-left: 0; }
 }

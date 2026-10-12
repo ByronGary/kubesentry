@@ -61,6 +61,16 @@ export function secondsLeft(retry: Retry, now: number): number {
   return Math.max(0, Math.ceil((retry.at - now) / 1000))
 }
 
+/**
+ * Polling pauses while the tab is hidden. On coming back, ask at once when the
+ * last answer is at least one interval old; otherwise the regular rhythm will.
+ * Nothing loaded yet means the first request is still on its way.
+ */
+export function refreshDue(loadedAt: number | undefined, now: number, intervalMs: number): boolean {
+  if (loadedAt === undefined) return false
+  return now - loadedAt >= intervalMs
+}
+
 /** "retrying in 5 s…", then "retrying now…" while the attempt is under way. */
 export function retryText(retry: Retry, now: number): string {
   const s = secondsLeft(retry, now)

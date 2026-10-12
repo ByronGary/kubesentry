@@ -1,71 +1,39 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { can, hiddenNote, visibleNav, type NavItem } from './access'
-import { setAuthSource } from './api'
-import { ClusterBar, IdentityMenu, InfoContext, NO_INFO, StatusBanners } from './components/Access'
-import { Async, Empty, Logo, PageHead } from './components/ui'
+import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
+import { can, hiddenNote } from './access'
+import { ApiError, setAuthSource } from './api'
+import { InfoContext, NO_INFO, PrometheusNotice, StatusBanners } from './components/Access'
+import { AppHeader, Sidebar, useSidebar, useTheme } from './components/Shell'
+import { Async, Empty, PageHead } from './components/ui'
+import { activeKey, groupNav, resolveRoute, type PageKey } from './nav'
 import { Activity } from './pages/Activity'
 import { Agents } from './pages/Agents'
 import { Certificates } from './pages/Certificates'
 import { Findings } from './pages/Findings'
 import { MapPage } from './pages/Map'
 import { Memory } from './pages/Memory'
+import { Nodes } from './pages/Nodes'
 import { PodDetail } from './pages/PodDetail'
 import { Pods } from './pages/Pods'
 import { Security } from './pages/Security'
 import { Storage } from './pages/Storage'
 import { Workloads } from './pages/Workloads'
 import { useRoute } from './router'
-import type { Capability, Info } from './types'
-import { useApi, type ApiState } from './useApi'
+import { prometheusOutage } from './sources'
+import type { Capability, Info, OverviewResponse } from './types'
+import { useApi, usePolled, type ApiState } from './useApi'
 
 type Flag = 'inventory' | 'certs'
 
-const NAV: NavItem[] = [
-  { href: '/', label: 'Findings' },
-  { href: '/map', label: 'Map', needs: 'inventory' },
-  { href: '/workloads', label: 'Workloads', needs: 'inventory' },
-  { href: '/pods', label: 'Pods' },
-  { href: '/memory', label: 'Memory' },
-  { href: '/storage', label: 'Storage' },
-  { href: '/security', label: 'Security', needs: 'inventory' },
-  { href: '/certificates', label: 'Certificates', needs: 'certs' },
-  { href: '/activity', label: 'Activity', cap: 'audit' },
-  // Agent status is a newer route: only servers that scope per user have it.
-  { href: '/agents', label: 'Agents', needs: 'processes', cap: 'agents', scopedOnly: true },
-]
+/** Pages built around wide tables get more room; the map and node pages get the most. */
+const TABLE_PAGES = new Set<PageKey>(['pods', 'workloads', 'storage', 'activity', 'agents'])
+const WIDE_PAGES = new Set<PageKey>(['map', 'nodes'])
 
-/** Pages built around wide tables get more room, like the map. */
-const TABLE_PAGES = new Set(['pods', 'workloads', 'storage', 'activity', 'agents'])
+/** Pages that read metrics: the Prometheus notice above them replaces the generic banner's line. */
+const METRICS_PAGES = new Set<PageKey>(['findings', 'memory', 'pod'])
+const METRICS_SOURCES = ['prometheus']
 
-/** Sources a metrics page explains in its own notice. */
-const METRICS_PAGE = ['prometheus']
-
-/** Old paths that still work. */
-const ALIAS: Record<string, string> = { volumes: 'storage' }
-
-type Theme = 'light' | 'dark' | 'auto'
-
-function useTheme(): [Theme, () => void] {
-  const [theme, setTheme] = useState<Theme>(() => {
-    try {
-      return (localStorage.getItem('kubesentry.theme') as Theme) || 'auto'
-    } catch {
-      return 'auto'
-    }
-  })
-  useEffect(() => {
-    const el = document.documentElement
-    if (theme === 'auto') el.removeAttribute('data-theme')
-    else el.setAttribute('data-theme', theme)
-    try {
-      localStorage.setItem('kubesentry.theme', theme)
-    } catch {
-      /* ignore */
-    }
-  }, [theme])
-  const next = () => setTheme((t) => (t === 'auto' ? 'dark' : t === 'dark' ? 'light' : 'auto'))
-  return [theme, next]
-}
+/** How often the sidebar badges (from /overview) refresh while the tab is visible. */
+const OVERVIEW_POLL_MS = 30_000
 
 /**
  * Waits for /api/v1/info before rendering a page that depends on it, and
@@ -118,61 +86,107 @@ export function App() {
     if (source) setAuthSource(source)
   }, [source])
 
-  const parts = route.path.split('/').filter(Boolean).map(decodeURIComponent)
-  if (parts[0] && ALIAS[parts[0]]) parts[0] = ALIAS[parts[0]]
-  let page
-  if (parts[0] === 'pods' && parts.length >= 3) page = <PodDetail key={parts[1] + '/' + parts[2]} ns={parts[1]} name={parts[2]} info={info} />
-  else if (parts[0] === 'pods') page = <Pods route={route} />
-  else if (parts[0] === 'memory') page = <Memory />
-  else if (parts[0] === 'map') page = <Gate state={infoState} title="Map" needs="inventory">{() => <MapPage route={route} />}</Gate>
-  else if (parts[0] === 'workloads') page = <Gate state={infoState} title="Workloads" needs="inventory">{() => <Workloads route={route} />}</Gate>
-  else if (parts[0] === 'storage') page = <Gate state={infoState} title="Storage">{(i) => <Storage route={route} inventory={i.inventory} />}</Gate>
-  else if (parts[0] === 'security') page = <Gate state={infoState} title="Security" needs="inventory">{() => <Security route={route} />}</Gate>
-  else if (parts[0] === 'certificates') page = <Gate state={infoState} title="Certificates" needs="certs">{() => <Certificates route={route} />}</Gate>
-  else if (parts[0] === 'activity') page = <Gate state={infoState} title="Activity" cap="audit">{(i) => <Activity route={route} info={i} />}</Gate>
-  else if (parts[0] === 'agents') page = <Gate state={infoState} title="Agents" cap="agents">{() => <Agents onMissing={() => hideRoute('/agents')} />}</Gate>
-  else page = <Findings info={info} />
-  // Pages that read metrics say "Prometheus is unavailable" themselves; the banner leaves it out there.
-  const explained = page.type === Findings || page.type === Memory || page.type === PodDetail ? METRICS_PAGE : undefined
-
-  const section = parts[0] ? '/' + parts[0] : '/'
-  // Gated tabs appear once the server says it has them and the user may use them, so there are no dead links.
-  const nav = visibleNav(NAV, info, missing)
-
-  // On a phone the nav scrolls sideways; keep the current tab in view.
-  const navRef = useRef<HTMLElement>(null)
-  const navCount = nav.length
+  // The sidebar badges come from /overview, polled while the tab is visible. An
+  // older server answers 404: then there are no badges, and it is not asked again.
+  const overviewGone = missing.has('/')
+  const overview = usePolled<OverviewResponse>(overviewGone ? null : '/api/v1/overview', OVERVIEW_POLL_MS, { retryBusy: true })
+  const notFound = overview.error instanceof ApiError && overview.error.status === 404
   useEffect(() => {
-    const el = navRef.current?.querySelector<HTMLElement>('a[aria-current="page"]')
-    const bar = navRef.current
-    if (!el || !bar || bar.scrollWidth <= bar.clientWidth) return
-    const r = el.getBoundingClientRect()
-    const b = bar.getBoundingClientRect()
-    if (r.left < b.left || r.right > b.right) bar.scrollLeft += r.left - b.left - 12
-  }, [section, navCount])
+    if (notFound) hideRoute('/')
+  }, [notFound, hideRoute])
+
+  // The Overview page is not built yet: home stays Findings.
+  const resolved = resolveRoute(route.path, route.query, { overview: false })
+  useEffect(() => {
+    if (!resolved.redirect) return
+    window.history.replaceState(null, '', resolved.redirect)
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+  }, [resolved.redirect])
+
+  const { parts } = resolved
+  let page: ReactElement
+  switch (resolved.page) {
+    case 'pod':
+      page = <PodDetail key={parts[1] + '/' + parts[2]} ns={parts[1]} name={parts[2]} info={info} />
+      break
+    case 'pods':
+      page = <Pods route={route} />
+      break
+    case 'memory':
+      page = <Memory />
+      break
+    case 'map':
+      page = <Gate state={infoState} title="Map" needs="inventory">{() => <MapPage route={route} />}</Gate>
+      break
+    case 'nodes':
+      page = <Gate state={infoState} title="Nodes" needs="inventory" cap="nodes">{() => <Nodes route={route} />}</Gate>
+      break
+    case 'workloads':
+      page = <Gate state={infoState} title="Workloads" needs="inventory">{() => <Workloads route={route} />}</Gate>
+      break
+    case 'storage':
+      page = <Gate state={infoState} title="Storage">{(i) => <Storage route={route} inventory={i.inventory} />}</Gate>
+      break
+    case 'security':
+      page = <Gate state={infoState} title="Security" needs="inventory">{() => <Security route={route} />}</Gate>
+      break
+    case 'certificates':
+      page = <Gate state={infoState} title="Certificates" needs="certs">{() => <Certificates route={route} />}</Gate>
+      break
+    case 'activity':
+      page = <Gate state={infoState} title="Activity" cap="audit">{(i) => <Activity route={route} info={i} />}</Gate>
+      break
+    case 'agents':
+      page = <Gate state={infoState} title="Agents" cap="agents">{() => <Agents onMissing={() => hideRoute('/agents')} />}</Gate>
+      break
+    default:
+      page = <Findings info={info} />
+  }
+  // Pages that read metrics get the Prometheus notice; the generic banner leaves Prometheus out there.
+  const metricsPage = METRICS_PAGES.has(resolved.page)
+  const down = prometheusOutage(info)
+
+  // Gated items appear once the server says it has them and the user may use them, so there are no dead links.
+  const sections = groupNav(info, { hidden: new Set([...missing, '/']), badges: overviewGone ? undefined : overview.data?.badges })
+  const control = useSidebar()
+  const { layout, state, dispatch } = control
+  const drawerOpen = layout === 'drawer' && state.drawerOpen
+  const menuButton = useRef<HTMLButtonElement>(null)
+
+  // Back and forward close the drawer too.
+  const hash = `${route.path}?${route.query}`
+  useEffect(() => {
+    dispatch({ type: 'closeDrawer' })
+  }, [hash, dispatch])
+
+  const frame = WIDE_PAGES.has(resolved.page) ? 'wide' : TABLE_PAGES.has(resolved.page) ? 'tables' : ''
   return (
     <InfoContext.Provider value={info}>
-      <a className="skip" href="#main">Skip to content</a>
-      <header className="top">
-        <a className="brand" href="#/"><Logo /><span>kubesentry</span></a>
-        <nav aria-label="Main" ref={navRef}>
-          {nav.map(({ href, label }) => (
-            <a key={href} href={`#${href}`} aria-current={section === href ? 'page' : undefined}>{label}</a>
-          ))}
-        </nav>
-        <div className="top-end">
-          {info.demo && <span className="badge" title="Synthetic data, not a real cluster">Demo data</span>}
-          <IdentityMenu info={info} />
-          <button className="btn quiet" onClick={cycleTheme} title="Change colour theme">
-            Theme: {theme === 'auto' ? 'system' : theme}
-          </button>
+      {/* Hash routing: following "#main" would change the page, so move focus instead. */}
+      <a
+        className="skip"
+        href="#main"
+        onClick={(e) => {
+          e.preventDefault()
+          document.getElementById('main')?.focus()
+        }}
+      >
+        Skip to content
+      </a>
+      <div className="shell" data-layout={layout}>
+        <Sidebar sections={sections} active={activeKey(resolved.page)} control={control} info={info} theme={theme} onTheme={cycleTheme} menuButton={menuButton} />
+        {drawerOpen && <div className="scrim" aria-hidden="true" onClick={() => dispatch({ type: 'closeDrawer' })} />}
+        <div className="content" inert={drawerOpen || undefined}>
+          <AppHeader info={info} layout={layout} drawerOpen={drawerOpen} onMenu={() => dispatch({ type: 'openDrawer' })} menuButton={menuButton} />
+          <div className={`notices ${frame}`}>
+            <StatusBanners info={info} explained={metricsPage ? METRICS_SOURCES : undefined} />
+            {down && (resolved.page === 'findings' || resolved.page === 'memory') && <PrometheusNotice reason={down} />}
+          </div>
+          <main id="main" tabIndex={-1} className={frame || undefined}>
+            {page}
+          </main>
         </div>
-      </header>
-      <ClusterBar info={info} />
-      <main id="main" className={parts[0] === 'map' ? 'wide' : TABLE_PAGES.has(parts[0] ?? '') && parts.length === 1 ? 'tables' : undefined}>
-        <StatusBanners info={info} explained={explained} />
-        {page}
-      </main>
+      </div>
     </InfoContext.Provider>
   )
 }

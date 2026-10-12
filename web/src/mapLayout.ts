@@ -11,7 +11,7 @@
 //    keeping the order and minimum gaps (isotonic regression), so a workload
 //    sits beside its pods rather than at the top of its column.
 
-import { podHref, workloadHref } from './findings'
+import { nodeHref, podHref, workloadHref } from './findings'
 import type { GraphEdge, GraphKind, GraphNode, Status } from './types'
 
 export interface LayoutOptions {
@@ -414,13 +414,13 @@ export function graphHref(n: MapNode, namespace: string, opts: { nodes?: boolean
   if (n.group) {
     if (n.kind === 'Pod') return `#/pods?${new URLSearchParams({ namespace: ns, ...(n.group.owner ? { q: n.group.owner } : {}) })}`
     if (n.kind === 'PVC') return `#/storage?q=${encodeURIComponent(`${ns}/`)}`
-    if (n.kind === 'Node') return canNodes ? '#/map?view=nodes' : undefined
+    if (n.kind === 'Node') return canNodes ? nodeHref() : undefined
     return undefined
   }
   if (n.kind === 'Pod') return podHref(ns, n.name)
   if (isWorkloadKind(n.kind)) return workloadHref(ns, n.name)
   if (n.kind === 'PVC') return `#/storage?q=${encodeURIComponent(`${ns}/${n.name}`)}`
-  if (n.kind === 'Node') return canNodes ? `#/map?view=nodes&node=${encodeURIComponent(n.name)}` : undefined
+  if (n.kind === 'Node') return canNodes ? nodeHref(n.name) : undefined
   return undefined
 }
 
