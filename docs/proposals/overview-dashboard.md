@@ -1,6 +1,6 @@
 # Scope: an Overview dashboard and sidebar navigation for kubesentry's React UI
 
-Status: scoping draft · 2026-10-11 · for decision. This is not implementation. It covers the Overview dashboard and moving the top tabs into a sidebar menu.
+Status: approved 2026-10-11 (see Decisions) · scoping document, not yet implemented. It covers the Overview dashboard and moving the top tabs into a sidebar menu.
 
 ## Why
 
@@ -192,9 +192,14 @@ GET /api/v1/overview?namespace=&owner=
 
 That is about 3–3.5 weeks in total. Step 2a can ship first on its own: it is useful immediately, and the Overview drops into it. It fits naturally alongside alerting phase B, and step 4 depends on it.
 
-## Decisions needed
-1. **Home page:** should Overview replace Findings as the landing page? (Recommended: yes.)
-2. **Which tiles matter most** to your team? The proposed set is nodes, pods, workloads, certificates, security, sensitive activity, cost. Drop or add any?
-3. **History source for v1:** the in-process ring buffer (recommended), or wait for Prometheus or the findings store?
-4. **Sidebar grouping:** are the sections right (Cluster, Health, Security, plus Overview and Alerts at the top)? Should Nodes become its own sidebar item, rather than a toggle inside Map?
-5. **Sequencing:** build it inside the alerting build (Overview ships with alerting phase B), or as its own small project before it?
+## Decisions (2026-10-11)
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Should Overview replace Findings as the landing page? | **Yes.** Overview is `#/`, and Findings moves to `#/findings` with a redirect |
+| 2 | Tiles | **As proposed:** nodes, pods, workloads, certificates, security, sensitive activity, cost |
+| 3 | History source for v1 | **In-process ring buffer** (24h in 5-minute buckets, per replica, lost on restart) |
+| 4 | Sidebar grouping | **As proposed:** Overview and Alerts at the top; Cluster (Map, Workloads, Pods, Nodes, Agents); Health (Findings, Memory, Storage); Security (Security, Certificates, Activity); a footer with identity and theme. Nodes becomes its own item |
+| 5 | Sequencing | **A separate build** from the alerting work. The Alerts sidebar item and the alerts widget (step 4) stay hidden until alerting phase B provides the findings store |
+
+Status: approved for build. It is scheduled as its own project, after the stress Phase 4 halt.
