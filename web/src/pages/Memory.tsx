@@ -1,4 +1,4 @@
-import { PrometheusNotice, useInfo } from '../components/Access'
+import { useInfo } from '../components/Access'
 import { Async, Empty, PageHead } from '../components/ui'
 import { podHref } from '../findings'
 import { ago, formatBytes, formatHours } from '../format'
@@ -12,7 +12,7 @@ export function Memory() {
   return (
     <>
       <PageHead title="Memory" lede="Containers killed for running out of memory, and containers whose memory only climbs." />
-      {down && <PrometheusNotice reason={down} />}
+      {/* "Prometheus is unavailable" shows in the notices above the page (App). */}
       <Async state={state} what="memory findings">
         {(d) => (
           <>

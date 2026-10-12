@@ -4,8 +4,8 @@ import { qs } from '../api'
 import { NoNamespaces, useInfo } from '../components/Access'
 import { Async, Empty, ListStatus, PageHead, StatusGlyph } from '../components/ui'
 import { VirtualTable, type Column } from '../components/VirtualTable'
-import { podHref, workloadHref } from '../findings'
-import { filterPods, reasonStatus, splitWorkload } from '../inventory'
+import { nodeHref, podHref, workloadHref } from '../findings'
+import { filterPods, podStatusFilter, reasonStatus, splitWorkload } from '../inventory'
 import { setQuery, type Route } from '../router'
 import type { PodSummary, PodsResponse } from '../types'
 import { useDebounced } from '../useApi'
@@ -23,12 +23,13 @@ export function Pods({ route }: { route: Route }) {
   const info = useInfo()
   const q = route.query.get('q') ?? ''
   const ns = route.query.get('namespace') ?? ''
-  const set = (k: 'q' | 'namespace', v: string) => setQuery('/pods', { q, namespace: ns, [k]: v })
+  const status = podStatusFilter(route.query.get('status'))
+  const set = (k: 'q' | 'namespace' | 'status', v: string) => setQuery('/pods', { q, namespace: ns, status, [k]: v })
   // The namespace filter runs on the server, so one namespace loads fast even in a huge cluster.
   const state = usePaged<PodsResponse, PodSummary>(`/api/v1/pods${qs({ namespace: ns })}`, { items, merge, refreshMs: 30_000 })
   const all = state.data?.items
   const dq = useDebounced(q)
-  const shown = useMemo(() => filterPods(all ?? [], dq), [all, dq])
+  const shown = useMemo(() => filterPods(all ?? [], dq, status), [all, dq, status])
 
   // Namespaces seen so far, so the picker keeps them while one namespace is shown.
   const [known, setKnown] = useState<string[]>([])
@@ -135,7 +136,7 @@ export function Pods({ route }: { route: Route }) {
               !p.node ? (
                 <span className="muted">-</span>
               ) : nodesOK && info.inventory ? (
-                <a className="id" href={`#/map?view=nodes&node=${encodeURIComponent(p.node)}`}>{p.node}</a>
+                <a className="id" href={nodeHref(p.node)}>{p.node}</a>
               ) : (
                 <span className="id">{p.node}</span>
               ),
@@ -160,6 +161,14 @@ export function Pods({ route }: { route: Route }) {
             {options.map((n) => <option key={n}>{n}</option>)}
           </select>
         </label>
+        <label>
+          Status
+          <select value={status} onChange={(e) => set('status', e.target.value)}>
+            <option value="">Any status</option>
+            <option value="failing">Failing</option>
+            <option value="pending">Pending</option>
+          </select>
+        </label>
       </div>
       <Async state={state} what="pods">
         {(d) =>
@@ -172,7 +181,7 @@ export function Pods({ route }: { route: Route }) {
                 state.following ? null : d.items.length === 0 ? (
                   <Empty title={ns ? `No pods in ${ns}` : 'No pods found'}>{ns ? 'Choose another namespace.' : 'The cluster reported no pods.'}</Empty>
                 ) : (
-                  <Empty title="No pods match">Clear the search or choose another namespace.</Empty>
+                  <Empty title="No pods match">{status ? 'Clear the search, pick any status or choose another namespace.' : 'Clear the search or choose another namespace.'}</Empty>
                 )
               ) : (
                 <VirtualTable
@@ -181,7 +190,7 @@ export function Pods({ route }: { route: Route }) {
                   rowKey={(p) => `${p.namespace}/${p.name}`}
                   caption="Pods, most troubled first"
                   minWidth={hasPlace ? 1040 : 640}
-                  resetKey={`${dq}|${ns}`}
+                  resetKey={`${dq}|${ns}|${status}`}
                 />
               )}
             </>

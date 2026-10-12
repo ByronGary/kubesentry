@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { BUSY_MAX_MS, busyDelayMs, isBusy, nextRetry, retryText, secondsLeft } from './retry'
+import { BUSY_MAX_MS, busyDelayMs, isBusy, nextRetry, refreshDue, retryText, secondsLeft } from './retry'
 
 describe('isBusy', () => {
   it('is a 503, with or without Retry-After', () => {
@@ -53,5 +53,13 @@ describe('retry countdown', () => {
   it('backs off on the attempt it is given', () => {
     expect(nextRetry(3, undefined, now, { random: 0 }).at).toBe(now + 20_000)
     expect(nextRetry(9, undefined, now, { random: 0, maxMs: 60_000 }).at).toBe(now + 60_000)
+  })
+})
+
+describe('refreshDue', () => {
+  it('catches up after a hidden tab only when the last answer is an interval old', () => {
+    expect(refreshDue(1_000, 31_000, 30_000)).toBe(true)
+    expect(refreshDue(1_000, 20_000, 30_000)).toBe(false)
+    expect(refreshDue(undefined, 99_000, 30_000)).toBe(false)
   })
 })

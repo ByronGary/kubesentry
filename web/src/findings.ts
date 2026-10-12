@@ -29,6 +29,11 @@ export function podHref(ns: string, pod: string): string {
   return `#/pods/${encodeURIComponent(ns)}/${encodeURIComponent(pod)}`
 }
 
+/** The Nodes page with one node opened, or the whole page. */
+export function nodeHref(node?: string): string {
+  return node ? `#/nodes?node=${encodeURIComponent(node)}` : '#/nodes'
+}
+
 /** The Workloads page filtered to one namespace and name. */
 export function workloadHref(ns: string, name: string): string {
   const p = new URLSearchParams()

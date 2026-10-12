@@ -2,6 +2,7 @@ import { useEffect, useMemo } from 'react'
 import { can } from '../access'
 import { ApiError } from '../api'
 import { useInfo } from '../components/Access'
+import { nodeHref } from '../findings'
 import { Async, Empty, PageHead, StatusGlyph } from '../components/ui'
 import { VirtualTable, type Column } from '../components/VirtualTable'
 import { ago, formatBytes, formatDateTime, plural } from '../format'
@@ -29,7 +30,7 @@ const columns = (nodesOK: boolean): Column<AgentStatus>[] => [
     sort: (a, b) => compareText(a.node, b.node),
     title: (a) => a.node,
     cell: (a) =>
-      nodesOK ? <a className="id" href={`#/map?view=nodes&node=${encodeURIComponent(a.node)}`}>{a.node}</a> : <span className="id">{a.node}</span>,
+      nodesOK ? <a className="id" href={nodeHref(a.node)}>{a.node}</a> : <span className="id">{a.node}</span>,
   },
   {
     key: 'last',

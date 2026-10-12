@@ -89,6 +89,74 @@ export function projectToLimit(
   return { from: last, to: [t, v], clipped: true }
 }
 
+// Sparklines: a small trend of counts, oldest first, drawn from a zero baseline.
+
+export interface Spark {
+  /** SVG path of the line; empty when there are fewer than two points to draw. */
+  line: string
+  /** The same line closed down to the baseline, for a light fill. */
+  area: string
+  /** Where the newest value sits, for an end dot. */
+  end?: [number, number]
+  min: number
+  max: number
+  /** The newest value. */
+  last?: number
+}
+
+const r2 = (n: number) => Math.round(n * 100) / 100
+
+/**
+ * Lay out `values` (counts, oldest first) in a width x height box, inset by
+ * `pad`. The scale starts at zero and reaches at least 1, so an all-zero
+ * series lies flat on the baseline instead of in the middle. Missing values
+ * (NaN, null) break the line.
+ */
+export function sparkline(values: readonly (number | null | undefined)[], width: number, height: number, pad = 2): Spark {
+  const finite = values.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
+  const min = finite.length ? Math.min(...finite) : 0
+  const max = finite.length ? Math.max(...finite) : 0
+  let last: number | undefined
+  for (let i = values.length - 1; i >= 0; i--) {
+    const v = values[i]
+    if (typeof v === 'number' && Number.isFinite(v)) {
+      last = v
+      break
+    }
+  }
+  if (finite.length < 2) return { line: '', area: '', min, max, last }
+  const top = Math.max(1, max)
+  const base = height - pad
+  const step = (width - 2 * pad) / (values.length - 1)
+  const x = (i: number) => r2(pad + i * step)
+  const y = (v: number) => r2(base - (Math.max(0, v) / top) * (height - 2 * pad))
+  const segments: [number, number][][] = []
+  let cur: [number, number][] = []
+  values.forEach((v, i) => {
+    if (typeof v === 'number' && Number.isFinite(v)) cur.push([x(i), y(v)])
+    else if (cur.length) {
+      segments.push(cur)
+      cur = []
+    }
+  })
+  if (cur.length) segments.push(cur)
+  const line = segments.map((s) => s.map(([px, py], i) => `${i === 0 ? 'M' : 'L'}${px},${py}`).join('')).join('')
+  const area = segments
+    .filter((s) => s.length > 1)
+    .map((s) => `M${s[0][0]},${r2(base)}${s.map(([px, py]) => `L${px},${py}`).join('')}L${s[s.length - 1][0]},${r2(base)}Z`)
+    .join('')
+  const tail = segments[segments.length - 1]
+  return { line, area, end: tail[tail.length - 1], min, max, last }
+}
+
+/** The text alternative: "unhealthy workloads, last 24h: min 0, max 4, now 2". */
+export function sparkText(label: string, values: readonly (number | null | undefined)[], span: string): string {
+  const s = sparkline(values, 1, 1, 0)
+  const head = span ? `${label}, last ${span}` : label
+  if (s.last === undefined) return `${head}: no data yet`
+  return `${head}: min ${s.min.toLocaleString('en-US')}, max ${s.max.toLocaleString('en-US')}, now ${s.last.toLocaleString('en-US')}`
+}
+
 /** Thin a series to at most `max` points for a table view, always keeping the newest. */
 export function thin(series: Point[], max: number): Point[] {
   if (series.length <= max) return series

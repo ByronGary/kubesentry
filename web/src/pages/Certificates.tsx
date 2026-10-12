@@ -2,7 +2,7 @@ import { can, hiddenNote } from '../access'
 import { useInfo } from '../components/Access'
 import { Async, Empty, PageHead, slashBreaks, StatusGlyph } from '../components/ui'
 import { ago, formatDateTime, formatExpiry, formatHours, hoursUntil, plural } from '../format'
-import { matches } from '../inventory'
+import { matches, statusMatches } from '../inventory'
 import { setQuery, type Route } from '../router'
 import type { CertificatesResponse, CertSummary, RequestSummary } from '../types'
 import { useApi } from '../useApi'
@@ -40,6 +40,9 @@ function requestState(r: RequestSummary): string {
 
 export function Certificates({ route }: { route: Route }) {
   const q = route.query.get('q') ?? ''
+  // "unhealthy" (critical or warning) is what the Overview and the sidebar badge count.
+  const status = route.query.get('status') === 'unhealthy' ? 'unhealthy' : ''
+  const set = (k: 'q' | 'status', v: string) => setQuery('/certificates', { q, status, [k]: v })
   const state = useApi<CertificatesResponse>('/api/v1/certificates', 60_000)
   // ClusterIssuers need cluster-wide access; without it the server sends names only, which this page hides.
   const clusterIssuersOK = can(useInfo(), 'clusterIssuers')
@@ -56,18 +59,30 @@ export function Certificates({ route }: { route: Route }) {
               </Empty>
             )
           }
-          const certs = (d.certificates ?? []).filter((c) => matches(q, `${c.namespace}/${c.name}`, c.secretName, `${c.issuerKind}/${c.issuerName}`, ...(c.dnsNames ?? [])))
+          const certs = (d.certificates ?? []).filter(
+            (c) => statusMatches(status, c.status) && matches(q, `${c.namespace}/${c.name}`, c.secretName, `${c.issuerKind}/${c.issuerName}`, ...(c.dnsNames ?? [])),
+          )
           const issuers = (d.issuers ?? []).filter(
-            (i) => (clusterIssuersOK || i.kind !== 'ClusterIssuer') && matches(q, i.namespace ? `${i.namespace}/${i.name}` : i.name, i.kind, i.type, i.server),
+            (i) =>
+              (clusterIssuersOK || i.kind !== 'ClusterIssuer') &&
+              statusMatches(status, i.status) &&
+              matches(q, i.namespace ? `${i.namespace}/${i.name}` : i.name, i.kind, i.type, i.server),
           )
           const requests = (d.requests ?? []).filter((r) => matches(q, `${r.namespace}/${r.name}`, r.certificate, r.issuerName))
-          const none = q ? 'Nothing matches the search' : undefined
+          const none = q || status ? 'Nothing matches the filters' : undefined
           return (
             <>
               <div className="filters">
                 <label>
                   Search
-                  <input type="search" value={q} onChange={(e) => setQuery('/certificates', { q: e.target.value })} placeholder="Name, DNS name or issuer" />
+                  <input type="search" value={q} onChange={(e) => set('q', e.target.value)} placeholder="Name, DNS name or issuer" />
+                </label>
+                <label>
+                  Status
+                  <select value={status} onChange={(e) => set('status', e.target.value)}>
+                    <option value="">Any status</option>
+                    <option value="unhealthy">Critical or warning</option>
+                  </select>
                 </label>
               </div>
 
