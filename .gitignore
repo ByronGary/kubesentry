@@ -13,3 +13,4 @@ test/stress/results/
 *.out
 *.prof
 __pycache__/
+scratchpad/
