@@ -16,6 +16,7 @@ import {
   scopeText,
   tiles,
   wasteLines,
+  type AttentionRow,
   type OverviewFilter,
   type Tile,
 } from '../overview'
@@ -112,66 +113,75 @@ function Body({ o, filter }: { o: OverviewResponse; filter: OverviewFilter }) {
         ))}
       </div>
 
+      {/* Two columns as in the wireframe (attention and activity; capacity and cost), so a long list leaves no gap. */}
       <div className="ov-grid">
-        <section className="panel ov-attention" aria-labelledby="h-attention">
-          <div className="panel-head">
-            <h2 id="h-attention">Needs attention</h2>
-            <span className="muted small">worst first</span>
-          </div>
-          {rows.length === 0 ? (
-            <p className="ov-calm">
-              <StatusGlyph status="ok" decorative /> Nothing needs attention right now.
-            </p>
-          ) : (
-            <ol className="ov-list">
-              {rows.map((r) => {
-                const body = (
-                  <>
-                    <span className="ov-row-head">
-                      <StatusGlyph status={r.severity} />
-                      <span className="tag">{r.kind}</span>
-                      <span className="ov-subject">{r.subject}</span>
-                    </span>
-                    <span className="ov-title">{r.title}</span>
-                    {(r.owner || r.age) && (
-                      <span className="ov-meta">
-                        {r.owner && <>owner {r.owner}</>}
-                        {r.owner && r.age && ' · '}
-                        {r.age && <>started {r.age}</>}
-                      </span>
-                    )}
-                  </>
-                )
-                return (
-                  <li key={r.key}>
-                    {r.href ? (
-                      <a className="ov-row" href={r.href}>
-                        {body}
-                      </a>
-                    ) : (
-                      <div className="ov-row">{body}</div>
-                    )}
-                  </li>
-                )
-              })}
-            </ol>
-          )}
-          <p className="panel-more">
-            <a href="#/findings">See everything in Findings</a>
-          </p>
-        </section>
-
-        {o.nodes && <Capacity nodes={o.nodes} />}
-        {o.activity && <Activity a={o.activity} />}
-
-        <section className="panel" aria-labelledby="h-waste">
-          <div className="panel-head">
-            <h2 id="h-waste">Cost and waste</h2>
-          </div>
-          <Waste w={o.waste} />
-        </section>
+        <div className="ov-col">
+          <Attention rows={rows} />
+          {o.activity && <Activity a={o.activity} />}
+        </div>
+        <div className="ov-col">
+          {o.nodes && <Capacity nodes={o.nodes} />}
+          <section className="panel" aria-labelledby="h-waste">
+            <div className="panel-head">
+              <h2 id="h-waste">Cost and waste</h2>
+            </div>
+            <Waste w={o.waste} />
+          </section>
+        </div>
       </div>
     </>
+  )
+}
+
+function Attention({ rows }: { rows: AttentionRow[] }) {
+  return (
+    <section className="panel ov-attention" aria-labelledby="h-attention">
+      <div className="panel-head">
+        <h2 id="h-attention">Needs attention</h2>
+        <span className="muted small">worst first</span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="ov-calm">
+          <StatusGlyph status="ok" decorative /> Nothing needs attention right now.
+        </p>
+      ) : (
+        <ol className="ov-list">
+          {rows.map((r) => {
+            const body = (
+              <>
+                <span className="ov-row-head">
+                  <StatusGlyph status={r.severity} />
+                  <span className="tag">{r.kind}</span>
+                  <span className="ov-subject">{r.subject}</span>
+                </span>
+                <span className="ov-title">{r.title}</span>
+                {(r.owner || r.age) && (
+                  <span className="ov-meta">
+                    {r.owner && <>owner {r.owner}</>}
+                    {r.owner && r.age && ' · '}
+                    {r.age && <>started {r.age}</>}
+                  </span>
+                )}
+              </>
+            )
+            return (
+              <li key={r.key}>
+                {r.href ? (
+                  <a className="ov-row" href={r.href}>
+                    {body}
+                  </a>
+                ) : (
+                  <div className="ov-row">{body}</div>
+                )}
+              </li>
+            )
+          })}
+        </ol>
+      )}
+      <p className="panel-more">
+        <a href="#/findings">See everything in Findings</a>
+      </p>
+    </section>
   )
 }
 

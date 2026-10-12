@@ -435,6 +435,7 @@ section.tile, section.panel { margin-top: 0; }
 .spark-cap { font-size: 12px; color: var(--pencil); }
 
 .ov-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; margin-top: 16px; align-items: start; }
+.ov-col { min-width: 0; display: grid; gap: 16px; align-content: start; }
 .panel { min-width: 0; padding: 14px 16px; background: var(--surface); border: 1px solid var(--rule); border-radius: 6px; }
 .panel-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; margin-bottom: 10px; }
 .panel-sub { margin: 14px 0 6px; font-size: 13px; color: var(--pencil); }

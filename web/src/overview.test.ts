@@ -203,6 +203,7 @@ describe('attentionRows', () => {
   })
   it('labels unknown kinds from their id', () => {
     expect(kindLabel('cert-expiring')).toBe('Certificate')
+    expect(kindLabel('rbac')).toBe('RBAC')
     expect(kindLabel('host_path')).toBe('Host path')
     expect(kindLabel('')).toBe('Finding')
   })

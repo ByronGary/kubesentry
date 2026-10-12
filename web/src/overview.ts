@@ -243,7 +243,7 @@ export function tiles(o: OverviewResponse, f: OverviewFilter = { namespace: '', 
     const c = o.certificates
     const href = link('certificates', { status: 'unhealthy' })
     const cLines: TileLine[] = [
-      { key: 'expiringSoon', count: c.expiringSoon, text: 'expire within 14 days', status: flag(c.expiringSoon, 'warn'), href },
+      { key: 'expiringSoon', count: c.expiringSoon, text: 'expire within 14d', status: flag(c.expiringSoon, 'warn'), href },
       { key: 'notReady', count: c.notReady, text: 'not ready', status: flag(c.notReady, 'crit'), href },
     ]
     if (c.issuerMissing > 0) cLines.push({ key: 'issuerMissing', count: c.issuerMissing, text: 'issuer missing', status: 'crit', href })
@@ -299,6 +299,10 @@ const KIND_LABEL: Record<string, string> = {
   exposure: 'Exposure',
   node: 'Node',
   'unused-pvc': 'Unused volume',
+  rbac: 'RBAC',
+  'cluster-admin': 'RBAC',
+  'wildcard-rbac': 'RBAC',
+  'psa-missing': 'Pod Security',
 }
 
 /** A label for the check that raised an item: known ones by name, others from their id ("pod-security" → "Pod security"). */
