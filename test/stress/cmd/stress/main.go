@@ -101,6 +101,10 @@ func main() {
 		err = cmdCWFake(ctx, args)
 	case "verify-cloudwatch":
 		err = cmdVerifyCloudWatch(ctx, args)
+	case "server-metrics":
+		err = cmdServerMetrics(ctx, args)
+	case "soak-report":
+		err = cmdSoakReport(ctx, args)
 	default:
 		usage()
 	}
@@ -261,6 +265,7 @@ func cmdVerify(ctx context.Context, args []string) error {
 	var c common
 	c.register(fs, 50, 100)
 	mapNS := fs.Int("map-namespaces", 40, "generated namespaces to map besides stress-* (-1: all)")
+	name := fs.String("name", "assoc", "result file name (assoc.json, assoc.md)")
 	_ = fs.Parse(args)
 	cl, err := c.kube.Connect()
 	if err != nil {
@@ -270,10 +275,10 @@ func cmdVerify(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := out.WriteJSON(c.outDir, "assoc.json", res); err != nil {
+	if err := out.WriteJSON(c.outDir, *name+".json", res); err != nil {
 		return err
 	}
-	if err := out.WriteText(c.outDir, "assoc.md", res.Markdown()); err != nil {
+	if err := out.WriteText(c.outDir, *name+".md", res.Markdown()); err != nil {
 		return err
 	}
 	for k, s := range res.Summary {
@@ -368,6 +373,7 @@ func cmdUsers(ctx context.Context, args []string) error {
 		}
 		opts.Identities = func(i int) ks.Identity { return ids[i%len(ids)] }
 		opts.Scope = func(i int) map[string]bool { return scopes[i%len(scopes)] }
+		opts.Kind = func(i int) string { return ps[i%len(ps)].Kind }
 		out.Logf("users: %d personas (JWT through oauth2-proxy)", len(ps))
 	} else {
 		// One shared token, as the baseline has.
@@ -431,6 +437,7 @@ func cmdAudit(ctx context.Context, args []string) error {
 	conc := fs.Int("query-concurrency", 5, "concurrent queries")
 	maxRun := fs.Duration("max-run", 20*time.Minute, "stop sending after this long")
 	name := fs.String("name", "audit", "result file name (audit.json)")
+	readerIDs := fs.Int("query-identities", 10, "with --auth=jwt: admin identities the queries after ingest rotate through")
 	_ = fs.Parse(args)
 	cl, err := c.kube.Connect()
 	if err != nil {
@@ -441,9 +448,19 @@ func cmdAudit(ctx context.Context, args []string) error {
 		return err
 	}
 	p := plan.Build(l)
+	// Queries after ingest come from several admin identities (as many
+	// users would), so the per-identity rate limit does not throttle them.
+	var readers []ks.Identity
+	if c.auth == "jwt" {
+		for i := 0; i < *readerIDs; i++ {
+			if id, err := c.jwt(ctx, cl, fmt.Sprintf("audit-reader-%d@corp.example", i), []string{personas.GroupAdmins}); err == nil {
+				readers = append(readers, id)
+			}
+		}
+	}
 	res := firehose.Run(ctx, firehose.Options{
 		Client: c.client(64), Ingest: c.ingestClient(64), AuditID: ks.Bearer{Label: "audit", Token: c.token(ctx, cl, c.auditToken, "KUBESENTRY_AUDIT_TOKEN", "kubesentry-audit")},
-		APIID: c.apiID(ctx, cl),
+		APIID: c.apiID(ctx, cl), APIIDs: readers,
 		Total: *events, Rate: *rate, BatchSize: *batch, Workers: *workers, Namespaces: p.Stats.TeamNamespaces,
 		QueryReps: *reps, QueryConc: *conc, Seed: plan.Seed, Timeout: c.timeout, MaxRun: *maxRun,
 	})

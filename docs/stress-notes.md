@@ -82,8 +82,70 @@ Full write-up: `test/stress/results/after-L3/checkpoint-d.md`.
 - a possibly stale CloudWatch lag gauge after the lock is lost
 - a Prometheus outage doesn't show in `/readyz` or `/info`
 
-### After: full L3 run (Phase 4)
-*Next.* It covers the 2,000-user ramp, a 2h soak at 500 users, every chaos scenario, and the baseline-vs-after report.
+### After: full L3 run, Phase 4 / checkpoint E (2026-10-11 to 2026-10-12): 7 of 12 targets met
+Generated reports, which stay local: `test/stress/results/after-summary.md`, `comparison.md` and `cautions-phase4/cautions.md`.
+
+| Measure | Baseline (L3) | After (L3) |
+|---|---|---|
+| Highest passing users stage | 0 | **1,000**. 2,000 aborted at 47% errors with chart defaults; it passes with `authzDenyTTL: 5m` once logins settle |
+| 500 users, worst list route p95 / p99 | unreachable | **14 / 23 ms** (admins 23 / 33 ms), 0% errors |
+| kubesentry → API server | about 5/s of throttled LISTs | **0 LISTs**. SubjectAccessReviews grow from 1.7 to 399/s between 10 and 2,000 users |
+| OOMs and restarts | 10 OOM kills | **0** |
+| Association | 29/42 tricky cases | **42/42**, 100% on every relation |
+| Authorization leaks | n/a (one shared token) | **0** in every run, including during a 2,000-RoleBinding storm |
+| 1M webhook events | 3,003/s, but the store held only 50k | **404 s**, all stored |
+| 500-agent surge | 57% accepted, OOM | **96.7%**, with the remainder cut off by the end of the run rather than refused. No OOM, 100/100 pods fresh |
+| 2h soak at 500 users | unreachable | 629,653 requests, 0.66% errors (audit routes only), 0 restarts |
+| Chaos | not run | 11 of 15 pass outright (below) |
+
+**Acceptance targets:**
+
+| Target | Result | Met? |
+|---|---|---|
+| Admin list views at 2,000 users: p95 < 300 ms, p99 < 1 s | p95 17.7 s with chart defaults. With a 5m deny TTL, p99 per 30 s window is 14–27 ms once logins settle | No |
+| Pod page p95 < 1.5 s at 2,000 users | 13.4 s with chart defaults (8 ms at 500 users) | No |
+| Audit queries p95 < 500 ms | Event queries met over 7.6M rows. Summaries: 8.2 s cold, and the 24h summary never answers at about 16M rows/day | No |
+| Snapshot age p99 < 15 s | 16 s in the soak. The age counts quiet time (bug 3); changes still show within seconds | No as measured; freshness yes |
+| RSS < 800 MiB per replica | 869 MiB at 2,000 users; 889 MiB in the soak and rising | No |
+| kubesentry's API request rate flat as users grow | Reads flat (0 LISTs); reviews grow with users | Partly |
+| Association 100% | 42/42 | **Yes** |
+| 0 authorization leaks | 0 | **Yes** |
+| 1M webhook events in under 10 min | 404 s | **Yes** |
+| CloudWatch lag < 60 s | 18 s idle, 57 s during the 1M firehose, 67–70 s under sustained ingest | **Yes** (except under sustained ingest) |
+| No lost or duplicated events (Postgres outage, lock moves) | 0 / 0 in every check, including 18M tail events | **Yes** |
+| Agent surge: no OOM, no data loss | no OOM, 100/100 fresh | **Yes** |
+
+**Chaos (after build, L3):**
+- **Pass:**
+  - spoofed headers and oversized payloads
+  - the RBAC storm (2,000 RoleBindings): 0 leaks; a revocation is visible at once, a new grant after 60 s (deny TTL)
+  - the 1,000-replica rolling update: views agree 3 s later
+  - deleting a namespace with 2,000 pods: views empty 2 s after the API server
+  - API server restart
+  - Postgres down 2 min: 0 lost, 0 duplicated
+  - killing the CloudWatch leader: the lock moves in 2.7 s, or 29 s to the standby alone
+  - a cold restart of both replicas under 500 users: Ready in 8 s, with a 5 s serving gap
+  - Prometheus down and up
+- **Worker stop and drain:** kubesentry tracked node state exactly as the API server did. Both fail only on snapshot age (bug 3), and the drain also on the harness's own deliberately stuck pod.
+- **Pod churn at 50/s:** **not measurable here.** The host went into swap in 3 attempts. kubesentry answered every probe, but the numbers reflect the laptop.
+
+**kubesentry bugs found in Phase 4 (not fixed yet):**
+1. **The authorization budget saturates at 1,000–2,000 distinct users while CPU stays low.**
+   - The chart sets `authzDenyTTL: 1m` (`charts/kubesentry/values.yaml:257`), against the server's own 5m default and the contract.
+   - Every `/info` poll reviews all capabilities (`internal/auth/authz.go:462`).
+   - At 2,000 users that is about 400 reviews/s across both replicas, 85% of them denials, with kubesentry at 0.54 cores or less and oauth2-proxy at 0.23 cores or less.
+   - With a 5m deny TTL the rate is about 207/s with 0 errors once logins settle, but each new login still costs about 20 reviews.
+2. **The 24h audit summary does not scale.** It scans the whole window (`internal/pgstore/query.go:248`): 16M rows and 12.5 GB of buffers take 11.2 s, so it hits the 10 s query timeout and returns 503. Fix direction: an hourly rollup table.
+3. **Snapshot age counts quiet time.** The view only rebuilds on change (`internal/snapshot/manager.go`), but `/info` reports the time since the last rebuild. In a quiet cluster the UI's "API server may be unreachable" banner and the chart's stale alert can fire falsely.
+4. **Memory rises during long runs and doesn't come back.** RSS went from about 700 to 820 MiB (max 889) over the 2h soak, and the heap from 450 to 520 MiB, still about 515 MiB after 13 idle hours. Goroutines stayed flat. The cause is unknown; needs heap profiles from `:9090/debug/pprof/heap`.
+5. **Sustained ingest of 600 events/s** pushed Postgres to 4.2–4.9 cores, filled the audit queue to its 50k cap, raised CloudWatch lag to 67–70 s, and moved the reader lock 9 times in 15 minutes. No data was lost.
+
+**Phase 4 cautions (230 snapshots):**
+- Node disk I/O saturation during the soak.
+- Memory major-fault alerts during churn, with real nodes down to 4% memory available.
+- API server read p99 up to 1.6 s, plus error-budget burn during churn.
+- Transient watch failures at the restarts.
+- kubesentry's own Postgres-errors and CloudWatch-lag alerts went pending, which is correct behaviour. The agents-dropped alert fired after the simulated agents stopped, as expected.
 
 ## Cautions and critical alerts across the cluster (baseline, 20 snapshots, 16:49–18:30 UTC)
 Full table: `test/stress/results/cautions-baseline/cautions.md`.

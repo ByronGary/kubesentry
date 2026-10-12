@@ -103,7 +103,8 @@ type Report struct {
 	Agents        map[string]*agents.Result   `json:"agents,omitempty"`
 	KubesentryMem []Point                     `json:"kubesentryMemMiB"`
 	OOMQuery      *OOMQuery                   `json:"oomQuery,omitempty"`
-	Errors        []string                    `json:"errors,omitempty"`
+	Extras
+	Errors []string `json:"errors,omitempty"`
 }
 
 // OOMQuery sizes the Prometheus answer behind /api/v1/oom?window=24h.
@@ -196,6 +197,7 @@ func Build(ctx context.Context, cs kubernetes.Interface, o Options) (*Report, er
 			r.Agents[strings.TrimSuffix(filepath.Base(f), ".json")] = &ag
 		}
 	}
+	r.Extras = loadExtras(o.Dir, &r.Errors)
 	if len(steps) == 0 {
 		return r, nil
 	}
@@ -252,9 +254,26 @@ func Build(ctx context.Context, cs kubernetes.Interface, o Options) (*Report, er
 		r.OOMQuery = oq
 	}
 
+	// Steps can repeat (e.g. two users ramps): key each run of a step.
+	keys := make([]string, len(steps))
+	seen := map[string]int{}
 	windows := map[string][2]time.Time{}
-	for _, s := range steps {
-		windows[s.Name] = [2]time.Time{s.Start, s.End}
+	for i, s := range steps {
+		seen[s.Name]++
+		keys[i] = s.Name
+		if seen[s.Name] > 1 {
+			keys[i] = fmt.Sprintf("%s#%d", s.Name, seen[s.Name])
+		}
+		windows[keys[i]] = [2]time.Time{s.Start, s.End}
+	}
+	// Prometheus keeps 6h and the Prometheus chaos scenario wipes it: keep
+	// what an earlier report measured for a step when it has more samples.
+	var prev Report
+	prevSteps := map[string]StepReport{}
+	if out.ReadJSON(filepath.Join(o.Dir, "report.json"), &prev) == nil {
+		for _, ps := range prev.Steps {
+			prevSteps[ps.Name+"@"+ps.Start.Format(time.RFC3339)] = ps
+		}
 	}
 	var loads map[string]*APILoad
 	if !o.SkipAudit && o.ControlPlane != "" {
@@ -263,7 +282,7 @@ func Build(ctx context.Context, cs kubernetes.Interface, o Options) (*Report, er
 			r.Errors = append(r.Errors, "audit log: "+err.Error())
 		}
 	}
-	for _, s := range steps {
+	for i, s := range steps {
 		sr := StepReport{Step: s, Seconds: s.End.Sub(s.Start).Seconds(), Usage: map[string]Usage{}}
 		for name := range components {
 			sr.Usage[name] = Usage{MemMiB: StatOf(mem[name], s.Start, s.End), CPU: StatOf(cpu[name], s.Start, s.End)}
@@ -274,9 +293,17 @@ func Build(ctx context.Context, cs kubernetes.Interface, o Options) (*Report, er
 			sr.Restarts = s.RestartsEnd
 		}
 		if loads != nil {
-			sr.KubesentryAPI = loads[s.Name]
+			sr.KubesentryAPI = loads[keys[i]]
 		}
 		sr.HostAvailMinMiB = guardMin(guard, s.Start, s.End)
+		if ps, ok := prevSteps[s.Name+"@"+s.Start.Format(time.RFC3339)]; ok {
+			if ps.Usage["kubesentry"].MemMiB.N > sr.Usage["kubesentry"].MemMiB.N {
+				sr.Usage, sr.APIServerRPS = ps.Usage, ps.APIServerRPS
+			}
+			if sr.KubesentryAPI == nil || (ps.KubesentryAPI != nil && ps.KubesentryAPI.Requests > sr.KubesentryAPI.Requests) {
+				sr.KubesentryAPI = ps.KubesentryAPI
+			}
+		}
 		r.Steps = append(r.Steps, sr)
 	}
 	return r, nil
@@ -552,6 +579,7 @@ func (r *Report) Markdown() string {
 		}
 		b.WriteString("\n")
 	}
+	r.Extras.markdown(&b)
 	if len(r.Errors) > 0 {
 		fmt.Fprintf(&b, "## Collection errors\n\n")
 		for _, e := range r.Errors {

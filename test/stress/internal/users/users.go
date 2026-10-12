@@ -25,6 +25,9 @@ type Options struct {
 	// Scope, if set, limits user i's pod and map targets to these namespaces
 	// (nil: all), so team members open their own pods.
 	Scope func(i int) map[string]bool
+	// Kind, if set, names user i's persona kind; each stage also reports
+	// the routes per kind (e.g. what admins, who see everything, get).
+	Kind func(i int) string
 	// InfoEvery polls /api/v1/info for the whole session (the new UI: 30s);
 	// 0 fetches it once, as the baseline UI did.
 	InfoEvery   time.Duration
@@ -55,6 +58,13 @@ type StageResult struct {
 	Reason    string             `json:"reason,omitempty"`
 	Requests  int64              `json:"requests"`
 	RPS       float64            `json:"rps"`
+	// SnapshotAge is the snapshot age every /info answer reported during the
+	// stage, in ms (what users saw; the target is p99 < 15s).
+	SnapshotAge hist.Summary `json:"snapshotAgeMs"`
+	// SnapshotStale counts /info answers that said stale.
+	SnapshotStale int64 `json:"snapshotStale"`
+	// ByKind is Routes per persona kind (with Options.Kind).
+	ByKind map[string][]hist.RouteReport `json:"byKind,omitempty"`
 }
 
 // Result is users.json.
@@ -85,6 +95,9 @@ type runner struct {
 	o        Options
 	stage    atomic.Pointer[hist.Recorder]
 	pages    atomic.Pointer[hist.Recorder]
+	snapAge  atomic.Pointer[hist.Hist]
+	byKind   atomic.Pointer[sync.Map] // kind → *hist.Recorder for the stage
+	stale    atomic.Int64
 	all      *hist.Recorder
 	active   atomic.Int64
 	inflight sync.Map // *int64 start nanos
@@ -108,9 +121,13 @@ func Run(ctx context.Context, o Options) *Result {
 	var wg sync.WaitGroup
 	started := 0
 	for _, st := range o.Stages {
-		rec, pageRec := hist.NewRecorder(), hist.NewRecorder()
+		rec, pageRec, ages := hist.NewRecorder(), hist.NewRecorder(), hist.New()
 		r.stage.Store(rec)
 		r.pages.Store(pageRec)
+		r.snapAge.Store(ages)
+		r.stale.Store(0)
+		kinds := &sync.Map{}
+		r.byKind.Store(kinds)
 		sr := StageResult{Users: st.Users, Started: time.Now().UTC()}
 		out.Logf("users: stage %d users (hold %s)", st.Users, st.Hold)
 		add := st.Users - started
@@ -137,6 +154,14 @@ func Run(ctx context.Context, o Options) *Result {
 			sr.Requests += rt.Requests
 		}
 		sr.RPS = float64(sr.Requests) / sr.Seconds
+		sr.SnapshotAge, sr.SnapshotStale = ages.Summarize(), r.stale.Load()
+		kinds.Range(func(k, v any) bool {
+			if sr.ByKind == nil {
+				sr.ByKind = map[string][]hist.RouteReport{}
+			}
+			sr.ByKind[k.(string)] = v.(*hist.Recorder).Report()
+			return true
+		})
 		if reason != "" {
 			sr.Aborted, sr.Reason = true, reason
 			res.Aborted, res.Reason = true, fmt.Sprintf("stage %d users: %s", st.Users, reason)
@@ -155,7 +180,8 @@ func Run(ctx context.Context, o Options) *Result {
 }
 
 func logStage(s StageResult) {
-	out.Logf("users: stage %d users done: %d requests (%.1f/s)%s", s.Users, s.Requests, s.RPS, map[bool]string{true: " ABORTED: " + s.Reason, false: ""}[s.Aborted])
+	out.Logf("users: stage %d users done: %d requests (%.1f/s)%s; snapshot age p50 %.1fs p99 %.1fs max %.1fs (%d answers, %d stale)", s.Users, s.Requests, s.RPS,
+		map[bool]string{true: " ABORTED: " + s.Reason, false: ""}[s.Aborted], s.SnapshotAge.P50/1000, s.SnapshotAge.P99/1000, s.SnapshotAge.Max/1000, s.SnapshotAge.Count, s.SnapshotStale)
 	for _, rt := range s.Routes {
 		out.Logf("  %-14s n=%-6d p50=%8.0fms p95=%8.0fms p99=%8.0fms max=%8.0fms err=%.1f%% timeouts=%d aborted=%d status=%v",
 			rt.Route, rt.Requests, rt.All.P50, rt.All.P95, rt.All.P99, rt.All.Max, 100*rt.ErrorRate, rt.Timeouts, rt.Aborted, rt.Status)
@@ -210,6 +236,25 @@ func (r *runner) stuck(older time.Duration) int {
 	return n
 }
 
+// noteSnapshot records the snapshot age an /info answer reports.
+func (r *runner) noteSnapshot(body []byte) {
+	var v struct {
+		Snapshot *struct {
+			AgeSeconds float64 `json:"ageSeconds"`
+			Stale      bool    `json:"stale"`
+		} `json:"snapshot"`
+	}
+	if json.Unmarshal(body, &v) != nil || v.Snapshot == nil {
+		return
+	}
+	if h := r.snapAge.Load(); h != nil {
+		h.Add(v.Snapshot.AgeSeconds * 1000)
+	}
+	if v.Snapshot.Stale {
+		r.stale.Add(1)
+	}
+}
+
 var reqSeq atomic.Int64
 
 // errSuperseded cancels a request that the hook's next poll replaces.
@@ -238,6 +283,12 @@ func (r *runner) requestBody(ctx context.Context, id ks.Identity, route, path st
 	}
 	r.stage.Load().Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
 	r.all.Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
+	if kind, _ := ctx.Value(kindKey{}).(string); kind != "" {
+		if m := r.byKind.Load(); m != nil {
+			v, _ := m.LoadOrStore(kind, hist.NewRecorder())
+			v.(*hist.Recorder).Record(route, resp.Status, resp.Bytes, resp.Elapsed, outcome, resp.Err)
+		}
+	}
 	return outcome, resp.Body
 }
 
@@ -277,8 +328,13 @@ func (r *runner) fetch(ctx context.Context, id ks.Identity, h Hook) (hist.Outcom
 	}
 }
 
+type kindKey struct{}
+
 // user is one virtual user's session.
 func (r *runner) user(ctx context.Context, n int) {
+	if r.o.Kind != nil {
+		ctx = context.WithValue(ctx, kindKey{}, r.o.Kind(n))
+	}
 	r.active.Add(1)
 	defer r.active.Add(-1)
 	rnd := rand.New(rand.NewPCG(r.o.Seed, uint64(n)))
@@ -296,6 +352,7 @@ func (r *runner) user(ctx context.Context, n int) {
 			Processes    bool            `json:"processes"`
 			Capabilities map[string]bool `json:"capabilities"`
 		}
+		r.noteSnapshot(body)
 		if json.Unmarshal(body, &info) == nil {
 			caps["audit"], caps["processes"] = info.Audit, info.Processes
 			if info.Capabilities != nil {
@@ -313,7 +370,9 @@ func (r *runner) user(ctx context.Context, n int) {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					r.request(ctx, id, "info", "/api/v1/info")
+					if oc, body := r.requestBody(ctx, id, "info", "/api/v1/info", true); oc == hist.OK {
+						r.noteSnapshot(body)
+					}
 				}
 			}
 		}()

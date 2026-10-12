@@ -13,10 +13,23 @@
 # chaos (the smoke set, host side). It also runs hack/cluster-cautions.py for
 # the whole level into results/cautions-<variant>/ (CAUTIONS=0 to skip).
 #
+# Phase 4 (after) adds the steps soak (users, firehose and agents together for
+# SOAK_FOR, with a Postgres sampler and soak-report), storm (the RBAC storm with
+# verify authz running during and after) and coldrestart (both replicas deleted
+# under 500 users). After users, audit, agents and chaos steps it records
+# server-side metrics (stress server-metrics) while Prometheus still has them.
+#
 # Env:
-#   STEPS          steps to run (default: gen verify conn users audit agents report;
-#                  after: gen verify authz conn cloudwatch users audit agents chaos report)
-#   CHAOS_SCENARIOS (after) spoof,oversize,prometheus,postgres,apiserver,killreplica,standby
+#   STEPS          steps to run, in this order (default: gen verify conn users audit agents report;
+#                  after: gen verify authz conn users audit cloudwatch agents chaos report;
+#                  also: soak storm coldrestart)
+#   CHAOS_SCENARIOS (after) spoof,oversize,prometheus,postgres,apiserver,killreplica,standby;
+#                  Phase 4 adds workerstop,drain,churn,rollout,nsdelete (rbacstorm and
+#                  coldrestart run as their own steps)
+#   CHAOS_NAME     result name for the chaos step (chaos-<name>.json; default chaos.json)
+#   VERIFY_NAME    result names for verify and authz (assoc-<name>.json, authz-<name>.json)
+#   SOAK_FOR       soak duration (2h), SOAK_USERS (500), SOAK_AUDIT_RATE (300/s)
+#   USERS_PERSONAS (after) distinct JWT identities the virtual users cycle through (2000)
 #   TOP_LEVEL      highest level for "all" (default L3; L4 is defined but was not run)
 #   USERS_STAGES   ramp (default 10:3m,50:3m,200:5m,500:5m,1000:5m,2000:5m)
 #   USERS_1GI      1: at L2 and above, repeat the users ramp with a 1Gi memory limit (default 1)
@@ -32,13 +45,15 @@ LEVEL=${1:-all}
 VARIANT=${2:-baseline}
 TOP_LEVEL=${TOP_LEVEL:-L3}
 if [ "$VARIANT" = after ]; then
-  STEPS=${STEPS:-gen verify authz conn cloudwatch users audit agents chaos report}
+  STEPS=${STEPS:-gen verify authz conn users audit cloudwatch agents chaos report}
   USERS_1GI=${USERS_1GI:-0}
   AUDIT_1GI=${AUDIT_1GI:-0}
   SHIPPED_LIMIT=${SHIPPED_LIMIT:-1Gi}
   KS=(--base http://kubesentry.kubesentry.svc:4180 --auth jwt --ingest http://kubesentry-ingest.kubesentry.svc:8081)
   CONN_EXTRA=(--kubesentry-svc kubesentry.kubesentry.svc.cluster.local:4180 --ops http://kubesentry-ops.kubesentry.svc:9090)
-  USERS_EXTRA=(--ui after --level "${1:-L3}")
+  # Every virtual user is a distinct identity (persona i; the 5/15/80 mix),
+  # so authorization reviews and their cache scale as with real users.
+  USERS_EXTRA=(--ui after --level "${1:-L3}" --personas "${USERS_PERSONAS:-2000}")
   AGENTS_EXTRA=(--fanout kubesentry-ingest-headless.kubesentry.svc --gzip)
 else
   STEPS=${STEPS:-gen verify conn users audit agents report}
@@ -117,10 +132,95 @@ set_limit() {
 }
 
 do_users() {
-  local limit=$1
+  local limit=$1 rc
   set_limit "$limit" || return 1
   sleep 30 # let the new pod catch up with agents and the audit log
   run_job "users-$(echo "$limit" | tr 'A-Z' 'a-z')" "$RUN" 7200 1536Mi users --stages "$USERS_STAGES" --name "users-$limit" "${KS[@]}" "${USERS_EXTRA[@]}"
+  rc=$?
+  server_metrics --users "users-$limit.json"
+  return $rc
+}
+
+# server_metrics records kubesentry's, Postgres' and oauth2-proxy's numbers
+# for windows of this run (stress server-metrics) while Prometheus has them.
+server_metrics() {
+  [ "$VARIANT" = after ] || return 0
+  "$STRESS_BIN" server-metrics --context "$CTX" --dir "$DIR" "$@" >>"$DIR/server-metrics.log" 2>&1 ||
+    log "server-metrics $*: failed (see server-metrics.log)"
+}
+
+# pg_sample prints one CSV line: time, database size, audit partitions, estimated audit rows.
+pg_sample() {
+  k -n stress-pg exec postgres-0 -- psql -U kubesentry -d kubesentry -At -F, -c \
+    "select to_char(now() at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), pg_database_size('kubesentry'),
+       (select count(*) from pg_inherits where inhparent = 'kubesentry.audit_events'::regclass),
+       (select coalesce(sum(c.reltuples), 0)::bigint from pg_inherits i join pg_class c on c.oid = i.inhrelid
+          where i.inhparent = 'kubesentry.audit_events'::regclass)" 2>/dev/null
+}
+
+secs_of() { # 2h, 90m, 300s → seconds
+  case $1 in *h) echo $(( ${1%h} * 3600 )) ;; *m) echo $(( ${1%m} * 60 )) ;; *s) echo "${1%s}" ;; *) echo "$1" ;; esac
+}
+
+# do_soak: SOAK_USERS users, a background audit firehose at SOAK_AUDIT_RATE and
+# 500 staggered agents together for SOAK_FOR, with Postgres sampled every 5 minutes.
+do_soak() {
+  local dur=${SOAK_FOR:-2h} users=${SOAK_USERS:-500} rate=${SOAK_AUDIT_RATE:-300} secs r0 sampler upid apid gpid rc=0
+  secs=$(secs_of "$dur")
+  r0=$(kubesentry_restarts)
+  ( while true; do pg_sample >>"$DIR/pg-soak.csv"; sleep 300; done ) &
+  sampler=$!
+  echo "$sampler" >.kind/stress-pids/pg-sampler.pid
+  run_job audit-soak "$RUN" $((secs + 1800)) 512Mi audit --events $((rate * secs)) --rate "$rate" --level "$LEVEL" --name audit-soak \
+    --max-run "$((secs + 300))s" --query-reps 10 "${KS[@]}" &
+  apid=$!
+  run_job agents-soak "$RUN" $((secs + 1200)) 1024Mi agents --agents "$AGENTS" --duration "${secs}s" --name agents-soak "${KS[@]}" "${AGENTS_EXTRA[@]}" &
+  gpid=$!
+  sleep 20
+  run_job users-soak "$RUN" $((secs + 1800)) 1536Mi users --stages "$users:${secs}s" --name users-soak "${KS[@]}" "${USERS_EXTRA[@]}" || rc=1
+  wait "$apid" || rc=1
+  wait "$gpid" || rc=1
+  pg_sample >>"$DIR/pg-soak.csv"
+  kill "$sampler" 2>/dev/null
+  rm -f .kind/stress-pids/pg-sampler.pid
+  "$STRESS_BIN" soak-report --context "$CTX" --dir "$DIR" --restarts "$(( $(kubesentry_restarts) - r0 )) ($(kubesentry_last_reason))" ||
+    log "soak-report failed"
+  server_metrics --users users-soak.json
+  return $rc
+}
+
+# do_storm: the RBAC storm (stress chaos rbacstorm) with verify authz running
+# back to back during it, then once more afterwards.
+do_storm() {
+  local vpid rc
+  (for i in 1 2 3; do
+    run_job "authz-storm-$i" "$RUN" 1800 512Mi verify authz --out /results --level "$LEVEL" --timeout 300s --name "authz-during-storm-$i" "${KS[@]}"
+  done) &
+  vpid=$!
+  sleep 10
+  # shellcheck disable=SC2046
+  "$STRESS_BIN" chaos --context "$CTX" --out "$DIR" --scenarios rbacstorm --name chaos-storm --level "$LEVEL" $(cw_args | sed 's/--start/--cw-start/')
+  rc=$?
+  wait "$vpid"
+  run_job authz-after-storm "$RUN" 1800 512Mi verify authz --out /results --level "$LEVEL" --timeout 300s --name authz-after-storm "${KS[@]}" || rc=1
+  server_metrics --chaos chaos-storm.json
+  return $rc
+}
+
+# do_cold: both replicas deleted while 500 users run (stress chaos coldrestart).
+do_cold() {
+  local upid rc
+  run_job users-cold "$RUN" 2400 1536Mi users --stages 500:15m --name users-cold "${KS[@]}" "${USERS_EXTRA[@]}" &
+  upid=$!
+  sleep 300
+  # shellcheck disable=SC2046
+  "$STRESS_BIN" chaos --context "$CTX" --out "$DIR" --scenarios coldrestart --name chaos-cold --users-file "$DIR/users-cold.json" \
+    $(cw_args | sed 's/--start/--cw-start/')
+  rc=$?
+  wait "$upid"
+  server_metrics --chaos chaos-cold.json
+  server_metrics --users users-cold.json
+  return $rc
 }
 
 # cwfake's options, read from its Deployment, for the CloudWatch checks.
@@ -134,12 +234,11 @@ cw_args() {
   echo "--start $start --events ${events:-1000000} --rate ${rate:-500} --seed ${seed:-2026}"
 }
 
+VN=${VERIFY_NAME:+-$VERIFY_NAME}
 has gen && step gen "$RUN" do_gen
-has verify && step verify "$RUN" run_job verify "$RUN" 3600 1024Mi verify --out /results --map-namespaces "$MAP_NAMESPACES" --timeout 600s "${KS[@]}"
-has authz && step authz "$RUN" run_job verify-authz "$RUN" 3600 512Mi verify authz --out /results --level "$LEVEL" --timeout 300s "${KS[@]}"
+has verify && step "verify$VN" "$RUN" run_job "verify$VN" "$RUN" 3600 1024Mi verify --out /results --map-namespaces "$MAP_NAMESPACES" --timeout 600s --name "assoc$VN" "${KS[@]}"
+has authz && step "authz$VN" "$RUN" run_job "verify-authz$VN" "$RUN" 3600 512Mi verify authz --out /results --level "$LEVEL" --timeout 300s --name "authz$VN" "${KS[@]}"
 has conn && step connectivity "$RUN" run_job connectivity "$RUN" 900 256Mi connectivity --out /results "${KS[@]}" "${CONN_EXTRA[@]}"
-# shellcheck disable=SC2046
-has cloudwatch && step cloudwatch "$RUN" "$STRESS_BIN" verify-cloudwatch --context "$CTX" --out "$DIR" $(cw_args)
 if has users; then
   step "users-$SHIPPED_LIMIT" "$RUN" do_users "$SHIPPED_LIMIT"
   if [ "$USERS_1GI" = 1 ] && [ "$LEVEL" != L1 ]; then
@@ -153,17 +252,32 @@ do_audit_1gi() {
   run_job audit-1gi "$RUN" 3600 512Mi audit --events "$AUDIT_EVENTS" --rate "$AUDIT_RATE" --level "$LEVEL" --name audit-1Gi
 }
 
-has audit && step audit "$RUN" run_job audit "$RUN" 3600 512Mi audit --events "$AUDIT_EVENTS" --rate "$AUDIT_RATE" --level "$LEVEL" "${KS[@]}"
+if has audit; then
+  step audit "$RUN" run_job audit "$RUN" 3600 512Mi audit --events "$AUDIT_EVENTS" --rate "$AUDIT_RATE" --level "$LEVEL" "${KS[@]}"
+  server_metrics --steps audit --name audit
+fi
 if has audit && [ "$AUDIT_1GI" = 1 ]; then
   step audit-1Gi "$RUN" do_audit_1gi
   set_limit "$SHIPPED_LIMIT"
 fi
+# The CloudWatch check (every cwfake event stored once, live-tail lag) runs
+# after the webhook firehose, so the lag is measured with the store loaded.
+# shellcheck disable=SC2046
+has cloudwatch && step cloudwatch "$RUN" "$STRESS_BIN" verify-cloudwatch --context "$CTX" --out "$DIR" $(cw_args)
 if has agents; then
   step agents "$RUN" run_job agents "$RUN" 1200 1024Mi agents --agents "$AGENTS" --duration 3m --name agents "${KS[@]}" "${AGENTS_EXTRA[@]}"
   step agents-surge "$RUN" run_job agents-surge "$RUN" 1200 1024Mi agents --agents "$AGENTS" --surge --duration 2m --name agents-surge "${KS[@]}" "${AGENTS_EXTRA[@]}"
+  server_metrics --steps agents,agents-surge --name agents
 fi
-# shellcheck disable=SC2046
-has chaos && step chaos "$RUN" "$STRESS_BIN" chaos --context "$CTX" --out "$DIR" --scenarios "$CHAOS_SCENARIOS" $(cw_args | sed 's/--start/--cw-start/')
+has soak && step soak "$RUN" do_soak
+has storm && step storm "$RUN" do_storm
+has coldrestart && step coldrestart "$RUN" do_cold
+if has chaos; then
+  CN=${CHAOS_NAME:+-$CHAOS_NAME}
+  # shellcheck disable=SC2046
+  step "chaos$CN" "$RUN" "$STRESS_BIN" chaos --context "$CTX" --out "$DIR" --scenarios "$CHAOS_SCENARIOS" --name "chaos$CN" --level "$LEVEL" $(cw_args | sed 's/--start/--cw-start/')
+  server_metrics --chaos "chaos$CN.json"
+fi
 if has report; then
   docker cp "$LOADGEN_NODE:$HOST_RESULTS/metrics-sim-truth.json" "$DIR/" >/dev/null 2>&1 || true
   "$STRESS_BIN" report --dir "$DIR" --level "$LEVEL" --variant "$VARIANT" --memory-limit "$SHIPPED_LIMIT" && log "report: $DIR/report.md"

@@ -141,6 +141,7 @@ func cmdVerifyCloudWatch(ctx context.Context, args []string) error {
 	start := fs.String("start", "", "RFC 3339 time of event 0 (as given to cwfake)")
 	kctx := fs.String("context", "kind-kubesentry", "kube context")
 	grace := fs.Duration("grace", 4*time.Minute, "ignore events newer than this (ingest delay, late delivery)")
+	window := fs.Duration("window", 2*time.Hour, "check only events of the last window (0: all; an endless tail is held in memory)")
 	dir := fs.String("out", "", "write cloudwatch.json here")
 	name := fs.String("name", "cloudwatch", "result file name")
 	_ = fs.Parse(args)
@@ -149,7 +150,7 @@ func cmdVerifyCloudWatch(ctx context.Context, args []string) error {
 		return err
 	}
 	o.Start = t
-	res, err := cwserve.Verify(ctx, *o, *kctx, "stress-pg", "postgres-0", "kubesentry", *grace)
+	res, err := cwserve.Verify(ctx, *o, *kctx, "stress-pg", "postgres-0", "kubesentry", *grace, *window)
 	if err != nil {
 		return err
 	}
@@ -197,6 +198,7 @@ func cmdVerifyAuthz(ctx context.Context, args []string) error {
 	c.register(fs, 100, 200)
 	level := fs.String("level", "L3", "level whose team namespaces the personas use")
 	perKind := fs.String("per-kind", "admin=2,viewer=3,team=8,many-groups=1,no-grants=1", "personas sampled per kind")
+	name := fs.String("name", "authz", "result file name (authz.json, authz.md)")
 	_ = fs.Parse(args)
 	cl, err := c.kube.Connect()
 	if err != nil {
@@ -227,18 +229,18 @@ func cmdVerifyAuthz(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := out.WriteJSON(c.outDir, "authz.json", res); err != nil {
+	if err := out.WriteJSON(c.outDir, *name+".json", res); err != nil {
 		return err
 	}
 	out.Logf("authz: %d personas, %d leaks, %d problems", len(res.Personas), res.Leaks, res.Problems)
-	return out.WriteText(c.outDir, "authz.md", res.Markdown())
+	return out.WriteText(c.outDir, *name+".md", res.Markdown())
 }
 
 // cmdChaos runs the chaos smoke set (host side).
 func cmdChaos(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("chaos", flag.ExitOnError)
 	var kf kc.Flags
-	kf.Register(fs, 50, 100)
+	kf.Register(fs, 300, 600)
 	scen := fs.String("scenarios", "spoof,oversize,prometheus,postgres,apiserver,killreplica,standby", "scenarios, in order")
 	dir := fs.String("out", "", "write chaos.json and chaos.md here")
 	cw := cwOptions(fs)
@@ -247,6 +249,19 @@ func cmdChaos(ctx context.Context, args []string) error {
 	rate := fs.Float64("firehose-rate", 1000, "audit events per second during the Postgres outage")
 	dur := fs.Duration("firehose-for", 4*time.Minute, "firehose duration")
 	name := fs.String("name", "chaos", "result file name (chaos.json, chaos.md)")
+	stopNode := fs.String("stop-node", "kubesentry-worker", "workerstop: kind node container to stop")
+	stopFor := fs.Duration("stop-for", 3*time.Minute, "workerstop: how long it stays stopped")
+	drainNode := fs.String("drain-node", "kubesentry-worker3", "drain: real worker to drain")
+	drainSel := fs.String("drain-selector", "app!=kwok-controller", "drain: pods kubectl drain may evict (KWOK's controller stays)")
+	level := fs.String("level", "L3", "rbacstorm: level whose team namespaces get the RoleBindings")
+	stormN := fs.Int("storm", 2000, "rbacstorm: RoleBindings")
+	stormRate := fs.Float64("storm-rate", 30, "rbacstorm: RoleBindings per second in each phase (create, modify, delete)")
+	churnRate := fs.Float64("churn-rate", 50, "churn: pods per second")
+	churnFor := fs.Duration("churn-for", 5*time.Minute, "churn: duration")
+	churnLife := fs.Duration("churn-life", time.Minute, "churn: pod lifetime")
+	rollN := fs.Int("rollout-replicas", 1000, "rollout: Deployment replicas")
+	nsdelN := fs.Int("nsdelete-pods", 2000, "nsdelete: pods in the namespace")
+	usersFile := fs.String("users-file", "", "coldrestart: users result the concurrent load writes (host path)")
 	_ = fs.Parse(args)
 	c, err := kf.Connect()
 	if err != nil {
@@ -267,11 +282,39 @@ func cmdChaos(ctx context.Context, args []string) error {
 	}
 	agentTok, _ := kc.Secret(ctx, c.CS, "kubesentry", "kubesentry-agent", "token")
 	auditTok, _ := kc.Secret(ctx, c.CS, "kubesentry", "kubesentry-audit", "token")
+	l, err := plan.Get(*level)
+	if err != nil {
+		return err
+	}
+	teamN := plan.Build(l).Stats.TeamNamespaces
+	var teamNS []string
+	for j := 0; j < teamN; j++ {
+		teamNS = append(teamNS, plan.NamespaceName(j))
+	}
+	// Personas whose pod lists are checked for leaks during the RBAC storm:
+	// team members (their own namespaces), the 300-group user and nobody.
+	var stormPersonas []chaos.StormPersona
+	teams := 0
+	for _, p := range personas.Build(teamN, 100) {
+		if p.Kind == personas.Team && teams < 4 || p.Kind == personas.ManyGroups || p.Kind == personas.NoGrants {
+			if p.Kind == personas.Team {
+				teams++
+			}
+			allowed := map[string]bool{}
+			for _, ns := range p.Namespaces {
+				allowed[ns] = true
+			}
+			stormPersonas = append(stormPersonas, chaos.StormPersona{Email: p.Email, Token: mint(p.Email, p.Groups), Allowed: allowed})
+		}
+	}
 	res, err := chaos.Run(ctx, chaos.Options{
 		CS: c.CS, Context: kf.Context, ProbeNode: "kubesentry-worker5", ControlPlane: "kubesentry-control-plane", Namespace: "kubesentry",
 		AdminToken: mint("admin0@corp.example", []string{personas.GroupAdmins}), NobodyToken: mint("nobody@corp.example", nil),
 		AgentToken: strings.TrimSpace(agentTok), AuditToken: strings.TrimSpace(auditTok), CW: *cw,
 		Scenarios: splitList(*scen), PGDown: *pgDown, FirehoseRate: *rate, FirehoseFor: *dur,
+		StopNode: *stopNode, StopFor: *stopFor, DrainNode: *drainNode, DrainSelector: *drainSel,
+		TeamNamespaces: teamNS, StormN: *stormN, StormRate: *stormRate, StormPersonas: stormPersonas, Mint: mint,
+		ChurnRate: *churnRate, ChurnFor: *churnFor, ChurnLife: *churnLife, RolloutReplicas: *rollN, NSDeletePods: *nsdelN, UsersFile: *usersFile,
 	})
 	if err != nil {
 		return err

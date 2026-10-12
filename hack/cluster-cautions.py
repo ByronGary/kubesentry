@@ -8,6 +8,7 @@ how often, and at what peak, split into real cautions and known artifacts of the
 kind/KWOK stress environment.
 
   hack/cluster-cautions.py --out DIR [--label L2] [--every 300] [--count N]
+  hack/cluster-cautions.py --out DIR --label-file .kind/cautions.label --every 300   # label per step
   hack/cluster-cautions.py --summarize DIR > DIR/cautions.md
 
 Stdlib only, so it runs anywhere kubectl does.
@@ -336,6 +337,34 @@ def summarize(d):
                 out.append(f"| {name} | {sev} | {state} | {v['peak']} | {why} |")
         out.append("")
 
+    # By label (the step running when the snapshot was taken)
+    labels = []
+    for s in snaps:
+        if s.get("label") and s["label"] not in labels:
+            labels.append(s["label"])
+    if len(labels) > 1:
+        out += ["## By step", "", "Real alerts (firing, or pending with `(p)`) and the worst health values in the snapshots taken while each step ran.", "",
+                "| Step | Snapshots | From / to | Real alerts | API read p99 | API 5xx /s | API 429 /s | Real node min mem avail |",
+                "|---|---:|---|---|---:|---:|---:|---:|"]
+        for lb in labels:
+            ss = [s for s in snaps if s.get("label") == lb]
+            names = collections.Counter()
+            for s in ss:
+                for a in s.get("alerts", []):
+                    if a["kind"] == "real" and a["state"] in ("firing", "pending"):
+                        names[a["alertname"] + ("" if a["state"] == "firing" else " (p)")] += 1
+            def worst(k, hi=True):
+                v = [s.get("metrics", {}).get(k) for s in ss]
+                v = [x for x in v if isinstance(x, (int, float))]
+                if not v:
+                    return "-"
+                w = max(v) if hi else min(v)
+                return f"{w:.3g}"
+            al = ", ".join(f"{n} ×{c}" for n, c in names.most_common(8)) or "none"
+            out.append(f"| {lb} | {len(ss)} | {ss[0]['time'][11:19]} / {ss[-1]['time'][11:19]} | {al} | {worst('apiserver_read_p99_s')} s | "
+                       f"{worst('apiserver_5xx_per_s')} | {worst('apiserver_429_per_s')} | {worst('node_mem_available_min_ratio', False)} |")
+        out.append("")
+
     # Health metrics: worst value seen
     out += ["## Control plane and monitoring health (worst value seen)", "", "| Signal | Worst | Last |", "|---|---:|---:|"]
     for k, (label, kind, worst) in METRIC_FMT.items():
@@ -420,6 +449,7 @@ def main():
     ap.add_argument("--prometheus", default="", help="namespace/service:port to pin (default: find kube-prometheus-stack)")
     ap.add_argument("--out", help="directory for cautions-<time>.json snapshots")
     ap.add_argument("--label", default="", help="free-form label stored in each snapshot (e.g. the load level)")
+    ap.add_argument("--label-file", default="", help="read the label from this file before each snapshot (e.g. the current step); --label is the fallback")
     ap.add_argument("--every", type=int, default=0, help="seconds between snapshots (0: one snapshot)")
     ap.add_argument("--count", type=int, default=0, help="stop after N snapshots (0: until killed)")
     ap.add_argument("--summarize", metavar="DIR", help="print a markdown summary of the snapshots in DIR")
@@ -443,12 +473,19 @@ def main():
             except Exception as e:
                 print(f"prometheus lookup: {e}", file=sys.stderr)
         s = snapshot(a.context, prom_base)
-        s["label"] = a.label
+        label = a.label
+        if a.label_file:
+            try:
+                with open(a.label_file) as f:
+                    label = f.read().strip() or a.label
+            except OSError:
+                pass
+        s["label"] = label
         path = os.path.join(a.out, f"cautions-{s['time'].replace(':', '')}.json")
         with open(path, "w") as f:
             json.dump(s, f, indent=1)
         real = sum(1 for x in s.get("alerts", []) if x["kind"] == "real" and x["state"] == "firing")
-        print(f"{s['time']} {a.label}: {real} real firing alerts, {len(s.get('alerts', []))} total, errors {len(s['errors'])} -> {path}", flush=True)
+        print(f"{s['time']} {label}: {real} real firing alerts, {len(s.get('alerts', []))} total, errors {len(s['errors'])} -> {path}", flush=True)
         n += 1
         if not a.every or (a.count and n >= a.count):
             return

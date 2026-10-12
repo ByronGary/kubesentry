@@ -89,7 +89,9 @@ if [ "$VARIANT" = after ]; then
   log "cwfake: a live CloudWatch tail from now (stress-cw)"
   docker image inspect quay.io/oauth2-proxy/oauth2-proxy:v7.15.5 >/dev/null 2>&1 || docker pull quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
   kind load docker-image --name "$STRESS_CLUSTER" --nodes "$CONTROL_PLANE" quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
-  k apply -f test/stress/deploy/cwfake.yaml >/dev/null
+  # Re-applying the manifest would reset START and restart the tail: only
+  # create cwfake when it is not there.
+  k -n stress-cw get deploy cwfake >/dev/null 2>&1 || k apply -f test/stress/deploy/cwfake.yaml >/dev/null
   if [ "$(k -n stress-cw get deploy cwfake -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="START")].value}')" = 2026-10-11T00:00:00Z ]; then
     k -n stress-cw set env deployment/cwfake START="$(date -u +%Y-%m-%dT%H:%M:%SZ)" EVENTS=0 RATE=300 SEED=2027 >/dev/null
   fi

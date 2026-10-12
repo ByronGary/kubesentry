@@ -18,10 +18,13 @@ import (
 
 // Options configure a firehose run.
 type Options struct {
-	Client     *ks.Client
-	Ingest     *ks.Client  // where /audit/webhook is (default Client)
-	AuditID    ks.Identity // webhook token
-	APIID      ks.Identity // API token for queries
+	Client  *ks.Client
+	Ingest  *ks.Client  // where /audit/webhook is (default Client)
+	AuditID ks.Identity // webhook token
+	APIID   ks.Identity // API token for queries
+	// APIIDs, if set, are used in turn for the queries after ingest, so the
+	// per-identity rate limit (20/s) applies to each as it would to users.
+	APIIDs     []ks.Identity
 	Total      int
 	Rate       float64 // events per second
 	BatchSize  int
@@ -61,6 +64,10 @@ type Result struct {
 	Retried        int64              `json:"retriedBatches"`
 	GaveUp         int64              `json:"gaveUpBatches"`
 	DistinctIDs    int                `json:"distinctAcceptedIDs,omitempty"`
+	// QueryRetries counts query answers 429/503 with Retry-After that were
+	// retried after the wait, as the UI does; latencies include the waits.
+	QueryRetries map[string]int64 `json:"queryRetries,omitempty"`
+	QueryFirst   map[string]int64 `json:"queryFirstAttemptStatus,omitempty"`
 }
 
 // Queries run after the ingest, with a route name each.
@@ -258,7 +265,15 @@ loop:
 	// Query latency with the store full.
 	qrec := hist.NewRecorder()
 	res.StoreView = map[string]int{}
+	res.QueryRetries, res.QueryFirst = map[string]int64{}, map[string]int64{}
 	var viewMu sync.Mutex
+	var idSeq atomic.Int64
+	pick := func() ks.Identity {
+		if len(o.APIIDs) == 0 {
+			return o.APIID
+		}
+		return o.APIIDs[int(idSeq.Add(1))%len(o.APIIDs)]
+	}
 	for _, q := range Queries {
 		var qwg sync.WaitGroup
 		var next atomic.Int64
@@ -267,10 +282,29 @@ loop:
 			go func() {
 				defer qwg.Done()
 				for next.Add(1) <= int64(o.QueryReps) {
-					rctx, cancel := context.WithTimeout(ctx, o.Timeout)
-					r := o.Client.Do(rctx, o.APIID, http.MethodGet, q.Path, nil, "", true)
-					cancel()
-					qrec.Record(q.Route, r.Status, r.Bytes, r.Elapsed, hist.Classify(r.Err, ctx.Err()), r.Err)
+					id := pick()
+					t0 := time.Now()
+					var r ks.Response
+					for attempt := 0; ; attempt++ {
+						rctx, cancel := context.WithTimeout(ctx, o.Timeout)
+						r = o.Client.Do(rctx, id, http.MethodGet, q.Path, nil, "", true)
+						cancel()
+						if attempt == 0 {
+							viewMu.Lock()
+							res.QueryFirst[q.Route+" "+strconv.Itoa(r.Status)]++
+							viewMu.Unlock()
+						}
+						ra := r.Header.Get("Retry-After")
+						if r.Err != nil || (r.Status != http.StatusServiceUnavailable && r.Status != http.StatusTooManyRequests) || ra == "" || attempt >= 5 {
+							break
+						}
+						viewMu.Lock()
+						res.QueryRetries[q.Route]++
+						viewMu.Unlock()
+						wait, _ := strconv.Atoi(ra)
+						time.Sleep(time.Duration(max(1, wait)) * time.Second)
+					}
+					qrec.Record(q.Route, r.Status, r.Bytes, time.Since(t0), hist.Classify(r.Err, ctx.Err()), r.Err)
 					var body struct {
 						Count int   `json:"count"`
 						Users []any `json:"users"`

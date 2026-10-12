@@ -136,6 +136,8 @@ step() {
   fi
   local start r0 rc
   [ "$name" = gen ] || wait_kubesentry
+  # The cautions collector labels its snapshots with the running step.
+  echo "$name" >.kind/cautions.label 2>/dev/null || true
   start=$(date +%s)
   r0=$(kubesentry_restarts)
   log "step $name ($run)"
@@ -146,6 +148,7 @@ step() {
   guard_stopped && status=guard-stopped
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$start" "$(date +%s)" "$status" "$r0" "$(kubesentry_restarts)" "$(kubesentry_last_reason)" "limit=$(kubesentry_memory_limit)" >>"$dir/steps.tsv"
   log "step $name: $status ($(( $(date +%s) - start ))s)"
+  echo "idle" >.kind/cautions.label 2>/dev/null || true
   return $rc
 }
 

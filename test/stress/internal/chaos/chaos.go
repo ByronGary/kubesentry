@@ -1,8 +1,10 @@
-// Package chaos runs the checkpoint-D smoke set against a running kubesentry
-// on the kind cluster: a replica killed (CloudWatch lock and agents),
-// Prometheus down and up, Postgres down for two minutes under an audit
-// firehose, an API server restart, identity headers spoofed through kubectl
-// port-forward, and oversized agent reports. It runs on the host: it needs
+// Package chaos runs chaos scenarios against a running kubesentry on the kind
+// cluster: the checkpoint-D smoke set (a replica killed: CloudWatch lock and
+// agents; Prometheus down and up; Postgres down for two minutes under an
+// audit firehose; an API server restart; identity headers spoofed through
+// kubectl port-forward; oversized agent reports) and the Phase 4 set in
+// phase4.go (worker stop, drain, RBAC storm, pod churn, a big rollout, a big
+// namespace deleted, a cold restart under load). It runs on the host: it needs
 // docker exec into the kind nodes and kubectl. Probes go from inside a node
 // (curl to ClusterIPs and pod IPs), so they keep working while the API server
 // is down.
@@ -47,6 +49,23 @@ type Options struct {
 	PGDown       time.Duration
 	FirehoseRate float64
 	FirehoseFor  time.Duration
+
+	// Phase 4 scenarios.
+	StopNode        string        // workerstop: kind node container to stop
+	StopFor         time.Duration // ... and how long
+	DrainNode       string        // drain: real worker to drain
+	DrainSelector   string        // ... pods kubectl drain may evict
+	TeamNamespaces  []string      // rbacstorm: where the RoleBindings go
+	StormN          int
+	StormRate       float64 // RoleBindings per second per phase
+	StormPersonas   []StormPersona
+	Mint            func(email string, groups []string) string
+	ChurnRate       float64
+	ChurnFor        time.Duration
+	ChurnLife       time.Duration
+	RolloutReplicas int
+	NSDeletePods    int
+	UsersFile       string // coldrestart: the users result written by the concurrent load
 }
 
 // Step is one timed observation.
@@ -59,6 +78,8 @@ type Step struct {
 // Scenario is one chaos experiment.
 type Scenario struct {
 	Name     string         `json:"name"`
+	Started  time.Time      `json:"started"`
+	Ended    time.Time      `json:"ended"`
 	Pass     bool           `json:"pass"`
 	Seconds  float64        `json:"seconds"`
 	Summary  string         `json:"summary"`
@@ -195,6 +216,13 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		"apiserver":   r.apiserver,
 		"killreplica": r.killReplica,
 		"standby":     r.standbyTakeover,
+		"workerstop":  r.workerStop,
+		"drain":       r.drain,
+		"rbacstorm":   r.rbacStorm,
+		"churn":       r.churn,
+		"rollout":     r.rollout,
+		"nsdelete":    r.nsDelete,
+		"coldrestart": r.coldRestart,
 	}
 	for _, name := range o.Scenarios {
 		f, ok := all[name]
@@ -203,7 +231,9 @@ func Run(ctx context.Context, o Options) (*Result, error) {
 		}
 		r.scenario = &Scenario{Name: name, Numbers: map[string]any{}}
 		r.scenStart = time.Now()
+		r.scenario.Started = r.scenStart.UTC()
 		f(ctx)
+		r.scenario.Ended = time.Now().UTC()
 		r.scenario.Seconds = time.Since(r.scenStart).Seconds()
 		r.scenario.Pass = len(r.scenario.Problems) == 0
 		if r.scenario.Pass {
@@ -735,6 +765,7 @@ func (r *runner) apiserver(ctx context.Context) {
 	}
 	r.scenario.Numbers = map[string]any{"apiserverDownSeconds": back.Sub(stopped).Seconds(), "probes": n, "probesOK": okN,
 		"maxSnapshotAgeSeconds": maxAge, "staleReported": staleSeen, "minReadyReplicas": readyMin, "freshSecondsAfterAPIServer": freshAfter}
+	r.scenario.Numbers["serverLogForbiddenLines"] = forbidden
 	r.note("probes", fmt.Sprintf("%d/%d answered 200; snapshot age max %.0fs, stale shown %v; ready replicas never below %d", okN, n, maxAge, staleSeen, readyMin))
 	if okN < n {
 		r.fail("%d of %d probes failed while the API server restarted", n-okN, n)
@@ -935,7 +966,7 @@ func (r *runner) lockMove(ctx context.Context, standbyOnly bool) {
 	r.note("agents after", fmt.Sprintf("HTTP %d, %d agents, %d fresh; nodes reporting to %s never below %.0f", code, len(ag), fresh, other.name, minAgents))
 	r.note("waiting for CloudWatch late deliveries", "4m")
 	time.Sleep(4 * time.Minute)
-	cw, err := cwserve.Verify(ctx, r.o.CW, r.o.Context, "stress-pg", "postgres-0", "kubesentry", 4*time.Minute)
+	cw, err := cwserve.Verify(ctx, r.o.CW, r.o.Context, "stress-pg", "postgres-0", "kubesentry", 4*time.Minute, 30*time.Minute)
 	if err != nil {
 		r.fail("CloudWatch check: %v", err)
 	} else {

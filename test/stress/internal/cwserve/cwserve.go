@@ -68,22 +68,29 @@ type Result struct {
 	MissingIDs   []string  `json:"missingSample,omitempty"`
 	DupIDs       []string  `json:"duplicatedSample,omitempty"`
 	NewestStored time.Time `json:"newestStored"`
-	LagSeconds   float64   `json:"lagSeconds"` // now - newest stored cwfake event time
+	LagSeconds   float64   `json:"lagSeconds"` // now - the newest cwfake event stored (the live tail's lag)
 	Complete     bool      `json:"complete"`   // every event of the group has its time in the past
 }
 
 // Verify compares the events cwfake has made visible with the rows in
 // Postgres, read through kubectl exec into the Postgres pod (host side).
-func Verify(ctx context.Context, o Options, kubeContext, pgNamespace, pgPod, schema string, grace time.Duration) (*Result, error) {
+//
+// window, if positive, checks only the events of the last window (an endless
+// tail grows without bound: every expected ID is held in memory).
+func Verify(ctx context.Context, o Options, kubeContext, pgNamespace, pgPod, schema string, grace, window time.Duration) (*Result, error) {
 	f := cwfake.New(o.FakeOptions())
 	now := time.Now()
 	res := &Result{Checked: now.UTC()}
 	// Events become visible a little after their time; leave a grace period.
 	cut := now.Add(-grace)
 	_, hi := f.Range(f.Time(0), cut)
-	res.Expected = hi
+	lo := int64(0)
+	if window > 0 {
+		lo, _ = f.Range(now.Add(-window), cut)
+	}
+	res.Expected = hi - lo
 	res.Complete = o.Events > 0 && hi >= o.Events
-	first, last := f.Time(0), f.Time(max(0, hi-1))
+	first, last := f.Time(lo), f.Time(max(lo, hi-1))
 	q := fmt.Sprintf(`COPY (SELECT audit_id, count(*), max(time) FROM %s.audit_events WHERE time >= '%s' AND time <= '%s' GROUP BY audit_id) TO STDOUT`,
 		schema, first.Format(time.RFC3339Nano), last.Add(time.Second).Format(time.RFC3339Nano))
 	cmd := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", pgNamespace, "exec", pgPod, "--",
@@ -116,7 +123,7 @@ func Verify(ctx context.Context, o Options, kubeContext, pgNamespace, pgPod, sch
 	if err := cmd.Wait(); err != nil {
 		return nil, fmt.Errorf("psql: %v: %s", err, stderr.String())
 	}
-	for i := int64(0); i < hi; i++ {
+	for i := lo; i < hi; i++ {
 		id := f.AuditID(i)
 		r, ok := stored[id]
 		switch {
@@ -135,6 +142,29 @@ func Verify(ctx context.Context, o Options, kubeContext, pgNamespace, pgPod, sch
 			}
 			if r.t.After(res.NewestStored) {
 				res.NewestStored = r.t
+			}
+		}
+	}
+	// The live tail: the newest cwfake event stored at all (also inside the
+	// grace period) gives the reader's lag behind real time.
+	_, hiNow := f.Range(f.Time(0), now)
+	if hiNow > hi {
+		q2 := fmt.Sprintf(`COPY (SELECT DISTINCT audit_id FROM %s.audit_events WHERE time > '%s' AND time <= '%s') TO STDOUT`,
+			schema, f.Time(hi).Add(-time.Second).Format(time.RFC3339Nano), now.Add(time.Second).Format(time.RFC3339Nano))
+		out, err := exec.CommandContext(ctx, "kubectl", "--context", kubeContext, "-n", pgNamespace, "exec", pgPod, "--",
+			"psql", "-U", "kubesentry", "-d", "kubesentry", "-At", "-c", q2).Output()
+		if err == nil {
+			recent := map[string]bool{}
+			for _, l := range strings.Split(string(out), "\n") {
+				recent[strings.TrimSpace(l)] = true
+			}
+			for i := hiNow - 1; i >= hi; i-- {
+				if recent[f.AuditID(i)] {
+					if t := f.Time(i); t.After(res.NewestStored) {
+						res.NewestStored = t
+					}
+					break
+				}
 			}
 		}
 	}
