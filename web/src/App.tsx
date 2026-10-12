@@ -12,6 +12,7 @@ import { Findings } from './pages/Findings'
 import { MapPage } from './pages/Map'
 import { Memory } from './pages/Memory'
 import { Nodes } from './pages/Nodes'
+import { Overview, OVERVIEW_POLL_MS } from './pages/Overview'
 import { PodDetail } from './pages/PodDetail'
 import { Pods } from './pages/Pods'
 import { Security } from './pages/Security'
@@ -24,16 +25,13 @@ import { useApi, usePolled, type ApiState } from './useApi'
 
 type Flag = 'inventory' | 'certs'
 
-/** Pages built around wide tables get more room; the map and node pages get the most. */
-const TABLE_PAGES = new Set<PageKey>(['pods', 'workloads', 'storage', 'activity', 'agents'])
+/** Pages built around wide tables (and the Overview's tiles) get more room; the map and node pages get the most. */
+const TABLE_PAGES = new Set<PageKey>(['overview', 'pods', 'workloads', 'storage', 'activity', 'agents'])
 const WIDE_PAGES = new Set<PageKey>(['map', 'nodes'])
 
 /** Pages that read metrics: the Prometheus notice above them replaces the generic banner's line. */
 const METRICS_PAGES = new Set<PageKey>(['findings', 'memory', 'pod'])
 const METRICS_SOURCES = ['prometheus']
-
-/** How often the sidebar badges (from /overview) refresh while the tab is visible. */
-const OVERVIEW_POLL_MS = 30_000
 
 /**
  * Waits for /api/v1/info before rendering a page that depends on it, and
@@ -86,8 +84,9 @@ export function App() {
     if (source) setAuthSource(source)
   }, [source])
 
-  // The sidebar badges come from /overview, polled while the tab is visible. An
-  // older server answers 404: then there are no badges, and it is not asked again.
+  // The Overview page and the sidebar badges share one /overview, polled while
+  // the tab is visible. An older server answers 404: then there are no badges,
+  // Findings is the home page again, and /overview is not asked for again.
   const overviewGone = missing.has('/')
   const overview = usePolled<OverviewResponse>(overviewGone ? null : '/api/v1/overview', OVERVIEW_POLL_MS, { retryBusy: true })
   const notFound = overview.error instanceof ApiError && overview.error.status === 404
@@ -95,8 +94,7 @@ export function App() {
     if (notFound) hideRoute('/')
   }, [notFound, hideRoute])
 
-  // The Overview page is not built yet: home stays Findings.
-  const resolved = resolveRoute(route.path, route.query, { overview: false })
+  const resolved = resolveRoute(route.path, route.query, { overview: !overviewGone && !notFound })
   useEffect(() => {
     if (!resolved.redirect) return
     window.history.replaceState(null, '', resolved.redirect)
@@ -106,6 +104,9 @@ export function App() {
   const { parts } = resolved
   let page: ReactElement
   switch (resolved.page) {
+    case 'overview':
+      page = <Overview route={route} shared={overview} />
+      break
     case 'pod':
       page = <PodDetail key={parts[1] + '/' + parts[2]} ns={parts[1]} name={parts[2]} info={info} />
       break
@@ -147,7 +148,7 @@ export function App() {
   const down = prometheusOutage(info)
 
   // Gated items appear once the server says it has them and the user may use them, so there are no dead links.
-  const sections = groupNav(info, { hidden: new Set([...missing, '/']), badges: overviewGone ? undefined : overview.data?.badges })
+  const sections = groupNav(info, { hidden: missing, badges: overviewGone ? undefined : overview.data?.badges })
   const control = useSidebar()
   const { layout, state, dispatch } = control
   const drawerOpen = layout === 'drawer' && state.drawerOpen

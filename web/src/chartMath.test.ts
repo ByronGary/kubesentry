@@ -1,5 +1,33 @@
 import { describe, expect, it } from 'vitest'
-import { byteTicks, findDrops, nearestIndex, niceTicks, projectToLimit, thin, timeTicks, type Point } from './chartMath'
+import { byteTicks, findDrops, nearestIndex, niceTicks, projectToLimit, sparkline, sparkText, thin, timeTicks, type Point } from './chartMath'
+
+describe('sparkline', () => {
+  it('scales counts from a zero baseline across the box', () => {
+    const s = sparkline([0, 2, 4], 100, 20, 0)
+    expect(s.line).toBe('M0,20L50,10L100,0')
+    expect(s.area).toBe('M0,20L0,20L50,10L100,0L100,20Z')
+    expect(s.end).toEqual([100, 0])
+    expect([s.min, s.max, s.last]).toEqual([0, 4, 4])
+  })
+  it('keeps an all-zero series flat on the baseline, inside the padding', () => {
+    expect(sparkline([0, 0, 0], 40, 10, 2).line).toBe('M2,8L20,8L38,8')
+  })
+  it('draws nothing for fewer than two points, but still reports them', () => {
+    expect(sparkline([3], 40, 10)).toMatchObject({ line: '', area: '', min: 3, max: 3, last: 3 })
+    expect(sparkline([], 40, 10)).toMatchObject({ line: '', last: undefined })
+  })
+  it('breaks the line at missing values', () => {
+    const s = sparkline([1, 1, null, 1, NaN], 40, 10, 0)
+    expect(s.line).toBe('M0,0L10,0M30,0')
+    expect(s.last).toBe(1)
+    expect(s.end).toEqual([30, 0])
+  })
+  it('has a text alternative', () => {
+    expect(sparkText('unhealthy workloads', [0, 4, 1, 2], '24h')).toBe('unhealthy workloads, last 24h: min 0, max 4, now 2')
+    expect(sparkText('failing pods', [], '24h')).toBe('failing pods, last 24h: no data yet')
+    expect(sparkText('certificates', [1200, 1300], '')).toBe('certificates: min 1,200, max 1,300, now 1,300')
+  })
+})
 
 const MiB = 1 << 20
 
