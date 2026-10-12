@@ -47,6 +47,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		ing.Backend = pg
 		go pg.MaintainLoop(ctx, time.Hour)
 		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "postgres", Check: pg.Ping})
+		srv.AuditHealth = watchPostgres(ctx, pg, 15*time.Second)
 		metrics.AuditQueueDepth.SetFunc(func() float64 { return float64(pg.Stats().Queued) })
 		slog.Info("audit store: postgres", "schema", cfg.pgSchema, "retention", formatDuration(cfg.auditRetention))
 	} else {
@@ -114,6 +115,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 			return nil
 		}})
 		metrics.CloudWatchLag.SetFunc(cw.lagSeconds)
+		srv.CloudWatchLag = cw.lag
 		slog.Info("reading EKS audit logs from CloudWatch", "logGroup", group, "streamPrefix", cfg.cloudwatchPrefix)
 	}
 	go pollAuditCounters(ctx, pg, cw)
@@ -260,6 +262,55 @@ func (c *cwRunner) status() (cloudwatch.Status, bool) {
 		return r.Status(), true
 	}
 	return cloudwatch.Status{}, false
+}
+
+// lag is how far the reader is behind; ok is false on a replica that is not
+// reading, and before its first commit.
+func (c *cwRunner) lag() (time.Duration, bool) {
+	if st, ok := c.status(); ok && !st.WindowEnd.IsZero() {
+		return st.Lag, true
+	}
+	return 0, false
+}
+
+// pinger is what watchPostgres needs of the store.
+type pinger interface {
+	Ping(ctx context.Context) error
+	Stats() pgstore.Stats
+}
+
+// watchPostgres pings the store every interval in the background and
+// returns its health for the Overview: the last ping's error, else the
+// last write error while writes keep failing. Reading it never waits on
+// the database.
+func watchPostgres(ctx context.Context, pg pinger, interval time.Duration) func() error {
+	var last atomic.Pointer[error]
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err := pg.Ping(pctx)
+			cancel()
+			if ctx.Err() == nil {
+				last.Store(&err)
+			}
+		}
+	}()
+	return func() error {
+		if p := last.Load(); p != nil && *p != nil {
+			return *p
+		}
+		if st := pg.Stats(); st.LastError != "" {
+			return errors.New(st.LastError)
+		}
+		return nil
+	}
 }
 
 // lagSeconds is kubesentry_cloudwatch_lag_seconds: how far the reader is

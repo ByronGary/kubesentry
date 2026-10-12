@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/api"
@@ -74,6 +75,8 @@ type config struct {
 	pvcMinAge                             time.Duration
 	pvcDefaultPrice                       optionalFloat
 	pvcClassPrices, ebsPrices             string
+	ownerAnnotation                       string
+	productionLabel                       string
 
 	auditLogFile        string
 	auditFromStart      bool
@@ -194,6 +197,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.Var(&c.pvcDefaultPrice, "pvc-default-price", "USD per GiB-month for classes nothing else prices; unset means no estimate")
 	fs.StringVar(&c.pvcClassPrices, "pvc-class-prices", "", "USD per GiB-month by storage class, e.g. gp3=0.08,io2=0.125")
 	fs.StringVar(&c.ebsPrices, "ebs-prices", "", "USD per GiB-month by EBS volume type, overriding the us-east-1 defaults, e.g. gp3=0.0952")
+	fs.StringVar(&c.ownerAnnotation, "owner-annotation", detectors.DefaultOwnerAnnotation, "namespace annotation naming the team that owns it (the Overview's owner filter)")
+	fs.StringVar(&c.productionLabel, "production-label", detectors.DefaultProductionLabel.String(), "namespace label key=value marking production namespaces (exec into production)")
 
 	// Audit.
 	fs.StringVar(&c.auditToken, "audit-token", os.Getenv("KUBESENTRY_AUDIT_TOKEN"), "bearer token POST /audit/webhook requires; the webhook is disabled without it (env KUBESENTRY_AUDIT_TOKEN)")
@@ -289,6 +294,12 @@ func (c *config) validate() error {
 	if _, err := prom.ParseMatchers(c.promSelector); err != nil {
 		return fmt.Errorf("-prometheus-selector: %w", err)
 	}
+	if !detectors.ValidLabelKey(c.ownerAnnotation) {
+		return fmt.Errorf("-owner-annotation %q: want an annotation key such as %s", c.ownerAnnotation, detectors.DefaultOwnerAnnotation)
+	}
+	if _, err := detectors.ParseLabelMatch(c.productionLabel); err != nil {
+		return fmt.Errorf("-production-label: %w", err)
+	}
 	return nil
 }
 
@@ -332,7 +343,20 @@ func (c *config) policy() (detectors.Policy, error) {
 		p.Pricing.EBSPrices[k] = v
 	}
 	p.Pricing.DefaultPrice = c.pvcDefaultPrice.ptr()
+	p.OwnerAnnotation = c.ownerAnnotation
+	if p.ProductionLabel, err = detectors.ParseLabelMatch(c.productionLabel); err != nil {
+		return p, fmt.Errorf("-production-label: %w", err)
+	}
 	return p, nil
+}
+
+// namespaceAnnotationKeys are the namespace annotations the informers keep
+// besides kubesentry.io/*: the owner annotation, when it is elsewhere.
+func (c *config) namespaceAnnotationKeys() []string {
+	if strings.HasPrefix(c.ownerAnnotation, "kubesentry.io/") {
+		return nil
+	}
+	return []string{c.ownerAnnotation}
 }
 
 // trustedProxies parses -auth-trusted-proxy-cidrs, refusing a CIDR that
