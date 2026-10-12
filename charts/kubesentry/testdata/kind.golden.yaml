@@ -500,6 +500,8 @@ spec:
             - -cluster-name=kind-kubesentry
             - -auth-mode=token
             - -pvc-min-age=5m
+            - -owner-annotation=kubesentry.io/owner
+            - -production-label=environment=production
             - -prometheus-autodiscover=true
             - -audit-store=memory
             - -audit-log-file=/var/log/kubernetes/audit/audit.log

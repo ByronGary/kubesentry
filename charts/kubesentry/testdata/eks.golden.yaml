@@ -746,6 +746,8 @@ spec:
             - -authz-share-by-groups=true
             - -system-namespaces-add=cert-manager,external-secrets,monitoring,kubesentry-agent
             - -ebs-prices=gp2=0.1,gp3=0.08,io2=0.125
+            - -owner-annotation=kubesentry.io/owner
+            - -production-label=environment=production
             - -prometheus-url=https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012
             - -prometheus-sigv4=true
             - -prometheus-selector=cluster="prod-eks"
