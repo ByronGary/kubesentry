@@ -1,0 +1,143 @@
+# CI: Go (format, vet, race tests with Postgres, vulnerabilities, cross-builds),
+# the web UI (typecheck, tests, and the committed build is current), the Helm
+# chart and alert rules, and the stress harness.
+#
+# Runs on every branch push and pull request, and is called by release.yml so a
+# tag is only released when these pass.
+#
+# Third-party actions are pinned to a commit SHA, with the release in a comment.
+# To update one, look up the new release's commit and change both.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Keep in step with the golang image in the Dockerfile.
+  GO_VERSION: "1.27.x"
+
+jobs:
+  go:
+    name: go
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: kubesentry
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # internal/pgstore and the CloudWatch checkpoint tests run against it.
+      KUBESENTRY_TEST_PG_DSN: postgres://postgres:kubesentry@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+      - name: gofmt
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -w these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - name: cross-compile
+        # The release builds these (release.yml); catch platform-specific code early.
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/server
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/server
+          GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/server
+          GOOS=linux GOARCH=amd64 go build -o /dev/null ./cmd/agent
+          GOOS=linux GOARCH=arm64 go build -o /dev/null ./cmd/agent
+
+  web:
+    name: web
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: internal/web/dist matches the build
+        # The server embeds the committed build; a UI change must commit it.
+        working-directory: .
+        run: |
+          if ! git diff --exit-code --stat -- internal/web/dist || [ -n "$(git status --porcelain -- internal/web/dist)" ]; then
+            echo "::error::internal/web/dist is not the build of web/: run 'cd web && npm run build' and commit internal/web/dist"
+            git status --short -- internal/web/dist
+            exit 1
+          fi
+
+  helm:
+    name: helm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # The golden renders in charts/kubesentry/testdata come from this version.
+          version: v4.3.0
+      - name: chart tests (lint, golden renders, refused configurations)
+        run: hack/helm-test.sh
+      - name: alert rules (promtool, amtool)
+        # promtool and amtool run from the prom/prometheus and prom/alertmanager
+        # images (docker is on the runner); the script pins their versions.
+        run: hack/check-rules.sh
+
+  stress-harness:
+    name: stress-harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: test/stress
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: test/stress/go.sum
+      - run: go vet ./...
+      - run: go test ./...

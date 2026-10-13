@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Builds the kubesentry server and agent images with docker buildx.
+# Release images are built and signed by .github/workflows/release.yml
+# (docs/release.md); --push here is for a registry of your own.
 #
 #   hack/build-images.sh                       host arch, loaded into the local docker as
 #                                              kubesentry:<tag> and kubesentry-agent:<tag>

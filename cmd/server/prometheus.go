@@ -219,7 +219,10 @@ type promSetup struct {
 	pods                 prom.PodLister
 	// discover returns candidate base URLs, best first (kube.DiscoverPrometheus).
 	discover func(ctx context.Context) ([]string, error)
-	retry    time.Duration // between discovery attempts; default 1m
+	// via reaches the discovered candidates: the API server's authenticated
+	// transport when they are service proxy URLs (remote.go). Nil: directly.
+	via   http.RoundTripper
+	retry time.Duration // between discovery attempts; default 1m
 	// heartbeat is how often the health probe runs; default promHeartbeat.
 	heartbeat time.Duration
 }
@@ -228,7 +231,7 @@ type promSetup struct {
 // discovery in the background, retried until a Prometheus answers.
 func (s promSetup) start(ctx context.Context, p *promSource) error {
 	if s.url != "" {
-		st, err := s.connect(ctx, s.url, "flag")
+		st, err := s.connect(ctx, s.url, "flag", nil)
 		if err != nil {
 			return err
 		}
@@ -245,15 +248,22 @@ func (s promSetup) start(ctx context.Context, p *promSource) error {
 }
 
 // connect builds the client (SigV4-signed for Amazon Managed Prometheus)
-// and the leak scanner, which starts at once.
-func (s promSetup) connect(ctx context.Context, url, source string) (*promState, error) {
-	var tr http.RoundTripper
-	if s.sigv4 || awsauth.IsAMP(url) {
-		t, err := awsauth.New(ctx, url, awsauth.Options{Region: s.region})
-		if err != nil {
-			return nil, fmt.Errorf("prometheus SigV4: %w", err)
+// and the leak scanner, which starts at once. via, when set, is the API
+// server's transport for a service proxy URL: it authenticates as the
+// Kubernetes client, so neither SigV4 nor PROMETHEUS_TOKEN applies (the API
+// server would take that header as the caller's credentials).
+func (s promSetup) connect(ctx context.Context, url, source string, via http.RoundTripper) (*promState, error) {
+	tr := via
+	bearer := ""
+	if via == nil {
+		bearer = os.Getenv("PROMETHEUS_TOKEN")
+		if s.sigv4 || awsauth.IsAMP(url) {
+			t, err := awsauth.New(ctx, url, awsauth.Options{Region: s.region})
+			if err != nil {
+				return nil, fmt.Errorf("prometheus SigV4: %w", err)
+			}
+			tr, source = t, "amp"
 		}
-		tr, source = t, "amp"
 	}
 	health := &promHealth{}
 	queryTr := tr
@@ -261,7 +271,7 @@ func (s promSetup) connect(ctx context.Context, url, source string) (*promState,
 		queryTr = http.DefaultTransport
 	}
 	c, err := prom.NewClient(url, prom.Options{
-		BearerToken: os.Getenv("PROMETHEUS_TOKEN"),
+		BearerToken: bearer,
 		Transport:   healthTransport{base: queryTr, h: health},
 		Selector:    s.selector,
 		KSMLimits:   s.ksmLimits,
@@ -334,14 +344,14 @@ func (s promSetup) discoverOnce(ctx context.Context) (*promState, error) {
 	if err != nil && len(urls) == 0 {
 		return nil, fmt.Errorf("discover: %w", err)
 	}
-	bi, rejected, err := prom.Choose(ctx, urls, probeClient(nil))
+	bi, rejected, err := prom.Choose(ctx, urls, probeClient(s.via))
 	for _, r := range rejected {
 		slog.Info("prometheus candidate rejected", "url", r.URL, "reason", r.Reason)
 	}
 	if err != nil {
 		return nil, err
 	}
-	st, err := s.connect(ctx, bi.URL, "discovered")
+	st, err := s.connect(ctx, bi.URL, "discovered", s.via)
 	if err != nil {
 		return nil, err
 	}

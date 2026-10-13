@@ -16,7 +16,31 @@ A standalone Kubernetes dashboard backend focused on what cluster browsers like 
 | Web UI (findings worklist, per-pod diagnostics with memory chart) | Implemented, embedded in the binary |
 | Enterprise scale and access (SSO via oauth2-proxy, per-user scope by Kubernetes RBAC, informer cache, paging) | Implemented; Helm chart in `charts/kubesentry` |
 
-## Quick start
+## Install
+
+Releases are built by GitHub Actions from version tags (`docs/release.md`):
+
+- **Binaries** for macOS (Apple Silicon and Intel), Linux and Windows on the [releases page](https://github.com/ByronGary/kubesentry/releases), with `SHA256SUMS`. The UI is built in.
+- **Images** `ghcr.io/byrongary/kubesentry` and `ghcr.io/byrongary/kubesentry-agent`, multi-arch, signed with cosign, with SBOM and provenance.
+- **Helm chart** `oci://ghcr.io/byrongary/charts/kubesentry`, for running in the cluster (`docs/deploy-eks.md`):
+
+  ```bash
+  helm upgrade --install kubesentry oci://ghcr.io/byrongary/charts/kubesentry --version 0.1.0 -n kubesentry --create-namespace
+  ```
+
+### From your workstation (remote mode)
+
+kubesentry also runs outside the cluster, with your own kubeconfig identity and nothing installed in the cluster. On EKS:
+
+```bash
+aws sso login --profile work
+aws eks update-kubeconfig --name prod-eks --region us-east-1 --profile work --alias prod-eks
+kubesentry -kube-context prod-eks -auth-mode none        # http://127.0.0.1:8080
+```
+
+The in-cluster Prometheus is queried through the API server's service proxy, so nothing has to be exposed; Amazon Managed Prometheus (`-prometheus-url`, SigV4 from your credentials) and the CloudWatch audit log (`-cloudwatch`) work too. Where the AWS CLI is missing (the container image), `-eks-cluster` makes kubesentry sign in to EKS by itself. `docs/run-remote.md` covers installing, the permissions your identity needs, and running several clusters or a shared instance on EC2/ECS.
+
+## Quick start (from source)
 
 ```bash
 go mod tidy            # downloads client-go and friends
@@ -106,9 +130,9 @@ Access has three modes (`-auth-mode`):
 
 - **proxy**: an SSO proxy (oauth2-proxy, as the Helm chart deploys it) signs users in and passes their identity in headers. With the sidecar, kubesentry listens only on a Unix socket the two containers share (`-addr unix:///var/run/kubesentry/web.sock`) and trusts the headers on it alone; a proxy elsewhere is trusted from `-auth-trusted-proxy-cidrs` (never `0.0.0.0/0` without `-auth-allow-any-proxy`, and with a startup warning for loopback, which `kubectl port-forward` also comes from). Each user sees exactly what their Kubernetes RBAC lets them list: kubesentry asks the API server with SubjectAccessReviews and caches the answers (`-authz-cache-ttl`). A user can force a recheck after an RBAC change. Cluster-scoped data (nodes, volumes, storage classes, cluster RBAC, ClusterIssuers) needs its cluster-wide permission; without it the pages show only names related to the user's own objects. See `docs/deploy-eks.md`.
 - **token** (default): the shared `-api-token`, a break-glass identity that sees everything. The UI asks for it and keeps it for the browser tab only. Without a token the server only listens on loopback.
-- **none**: everyone sees everything; loopback only. Here, and in token mode without a token, only the Host names `localhost`, `127.0.0.1` and `[::1]` are answered (`-allowed-hosts`), so a web page cannot reach the server through DNS rebinding.
+- **none**: everyone sees everything; loopback only. This is the local mode for running on your own workstation (`docs/run-remote.md`). Here, and in token mode without a token, only the Host names `localhost`, `127.0.0.1` and `[::1]` are answered (`-allowed-hosts`), so a web page cannot reach the server through DNS rebinding.
 
-Credentials are resolved from `-kubeconfig`, then the in-cluster service account, then `KUBECONFIG` / `~/.kube/config`.
+Credentials are resolved from `-kubeconfig` (with `-kube-context`, or its current context), then the in-cluster service account, then `KUBECONFIG` / `~/.kube/config`. With `-eks-cluster`, kubesentry signs every request with an EKS token it mints from AWS credentials, and without a kubeconfig takes the endpoint and CA from `eks:DescribeCluster`.
 
 ### Flags
 
@@ -124,6 +148,9 @@ The most used; `docs/contracts.md` lists every flag, and `kubesentry -h` describ
 | `-max-inflight-per-identity` | `4` | Requests one user may have in flight on the expensive routes (`/oom`, pod diagnostics, audit summary); more get 429 |
 | `-tls-cert`, `-tls-key` | | Serve HTTPS on the web and ingest listeners |
 | `-kubeconfig` | | Path to kubeconfig |
+| `-kube-context` | current context | kubeconfig context to use |
+| `-eks-cluster` | | Sign in to this EKS cluster with a token kubesentry mints from AWS credentials (no AWS CLI needed); without `-kubeconfig`/`-kube-context` the endpoint and CA come from `eks:DescribeCluster`. Region from `-aws-region` |
+| `-prometheus-via-apiserver` | `auto` | Reach discovered Prometheus Services and `-prometheus-service` through the API server's service proxy: `auto` (outside the cluster), `true` or `false` |
 | `-cache` | `true` | Serve from shared informers and a precomputed view; `false` lists the cluster on every request (debugging) |
 | `-cluster-name` | | Shown in the UI; names the EKS CloudWatch log group |
 | `-prometheus-url` | | Prometheus (or an AMP workspace, signed with SigV4) for leak detection; `PROMETHEUS_TOKEN` for bearer auth (preferred over `user:password@` in the URL, which is sent as basic auth but kept out of logs and `/info`). Empty: discover an in-cluster Prometheus (`-prometheus-autodiscover`) |
@@ -290,7 +317,7 @@ internal/snapshot     the precomputed view requests are served from, rebuilt as 
 internal/auth         authentication (proxy headers, token) and the SubjectAccessReview authorizer
 internal/metrics      Prometheus text exposition of kubesentry's own metrics
 internal/prom         Prometheus client, result cache, discovery probe, background leak scanner
-internal/awsauth      SigV4 signing for Amazon Managed Prometheus
+internal/awsauth      SigV4 signing for Amazon Managed Prometheus, EKS tokens and DescribeCluster
 internal/procmon      /proc scanner, cgroup-to-pod mapping, redaction, per-node store
 internal/audit        audit event parsing, tagging, memory store, file tailer
 internal/pgstore      Postgres audit store (the only package that imports pgx)
