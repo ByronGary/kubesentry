@@ -497,13 +497,64 @@ pricing:
 # filters and attributes by owner and counts exec into production; alerting
 # routes by the same annotation and label.
 alerts:
-  # -- -owner-annotation: the namespace annotation naming the owning team.
-  # Every kubesentry.io/* namespace annotation is kept for routing hints.
+  # -- -alerts: evaluate findings and send them to Alertmanager (docs/alerts.md).
+  # Notify only: kubesentry never writes to the cluster. With replicas > 1 it
+  # needs audit.store=postgres: the replica holding the alerts lock notifies.
+  enabled: false
+  # -- -owner-annotation: the namespace annotation naming the owning team (the
+  # alerts' owner label). Every other kubesentry.io/<x> namespace annotation
+  # becomes the label kubesentry_<x>, a routing hint (e.g. kubesentry.io/slack-channel).
   ownerAnnotation: kubesentry.io/owner
   production:
-    # -- -production-label: namespaces labelled labelKey=labelValue are production.
+    # -- -production-label: namespaces labelled labelKey=labelValue are
+    # production (the alerts' production label).
     labelKey: environment
     labelValue: production
+  # -- Owner of findings whose namespace has no owner annotation, and of
+  # cluster-scoped findings (-alerts-default-owner).
+  defaultOwner: platform
+  # -- Alerts are evaluated after view rebuilds, at most this often, and at
+  # least this often in a quiet cluster (-alerts-interval).
+  interval: 30s
+  # -- Open alerts are posted again this often, with endsAt 4x this ahead (-alerts-resend).
+  resend: 1m
+  # -- A finding gone this long resolves (-alerts-resolve-grace).
+  resolveGrace: 5m
+  # -- More new alerts than this in one evaluation go out as one digest per
+  # owner, labelled kubesentry_digest="true" (-alerts-max-new).
+  maxNew: 50
+  # -- A memory leak alert is critical when the limit is closer than this many
+  # hours; null uses thresholds.leakCritHours (-alerts-leak-crit-hours).
+  leakCritHours: null
+  # -- Each alert's runbook_url is this plus "#<alert name in lower case>";
+  # empty: docs/alerts.md on GitHub. Point it at your own copy if you keep runbooks internally.
+  runbookBaseURL: ""
+  alertmanager:
+    # -- Alertmanager base URLs (-alertmanager-url); every alert goes to each
+    # (list both members of an HA pair). Amazon Managed Prometheus:
+    # https://aps-workspaces.<region>.amazonaws.com/workspaces/<id>/alertmanager,
+    # signed with SigV4 by the pod's IAM role (aps:CreateAlertManagerAlerts).
+    # Empty: findings are tracked and listed, nobody is notified.
+    urls: []
+    # -- Secret holding the bearer token (tokenKey) or, with basicAuth.username,
+    # the basic auth password (passwordKey). Not with SigV4.
+    existingSecret: ""
+    tokenKey: token
+    basicAuth:
+      username: ""
+      passwordKey: password
+    # -- Sign requests with SigV4; automatic when every URL is an AMP workspace.
+    sigv4: false
+    # -- CA bundle that signs Alertmanager's certificate (added to the system
+    # roots), from a ConfigMap or a Secret.
+    ca:
+      configMap: ""
+      secret: ""
+      key: ca.crt
+
+# -- kubesentry's URL as users reach it, e.g. https://kubesentry.example.com
+# (-external-url): each alert links to its finding there (kubesentry_url).
+externalURL: ""
 
 # -- Node agent DaemonSet: reports the processes inside pods. Needs hostPID,
 # which the Pod Security baseline and restricted levels reject.
@@ -634,6 +685,11 @@ networkPolicy:
       toCIDRs: []
       toNamespaces: []
       ports: [9090]
+    # -- An in-cluster Alertmanager (alerts.alertmanager.urls); AMP's goes over https.
+    alertmanager:
+      toCIDRs: []
+      toNamespaces: []
+      ports: [9093]
     # -- Raw egress rules appended to the policy.
     extra: []
 

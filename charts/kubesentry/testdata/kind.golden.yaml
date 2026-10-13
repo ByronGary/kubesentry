@@ -606,16 +606,22 @@ spec:
   groups:
     - name: kubesentry
       rules:
+        # Stale only while a change is waiting for a rebuild: in a quiet
+        # cluster the view is old and so is the last change.
         - alert: KubesentrySnapshotStale
-          expr: max by (namespace, pod) (kubesentry_snapshot_age_seconds{namespace="kubesentry"}) > 120
+          expr: |
+            max by (namespace, pod) (kubesentry_snapshot_age_seconds{namespace="kubesentry"}) > 120
+            and
+            max by (namespace, pod) (kubesentry_snapshot_last_change_timestamp_seconds{namespace="kubesentry"})
+              > max by (namespace, pod) (time() - kubesentry_snapshot_age_seconds{namespace="kubesentry"})
           for: 5m
           labels:
             severity: warning
           annotations:
             summary: kubesentry is serving a stale view of the cluster.
             description: >-
-              {{ $labels.pod }} has served a snapshot older than 120s for 5 minutes.
-              Its informers are not keeping up with the API server, or the API server is unreachable.
+              {{ $labels.pod }} has served a snapshot older than 120s for 5 minutes while
+              cluster changes waited for a rebuild. Its rebuilds are failing or its informers are not keeping up with the API server.
             runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotstale
         - alert: KubesentrySnapshotBuildSlow
           expr: |
@@ -704,6 +710,53 @@ spec:
               5% of its requests, for 15 minutes: route timeouts, an overloaded audit store,
               a full audit write queue (ingest_audit_webhook), or an ingest route without its token.
             runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryserviceunavailable
+        - alert: KubesentryRequestsRejected
+          expr: |
+            sum by (namespace, reason) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+              > 0.05
+            and on (namespace)
+            sum by (namespace) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+              / (
+                sum by (namespace) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+                + sum by (namespace) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              )
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry turns API requests away before routing them.
+            description: >-
+              kubesentry in {{ $labels.namespace }} rejected requests ({{ $labels.reason }}) at
+              {{ printf "%.2f" $value }}/s, more than 5% of its API requests, for
+              15 minutes: users exceed the per-identity rate limit (server.rateLimit, 429), or more requests are in flight than
+              server.maxInflight allows (503).
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryrequestsrejected
+        - alert: KubesentryPrometheusUnreachable
+          expr: min by (namespace, pod) (kubesentry_dependency_up{namespace="kubesentry",dependency="prometheus"}) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot query Prometheus.
+            description: >-
+              {{ $labels.pod }} has failed to query its Prometheus for 10 minutes: memory charts, the /oom page and the
+              background leak scan (and so memory leak alerts) have no data. /info and the ops /readyz name the error.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryprometheusunreachable
+        - alert: KubesentryLeakScanFailing
+          expr: |
+            sum by (namespace, pod) (increase(kubesentry_leak_scan_runs_total{namespace="kubesentry",result="failed"}[30m])) > 0
+            unless on (namespace, pod)
+            sum by (namespace, pod) (increase(kubesentry_leak_scan_runs_total{namespace="kubesentry",result=~"ok|partial"}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's background leak scan keeps failing.
+            description: >-
+              No leak scan on {{ $labels.pod }} has succeeded for an hour: the /oom page and the memory leak alerts keep
+              the last good findings, so new leaks go unnoticed. The scan's errors are in /api/v1/oom warnings and the server log.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryleakscanfailing
         - alert: KubesentryAgentNodesDropped
           expr: |
             max by (namespace) (kubesentry_agent_nodes_reporting{namespace="kubesentry"})

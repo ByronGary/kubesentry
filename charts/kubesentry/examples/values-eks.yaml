@@ -159,6 +159,18 @@ audit:
       # Defaults: log group /aws/eks/prod-eks/cluster, streams kube-apiserver-audit*.
       start: 24h
 
+# Findings become alerts in the workspace's alert manager, which routes them to
+# SNS by owner (docs/monitoring-eks.md, "Routing by owner"). The IAM role above
+# needs aps:CreateAlertManagerAlerts on the workspace. Owners come from the
+# kubesentry.io/owner namespace annotation; the rest go to "platform".
+alerts:
+  enabled: true
+  alertmanager:
+    urls:
+      - https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012/alertmanager
+# Alerts link to their finding here.
+externalURL: https://kubesentry.prod.example.com
+
 systemNamespaces:
   add:
     - cert-manager

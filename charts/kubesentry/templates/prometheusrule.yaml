@@ -31,16 +31,22 @@ spec:
   groups:
     - name: kubesentry
       rules:
+        # Stale only while a change is waiting for a rebuild: in a quiet
+        # cluster the view is old and so is the last change.
         - alert: KubesentrySnapshotStale
-          expr: max by (namespace, pod) ({{ printf "kubesentry_snapshot_age_seconds{%s}" $m }}) > {{ $pr.snapshotStaleSeconds }}
+          expr: |
+            max by (namespace, pod) ({{ printf "kubesentry_snapshot_age_seconds{%s}" $m }}) > {{ $pr.snapshotStaleSeconds }}
+            and
+            max by (namespace, pod) ({{ printf "kubesentry_snapshot_last_change_timestamp_seconds{%s}" $m }})
+              > max by (namespace, pod) (time() - {{ printf "kubesentry_snapshot_age_seconds{%s}" $m }})
           for: 5m
           labels:
             severity: warning
           annotations:
             summary: kubesentry is serving a stale view of the cluster.
             description: >-
-              {{ "{{" }} $labels.pod {{ "}}" }} has served a snapshot older than {{ $pr.snapshotStaleSeconds }}s for 5 minutes.
-              Its informers are not keeping up with the API server, or the API server is unreachable.
+              {{ "{{" }} $labels.pod {{ "}}" }} has served a snapshot older than {{ $pr.snapshotStaleSeconds }}s for 5 minutes while
+              cluster changes waited for a rebuild. Its rebuilds are failing or its informers are not keeping up with the API server.
             runbook_url: {{ $rb }}#kubesentrysnapshotstale
         - alert: KubesentrySnapshotBuildSlow
           expr: |
@@ -187,6 +193,83 @@ spec:
               {{ round (mulf $pr.rejectedRatio 100) 1 }}% of its requests, for 15 minutes: route timeouts, an overloaded audit store,
               a full audit write queue (ingest_audit_webhook), or an ingest route without its token.
             runbook_url: {{ $rb }}#kubesentryserviceunavailable
+        - alert: KubesentryRequestsRejected
+          expr: |
+            sum by (namespace, reason) (rate({{ printf "kubesentry_http_rejected_total{%s,reason=~\"rate_limit|max_inflight\"}" $m }}[10m]))
+              > {{ include "kubesentry.scalar" $pr.rejectedMinPerSecond }}
+            and on (namespace)
+            sum by (namespace) (rate({{ printf "kubesentry_http_rejected_total{%s,reason=~\"rate_limit|max_inflight\"}" $m }}[10m]))
+              / (
+                sum by (namespace) (rate({{ printf "kubesentry_http_rejected_total{%s,reason=~\"rate_limit|max_inflight\"}" $m }}[10m]))
+                + sum by (namespace) (rate({{ printf "kubesentry_http_requests_total{%s}" $m }}[10m]))
+              )
+              > {{ include "kubesentry.scalar" $pr.rejectedRatio }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry turns API requests away before routing them.
+            description: >-
+              kubesentry in {{ "{{" }} $labels.namespace {{ "}}" }} rejected requests ({{ "{{" }} $labels.reason {{ "}}" }}) at
+              {{ "{{" }} printf "%.2f" $value {{ "}}" }}/s, more than {{ round (mulf $pr.rejectedRatio 100) 1 }}% of its API requests, for
+              15 minutes: users exceed the per-identity rate limit (server.rateLimit, 429), or more requests are in flight than
+              server.maxInflight allows (503).
+            runbook_url: {{ $rb }}#kubesentryrequestsrejected
+        - alert: KubesentryPrometheusUnreachable
+          expr: min by (namespace, pod) ({{ printf "kubesentry_dependency_up{%s,dependency=\"prometheus\"}" $m }}) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot query Prometheus.
+            description: >-
+              {{ "{{" }} $labels.pod {{ "}}" }} has failed to query its Prometheus for 10 minutes: memory charts, the /oom page and the
+              background leak scan (and so memory leak alerts) have no data. /info and the ops /readyz name the error.
+            runbook_url: {{ $rb }}#kubesentryprometheusunreachable
+        - alert: KubesentryLeakScanFailing
+          expr: |
+            sum by (namespace, pod) (increase({{ printf "kubesentry_leak_scan_runs_total{%s,result=\"failed\"}" $m }}[30m])) > 0
+            unless on (namespace, pod)
+            sum by (namespace, pod) (increase({{ printf "kubesentry_leak_scan_runs_total{%s,result=~\"ok|partial\"}" $m }}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's background leak scan keeps failing.
+            description: >-
+              No leak scan on {{ "{{" }} $labels.pod {{ "}}" }} has succeeded for an hour: the /oom page and the memory leak alerts keep
+              the last good findings, so new leaks go unnoticed. The scan's errors are in /api/v1/oom warnings and the server log.
+            runbook_url: {{ $rb }}#kubesentryleakscanfailing
+        {{- if .Values.alerts.enabled }}
+        - alert: KubesentryAlertsNotEvaluated
+          expr: sum by (namespace) ({{ printf "kubesentry_alerts_leader{%s}" $m }}) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: No kubesentry replica evaluates alerts.
+            description: >-
+              For 10 minutes no replica in {{ "{{" }} $labels.namespace {{ "}}" }} has held the alerts lock, so findings are neither
+              evaluated nor sent to Alertmanager. With Postgres, check that the replicas reach it; the server log says why.
+            runbook_url: {{ $rb }}#kubesentryalertsnotevaluated
+        {{- if .Values.alerts.alertmanager.urls }}
+        - alert: KubesentryAlertmanagerFailing
+          expr: |
+            sum by (namespace, pod) (rate({{ printf "kubesentry_alerts_sent_total{%s,result=~\"failed|dropped\"}" $m }}[10m])) > 0
+            and on (namespace, pod)
+            max by (namespace, pod) ({{ printf "kubesentry_alerts_leader{%s}" $m }}) == 1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot deliver its alerts to Alertmanager.
+            description: >-
+              {{ "{{" }} $labels.pod {{ "}}" }}, which sends kubesentry's alerts, has failed or dropped deliveries to Alertmanager for
+              15 minutes: findings are not reaching anyone. /info (alerts.lastError) names the Alertmanager and the error. If
+              Alertmanager itself is down, this alert cannot reach you through it either.
+            runbook_url: {{ $rb }}#kubesentryalertmanagerfailing
+        {{- end }}
+        {{- end }}
         {{- if .Values.agent.enabled }}
         - alert: KubesentryAgentNodesDropped
           expr: |

@@ -95,6 +95,8 @@ type config struct {
 	cloudwatchStart     time.Duration
 	cloudwatchEndpoint  string
 	awsRegion           string
+
+	alerts alertsConfig // alerts.go: -alerts, -alertmanager-*, -alerts-*, -external-url
 }
 
 // parseFlags reads the server's flags from args.
@@ -222,6 +224,8 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.StringVar(&c.cloudwatchEndpoint, "cloudwatch-endpoint", "", "CloudWatch Logs endpoint override (tests, VPC endpoints)")
 	fs.StringVar(&c.awsRegion, "aws-region", "", "AWS region (default from the environment, e.g. AWS_REGION)")
 
+	c.alerts.register(fs, dur)
+
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
@@ -305,7 +309,7 @@ func (c *config) validate() error {
 	if _, err := detectors.ParseLabelMatch(c.productionLabel); err != nil {
 		return fmt.Errorf("-production-label: %w", err)
 	}
-	return nil
+	return c.alerts.validate(c)
 }
 
 // policy builds the detectors' policy from the flags. The server's own

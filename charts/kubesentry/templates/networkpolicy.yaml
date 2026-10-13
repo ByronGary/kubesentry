@@ -166,6 +166,24 @@ spec:
           protocol: TCP
         {{- end }}
     {{- end }}
+    {{- if and .Values.alerts.enabled (or $eg.alertmanager.toCIDRs $eg.alertmanager.toNamespaces) }}
+    # In-cluster Alertmanager.
+    - to:
+        {{- range $eg.alertmanager.toCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- range $eg.alertmanager.toNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        {{- range $eg.alertmanager.ports }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+    {{- end }}
     {{- with $eg.extra }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

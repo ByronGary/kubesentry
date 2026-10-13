@@ -95,6 +95,9 @@ func run(cfg *config) error {
 	var ready atomic.Bool
 	hist := snapshot.NewHistory(snapshot.DefaultHistoryStep, snapshot.DefaultHistoryBuckets)
 	srv.History = hist
+	// built tells the alerts a new view is ready (coalesced: one pending
+	// signal stands for many builds).
+	built := make(chan struct{}, 1)
 	if cfg.cache {
 		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
 			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName})
@@ -106,6 +109,10 @@ func run(cfg *config) error {
 				onBuild(v, took, err)
 				if err == nil {
 					hist.Record(v)
+					select {
+					case built <- struct{}{}:
+					default:
+					}
 				}
 			}}
 		go func() {
@@ -187,11 +194,21 @@ func run(cfg *config) error {
 		dependencyUp("prometheus", metricsSource.Health)
 	}
 
-	closers, err := setupAudit(ctx, cfg, policy, srv)
+	closers, pg, err := setupAudit(ctx, cfg, policy, srv)
 	if err != nil {
 		return err
 	}
 	defer closers.close()
+
+	if cfg.alerts.enabled {
+		if cfg.auditStore != "postgres" {
+			slog.Warn("alerts with the memory store: run one replica; with more, each would notify on its own (use -audit-store=postgres)")
+		}
+		_, err := alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built}.start(ctx, srv)
+		if err != nil {
+			return fmt.Errorf("alerts: %w", err)
+		}
+	}
 
 	if cfg.agentToken != "" {
 		store := procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})

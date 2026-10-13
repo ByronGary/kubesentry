@@ -1,0 +1,25 @@
+# The alerts golden case (hack/helm-test.sh): findings go to an in-cluster
+# Alertmanager pair with a bearer token and a private CA, through a
+# restricted egress policy, with the alerting rules rendered.
+alerts:
+  enabled: true
+  defaultOwner: platform-team
+  maxNew: 100
+  leakCritHours: 12
+  alertmanager:
+    urls:
+      - https://alertmanager-0.alertmanager-operated.monitoring:9093
+      - https://alertmanager-1.alertmanager-operated.monitoring:9093
+    existingSecret: kubesentry-alertmanager
+    ca:
+      configMap: alertmanager-ca
+externalURL: https://kubesentry.example.com
+networkPolicy:
+  enabled: true
+  egress:
+    enabled: true
+    alertmanager:
+      toNamespaces: [monitoring]
+metrics:
+  prometheusRule:
+    enabled: true

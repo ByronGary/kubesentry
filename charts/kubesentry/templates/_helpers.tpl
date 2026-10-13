@@ -187,6 +187,23 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- $v := .Values -}}
 {{- $mode := include "kubesentry.authMode" . -}}
 {{- $sources := include "kubesentry.auditSources" . -}}
+{{- if and (gt (int $v.replicas) 1) $v.alerts.enabled (ne $v.audit.store "postgres") -}}
+{{- fail (printf "kubesentry: replicas=%d with alerts.enabled needs audit.store=postgres: the replica holding a Postgres advisory lock evaluates and notifies, and with the memory store every replica would notify on its own. Set audit.store=postgres with audit.postgres.existingSecret, or replicas=1." (int $v.replicas)) -}}
+{{- end -}}
+{{- $am := $v.alerts.alertmanager -}}
+{{- if $v.alerts.enabled -}}
+{{- if and $am.basicAuth.username (not $am.existingSecret) -}}
+{{- fail "kubesentry: alerts.alertmanager.basicAuth.username needs alerts.alertmanager.existingSecret, a Secret holding the password (passwordKey)." -}}
+{{- end -}}
+{{- $amp := false -}}
+{{- range $am.urls }}{{ if regexMatch "^https://aps-workspaces\\." . }}{{ $amp = true }}{{ end }}{{ end -}}
+{{- if and (or $am.sigv4 $amp) $am.existingSecret -}}
+{{- fail "kubesentry: the Amazon Managed Prometheus alert manager (SigV4) authenticates with the pod's IAM role: drop alerts.alertmanager.existingSecret." -}}
+{{- end -}}
+{{- if and $am.ca.configMap $am.ca.secret -}}
+{{- fail "kubesentry: set alerts.alertmanager.ca.configMap or alerts.alertmanager.ca.secret, not both." -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int $v.replicas) 1) (eq $v.audit.store "memory") $sources -}}
 {{- fail (printf "kubesentry: replicas=%d with audit.store=memory and audit sources enabled (%s): each replica would keep a different, partial audit history. Set audit.store=postgres with audit.postgres.existingSecret, or replicas=1." (int $v.replicas) $sources) -}}
 {{- end -}}
@@ -306,6 +323,21 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- /* owners and production namespaces */ -}}
 {{- with $v.alerts.ownerAnnotation }}{{ $a = append $a (printf "-owner-annotation=%s" .) }}{{ end -}}
 {{- with $v.alerts.production.labelKey }}{{ $a = append $a (printf "-production-label=%s=%s" . (toString $v.alerts.production.labelValue)) }}{{ end -}}
+{{- /* alerts */ -}}
+{{- $al := $v.alerts -}}
+{{- if $al.enabled -}}
+{{- $a = append $a "-alerts=true" -}}
+{{- with $al.alertmanager.urls }}{{ $a = append $a (printf "-alertmanager-url=%s" (join "," .)) }}{{ end -}}
+{{- if $al.alertmanager.sigv4 }}{{ $a = append $a "-alertmanager-sigv4=true" }}{{ end -}}
+{{- with $al.alertmanager.basicAuth.username }}{{ $a = append $a (printf "-alertmanager-basic-auth-user=%s" .) }}{{ end -}}
+{{- if or $al.alertmanager.ca.configMap $al.alertmanager.ca.secret }}{{ $a = append $a (printf "-alertmanager-ca-file=/etc/kubesentry/alertmanager-ca/%s" $al.alertmanager.ca.key) }}{{ end -}}
+{{- range $flag, $val := dict "alerts-interval" $al.interval "alerts-resend" $al.resend "alerts-resolve-grace" $al.resolveGrace "alerts-default-owner" $al.defaultOwner "alerts-runbook-url" $al.runbookBaseURL -}}
+{{- with $val }}{{ $a = append $a (printf "-%s=%s" $flag .) }}{{ end -}}
+{{- end -}}
+{{- if not (kindIs "invalid" $al.maxNew) }}{{ $a = append $a (printf "-alerts-max-new=%s" (include "kubesentry.scalar" $al.maxNew)) }}{{ end -}}
+{{- if not (kindIs "invalid" $al.leakCritHours) }}{{ $a = append $a (printf "-alerts-leak-crit-hours=%s" (include "kubesentry.scalar" $al.leakCritHours)) }}{{ end -}}
+{{- with $v.externalURL }}{{ $a = append $a (printf "-external-url=%s" .) }}{{ end -}}
+{{- end -}}
 {{- /* prometheus */ -}}
 {{- $p := $v.prometheus -}}
 {{- $region := include "kubesentry.awsRegion" . -}}
