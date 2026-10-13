@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ByronGary/kubesentry/internal/alerts"
 )
 
 const partitionPrefix = "audit_events_"
@@ -20,13 +22,17 @@ type MaintainResult struct {
 	PurgedRows  int64    // rows past retention deleted from the default partition
 	Partitions  int      // daily partitions after the run
 	DefaultRows int64    // rows left in the default partition (should be 0)
+	// AlertsPruned counts alert findings deleted because they resolved
+	// more than alerts.Retention ago.
+	AlertsPruned int
 }
 
 // Maintain keeps the daily partitions in shape: it creates audit_events_YYYYMMDD
 // (UTC) from yesterday to three days ahead, plus a partition for any day that
 // has rows in the default partition (a backfill of old events, clock skew),
 // moving those rows into it; drops partitions entirely older than Retention
-// and purges such rows from the default partition; then ANALYZEs what it
+// and purges such rows from the default partition; deletes alert findings
+// resolved more than alerts.Retention ago; then ANALYZEs what it
 // created. It is idempotent and serializes itself across replicas with a
 // transaction-level advisory lock, so any replica may run it; running it on
 // the leader (TryLead) merely avoids redundant work. Open runs it once.
@@ -112,14 +118,19 @@ func (s *Store) MaintainReport(ctx context.Context) (MaintainResult, error) {
 		return res, fmt.Errorf("pgstore: maintain: %w", err)
 	}
 	sort.Strings(res.Dropped)
+	if n, err := s.Alerts().Prune(ctx, now.Add(-alerts.Retention)); err != nil {
+		s.log.Warn("pruning resolved alert findings failed", "err", err)
+	} else {
+		res.AlertsPruned = n
+	}
 	for _, name := range res.Created {
 		if _, err := s.pool.Exec(ctx, "ANALYZE "+pgx.Identifier{name}.Sanitize()); err != nil {
 			s.log.Warn("analyze new partition failed", "partition", name, "err", err)
 		}
 	}
-	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.PurgedRows > 0 {
+	if len(res.Created) > 0 || len(res.Dropped) > 0 || res.PurgedRows > 0 || res.AlertsPruned > 0 {
 		s.log.Info("audit partitions maintained", "created", res.Created, "dropped", res.Dropped,
-			"moved", res.Moved, "purged", res.PurgedRows, "partitions", res.Partitions)
+			"moved", res.Moved, "purged", res.PurgedRows, "partitions", res.Partitions, "alertsPruned", res.AlertsPruned)
 	}
 	return res, nil
 }
