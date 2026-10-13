@@ -82,6 +82,9 @@ Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in 
 | `-ingest-addr` / `-ops-addr` / `-pprof` | | listeners (above) |
 | `-cache` | `true` | informer cache; `false` lists per request (debugging) |
 | `-kube-qps` / `-kube-burst` | `50` / `100` | client-go limits |
+| `-kube-context` | current context | kubeconfig context (`ConfigOverrides.CurrentContext`); setting it skips the in-cluster configuration |
+| `-eks-cluster` | | sign in to EKS with a token kubesentry mints (no AWS CLI); without `-kubeconfig`/`-kube-context` the endpoint and CA come from `eks:DescribeCluster`; also the default `-cluster-name` |
+| `-prometheus-via-apiserver` | `auto` | `auto` (when not in cluster), `true`, `false`: discovered Prometheus Services and `-prometheus-service` are queried at `https://<apiserver>/api/v1/namespaces/<ns>/services/<name>:<port>/proxy` with the kube client's transport; `PROMETHEUS_TOKEN` and SigV4 are not applied there |
 | `-snapshot-min-interval` / `-snapshot-max-delay` | `2s` / `10s` | view rebuild debounce |
 | `-cluster-name` | | shown in the UI; CloudWatch log group default `/aws/eks/<name>/cluster` |
 | `-system-namespaces` / `-system-namespaces-add` | Policy default / | replace or extend system namespaces |
@@ -111,6 +114,8 @@ Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in 
 | `-version` | | print the version and exit |
 
 Every duration flag also takes days (`30d`, `1d12h`). `-leak-min-slope` is a growth per hour in bytes, with an optional unit (`1MiB`, `512KiB`). `GOMEMLIMIT`, when unset, defaults to 90% of the cgroup memory limit. Kept from before: `-addr`, `-kubeconfig`, `-api-token`, `-agent-token`, `-audit-token`, `-prometheus-url` (with `PROMETHEUS_TOKEN`), `-pvc-min-age`, `-pvc-class-prices`, `-audit-log-file`, `-audit-from-start`, `-audit-journal` (memory store only) and `-audit-max-events` (memory store).
+
+Remote mode (`docs/run-remote.md`): `internal/awsauth` mints the EKS token (`EKSTokenSource.Token`: `k8s-aws-v1.` + base64url of a presigned STS `GetCallerIdentity` URL with `x-k8s-aws-id` signed, valid 14 minutes or until the credentials expire) and calls `DescribeCluster` with its SigV4 signer. `internal/kube` takes the token as a plain `ClientOptions.TokenSource func(ctx) (token, expiry, error)`, caches it until a minute before expiry or a 401, and drops the kubeconfig's credentials; `ClientOptions.ExecFallback` is asked for one when the kubeconfig's `aws eks get-token` or `aws-iam-authenticator` plugin is not installed. `Clients.InCluster` says which configuration was used, and `Clients.ServiceProxy(ns, name, port)` returns a Service's proxy URL and the authenticated transport (`rest.TransportFor`). The cgroup memory limit is read on Linux only; the server builds for darwin, windows and linux.
 
 Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare host, e.g. the headless ingest Service: the agent resolves it and posts to every address with the scheme and port of `-server`, verifying TLS against the `-server` host; if resolution fails it posts to `-server` alone), `-ca-file`, `-version`. Both binaries take `-X main.version=...` at build time; the server's Kubernetes user agent is `kubesentry/<version>`, the agent's `kubesentry-agent/<version>`.
 

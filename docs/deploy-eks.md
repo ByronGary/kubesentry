@@ -50,7 +50,9 @@ Prometheus / ADOT ───────────────> kubesentry-ops 
 
 ## 2. Images
 
-Build multi-arch images (linux/amd64 and linux/arm64) with an SBOM and provenance attestations, and push them to ECR:
+Each release publishes multi-arch, cosign-signed images to `ghcr.io/byrongary/kubesentry` and `ghcr.io/byrongary/kubesentry-agent`, which are the chart's defaults, and the chart itself to `oci://ghcr.io/byrongary/charts/kubesentry` (`docs/release.md`). Use them as they are, or copy them into ECR if your nodes may pull only from there (`docker buildx imagetools create -t <ecr repo>:0.1.0 ghcr.io/byrongary/kubesentry:0.1.0` copies every architecture).
+
+To build your own instead, build multi-arch images (linux/amd64 and linux/arm64) with an SBOM and provenance attestations, and push them to ECR:
 
 ```bash
 aws ecr create-repository --repository-name kubesentry
