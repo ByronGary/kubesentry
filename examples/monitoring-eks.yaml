@@ -317,8 +317,8 @@ alertmanager:
           routes:
             - receiver: team-payments-pager
               matchers: ['severity = "critical"']
-        # Until kubesentry sends owner labels, a team's Prometheus alerts can be
-        # routed by namespace instead (a second branch to the same receivers):
+        # Prometheus alerts carry no owner label: route a team's by namespace
+        # instead (a second branch to the same receivers):
         # - receiver: team-payments
         #   matchers: ['namespace =~ "payments|payments-.+"']
         #   routes:
@@ -329,13 +329,15 @@ alertmanager:
           matchers: ['severity = "critical"']
     inhibit_rules:
       # A critical alert mutes the warning or info of the same name about the
-      # same thing. A label missing from both alerts counts as equal.
+      # same thing. A label missing from both alerts counts as equal, so the
+      # list names kubesentry's workload and object labels too: without them a
+      # critical kubesentry alert would mute every warning of its namespace.
       - source_matchers: ['severity = "critical"']
         target_matchers: ['severity =~ "warning|info"']
-        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint]
+        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint, workload, object]
       - source_matchers: ['severity = "warning"']
         target_matchers: ['severity = "info"']
-        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint]
+        equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint, workload, object]
       # Info alerts reach someone only next to a warning or critical in the
       # same namespace (kube-prometheus-stack's InfoInhibitor).
       - source_matchers: ['alertname = "InfoInhibitor"']

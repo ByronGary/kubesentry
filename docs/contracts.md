@@ -18,7 +18,7 @@ This file fixes the shared interfaces before the parallel workstreams start. The
 
 Shared contract files (read-only for streams): `internal/model/*.go`, `internal/detectors/inventory.go`, `internal/detectors/policy.go`, `internal/snapshot/snapshot.go`, `internal/auth/auth.go`, the `Store`/`Query`/`Cursor`/`Coverage` part of `internal/audit/store.go`, `web/src/types.ts`.
 
-Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only in `internal/pgstore`; AWS SDK v2 only in `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**`. Everything else is stdlib.
+Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only in `internal/pgstore`; AWS SDK v2 only in `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**`. Everything else is stdlib, `internal/alerts` included (its Postgres store is `pgstore.AlertStore`, its SigV4 transport comes from `internal/awsauth` through `cmd/server`).
 
 ## HTTP
 
@@ -117,6 +117,15 @@ Every namespaced item is shown only if the caller holds `auth.ViewNamespace` in 
 | `-shutdown-drain` / `-shutdown-timeout` | `5s` / `20s` | on SIGTERM: how long `/readyz` fails before the listeners stop, then how long requests in flight may take |
 | `-agent-interval` | `15s` | the agents' `-interval`; process data is stale after 8 and forgotten after 40 of these |
 | `-version` | | print the version and exit |
+| `-alerts` | `false` | evaluate findings and send them to Alertmanager (`docs/alerts.md`); with `-audit-store=postgres` only the holder of the `alerts` advisory lock does, with the memory store the one replica. Needs `-cache=true` |
+| `-alertmanager-url` | | Alertmanager base URLs, comma-separated (`/api/v2/alerts` appended unless present); every alert to each. No user info (refused). Needs `-alerts`. Empty with `-alerts`: findings tracked, nobody notified |
+| `-alertmanager-ca-file` / `-alertmanager-sigv4` / `-alertmanager-basic-auth-user` | / auto for `aps-workspaces.*` URLs / | CA bundle added to the system roots; SigV4 (service `aps`, region from the URL or `-aws-region`); basic auth user. Secrets from the environment only: `ALERTMANAGER_TOKEN` (bearer) or `ALERTMANAGER_PASSWORD`; one kind of credential at a time. Mixing AMP and other URLs needs `-alertmanager-sigv4` |
+| `-alerts-interval` / `-alerts-resend` / `-alerts-resolve-grace` | `30s` / `1m` / `5m` | evaluate after view builds at most (and in a quiet cluster at least) every interval; re-post open alerts every resend with `endsAt` = now + 4 × resend (resend ≥ interval); resolve a finding gone this long (`endsAt` = now) |
+| `-alerts-max-new` | `50` | more new alerts in one evaluation go out as one `KubesentryFindingsDigest` per owner |
+| `-alerts-default-owner` | `platform` | owner of findings in namespaces without the owner annotation, and of cluster-scoped findings |
+| `-alerts-leak-crit-hours` | `0` (= `-leak-crit-hours`) | a memory leak alert is critical when the limit is closer |
+| `-alerts-runbook-url` | `https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md` | `runbook_url` = this + `#<alertname lower case>` |
+| `-external-url` | | kubesentry's URL as users reach it; alerts link to their finding there (`kubesentry_url`, `generatorURL`) |
 
 Every duration flag also takes days (`30d`, `1d12h`). `-leak-min-slope` is a growth per hour in bytes, with an optional unit (`1MiB`, `512KiB`). `GOMEMLIMIT`, when unset, defaults to 90% of the cgroup memory limit. Kept from before: `-addr`, `-kubeconfig`, `-api-token`, `-agent-token`, `-audit-token`, `-prometheus-url` (with `PROMETHEUS_TOKEN`), `-pvc-min-age`, `-pvc-class-prices`, `-audit-log-file`, `-audit-from-start`, `-audit-journal` (memory store only) and `-audit-max-events` (memory store).
 
@@ -135,14 +144,23 @@ Agent flags (new): `-jitter` (0.2), `-gzip` (true), `-server-fanout` (a bare hos
 - Ingress annotations (kept): `alb.ingress.kubernetes.io/{scheme,certificate-arn,listen-ports,ssl-redirect}`, `kubernetes.io/ingress.class`.
 
 ## Helm values (top level)
-`clusterName`, `image`, `imagePullSecrets`, `agent`, `replicas`, `updateStrategy`, `server{cache,kubeQPS,kubeBurst,snapshot...,rateLimit,rateBurst,maxInflight,maxInflightPerIdentity,allowedHosts,systemPrincipalPrefixes,builtinRBACPrefixes,nodeLabelKeysAdd,pprof}`, `tls{enabled,existingSecret}`, `tokens{api,agent,audit}{existingSecret,key}`, `rbac{viewerRoles.*.aggregateTo}`, `resources`, `serviceAccount{create,name,annotations}`, `auth{mode,userHeader,groupsHeader,allowCustomHeaders,usernamePrefix,groupsPrefix,groupMap,trustedProxyCIDRs,allowAnyProxy,authzQPS,authzCacheTTL,authzDenyTTL,shareByGroups}`, `oauth2Proxy{enabled,image,provider,issuerURL,clientID,existingSecret,upstreamTimeout,trustedProxyIPs,extraArgs,sessionStore}`, `prometheus{url,autodiscover,service,selector,ksmLimits,bearerTokenSecret,leakScan,amp{enabled,workspaceURL,region}}`, `audit{store,retention,maxEvents,redactExecArgs,postgres{existingSecret,dsnKey,schema,maxConns,queryTimeout,sslmode,sslRootCert},sources{webhook{enabled},cloudwatch{enabled,logGroup,streamPrefix,start,endpoint},file{path,fromStart,hostPathDir}}}`, `eks{clusterName,region,awsAuth{read}}`, `systemNamespaces{replace,add}`, `thresholds{...}`, `pricing{defaultPrice,ebsPrices,classPrices}`, `alerts{ownerAnnotation,production{labelKey,labelValue}}`, `pdb`, `networkPolicy{...,egress.podIdentityAgent}`, `topologySpread`, `ingress`, `metrics{serviceMonitor,prometheusRule,grafanaDashboards}`, `apf{enabled}`, `extraArgs`, plus the usual pod knobs (resources, probes, affinity, tolerations, extra env/volumes/containers). The chart is authoritative: `charts/kubesentry/values.yaml` and `values.schema.json`. Postgres TLS comes from `PGSSLMODE`/`PGSSLROOTCERT` env, so pgstore must build its config with `pgxpool.ParseConfig`.
+`clusterName`, `image`, `imagePullSecrets`, `agent`, `replicas`, `updateStrategy`, `server{cache,kubeQPS,kubeBurst,snapshot...,rateLimit,rateBurst,maxInflight,maxInflightPerIdentity,allowedHosts,systemPrincipalPrefixes,builtinRBACPrefixes,nodeLabelKeysAdd,pprof}`, `tls{enabled,existingSecret}`, `tokens{api,agent,audit}{existingSecret,key}`, `rbac{viewerRoles.*.aggregateTo}`, `resources`, `serviceAccount{create,name,annotations}`, `auth{mode,userHeader,groupsHeader,allowCustomHeaders,usernamePrefix,groupsPrefix,groupMap,trustedProxyCIDRs,allowAnyProxy,authzQPS,authzCacheTTL,authzDenyTTL,shareByGroups}`, `oauth2Proxy{enabled,image,provider,issuerURL,clientID,existingSecret,upstreamTimeout,trustedProxyIPs,extraArgs,sessionStore}`, `prometheus{url,autodiscover,service,selector,ksmLimits,bearerTokenSecret,leakScan,amp{enabled,workspaceURL,region}}`, `audit{store,retention,maxEvents,redactExecArgs,postgres{existingSecret,dsnKey,schema,maxConns,queryTimeout,sslmode,sslRootCert},sources{webhook{enabled},cloudwatch{enabled,logGroup,streamPrefix,start,endpoint},file{path,fromStart,hostPathDir}}}`, `eks{clusterName,region,awsAuth{read}}`, `systemNamespaces{replace,add}`, `thresholds{...}`, `pricing{defaultPrice,ebsPrices,classPrices}`, `alerts{enabled,ownerAnnotation,production{labelKey,labelValue},defaultOwner,interval,resend,resolveGrace,maxNew,leakCritHours,runbookBaseURL,alertmanager{urls,existingSecret,tokenKey,basicAuth{username,passwordKey},sigv4,ca{configMap,secret,key}}}`, `externalURL`, `pdb`, `networkPolicy{...,egress.podIdentityAgent,egress.alertmanager{toCIDRs,toNamespaces,ports}}`, `topologySpread`, `ingress`, `metrics{serviceMonitor,prometheusRule,grafanaDashboards}`, `apf{enabled}`, `extraArgs`, plus the usual pod knobs (resources, probes, affinity, tolerations, extra env/volumes/containers). The chart is authoritative: `charts/kubesentry/values.yaml` and `values.schema.json`. With `alerts.enabled` the chart refuses `replicas > 1` without `audit.store=postgres` (the lock), and a token Secret together with AMP's SigV4. Postgres TLS comes from `PGSSLMODE`/`PGSSLROOTCERT` env, so pgstore must build its config with `pgxpool.ParseConfig`.
 
 ## Metrics (`/metrics` on the ops listener)
 `kubesentry_http_requests_total{route,code}`, `kubesentry_http_request_duration_seconds{route}`, `kubesentry_http_inflight`, `kubesentry_http_cache_total{result}`, `kubesentry_snapshot_build_seconds`, `kubesentry_snapshot_age_seconds`, `kubesentry_snapshot_version`, `kubesentry_informer_objects{resource}`, `kubesentry_kube_requests_total{verb,resource,code}`, `kubesentry_authz_reviews_total{result}`, `kubesentry_authz_cache_total{result}`, `kubesentry_prometheus_query_seconds{kind}`, `kubesentry_prometheus_cache_total{result}`, `kubesentry_audit_ingested_total{source}`, `kubesentry_audit_queue_depth`, `kubesentry_audit_store_errors_total`, `kubesentry_cloudwatch_lag_seconds`, `kubesentry_agent_reports_total{code}`, `kubesentry_agent_nodes_reporting`, plus Go runtime metrics.
 
+Added with alerting phase B:
+- `kubesentry_findings{check,severity}`: open (unresolved) alert findings on the replica that evaluates; the others report 0. `check` is one of the alert checks below, `severity` `warning` or `critical`; no object, namespace or owner labels.
+- `kubesentry_alerts_sent_total{result}`: alerts posted to Alertmanager, per URL; `sent`, `failed` (every attempt failed, or a 4xx other than 429), `dropped` (queue full, or leadership lost).
+- `kubesentry_alerts_queue_depth`, `kubesentry_alerts_evaluation_seconds` (histogram), `kubesentry_alerts_leader` (1 on the evaluating replica).
+- `kubesentry_http_rejected_total{reason}`: `/api/` requests turned away before routing: `rate_limit` (429), `max_inflight` (503), `unauthenticated` (401).
+- `kubesentry_dependency_up{dependency}`: 1 while a configured dependency works, from the state behind `/readyz`: `snapshot` (0 before the first view and while serving a stale one), `prometheus` (1 while none is known), `postgres`, `cloudwatch`, `alertmanager` (0 while the latest delivery to some URL failed).
+- `kubesentry_leak_scan_runs_total{result}`: `ok`, `partial` (some queries failed), `failed` (no fresh findings).
+- `kubesentry_snapshot_last_change_timestamp_seconds`: when the informers last announced a change (every poll without them); newer than the view's build time means a change waits for a rebuild.
+
 Label values: `route` is one of `info`, `auth_recheck`, `overview`, `alerts`, `pods`, `pod_diagnostics`, `pod_processes`, `pvcs_unused`, `oom`, `workloads`, `nodes`, `node`, `storage`, `security`, `map`, `certificates`, `audit_events`, `audit_summary`, `agents`, `ingest_agent_report`, `ingest_audit_webhook`. `kubesentry_kube_requests_total` uses the Kubernetes verb (`list`, `watch`, `get`, `create`, ...), the resource (with `/subresource`; `discovery` for non-resource paths) and the status code or `error`. `kubesentry_audit_ingested_total{source}` is `webhook`, `file` (lines read) or `cloudwatch`.
 
-## Postgres schema (`internal/pgstore/migrations/0001_audit.sql`, `0002_read_indexes.sql`)
+## Postgres schema (`internal/pgstore/migrations/0001_audit.sql`, `0002_read_indexes.sql`, `0003_alerts.sql`)
 ```sql
 CREATE TABLE IF NOT EXISTS audit_events (
   audit_id text COLLATE "C" NOT NULL, time timestamptz NOT NULL, stage_rank smallint NOT NULL, stage text NOT NULL,
@@ -173,4 +191,61 @@ CREATE INDEX IF NOT EXISTS audit_events_summary ON audit_events (namespace, time
 CREATE INDEX IF NOT EXISTS audit_events_scoped_view ON audit_events (namespace, time DESC, audit_id DESC)
   WHERE (actor_kind <> 'system' OR tags <> '{}') AND (NOT is_read OR tags <> '{}');
 ```
+Migration `0003_alerts.sql` adds the alert store (written only by the holder of the `alerts` lock, on the lock's connection after checking it is held; read by every replica):
+```sql
+CREATE TABLE IF NOT EXISTS alert_findings (
+  key text COLLATE "C" PRIMARY KEY, alert text NOT NULL, check_name text NOT NULL, kind text NOT NULL,
+  namespace text NOT NULL DEFAULT '', name text NOT NULL, severity text NOT NULL, title text NOT NULL, owner text NOT NULL,
+  production boolean NOT NULL DEFAULT false, labels jsonb NOT NULL DEFAULT '{}', annotations jsonb NOT NULL DEFAULT '{}',
+  state text NOT NULL, silenced_until timestamptz, digest boolean NOT NULL DEFAULT false,
+  first_seen timestamptz NOT NULL, last_seen timestamptz NOT NULL, last_notified timestamptz, resolved_at timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alert_findings_unresolved ON alert_findings (key) WHERE state <> 'resolved';
+CREATE INDEX IF NOT EXISTS alert_findings_resolved ON alert_findings (resolved_at) WHERE state = 'resolved';
+CREATE TABLE IF NOT EXISTS alert_baseline (
+  check_name text PRIMARY KEY, keys text[] NOT NULL DEFAULT '{}', updated_at timestamptz NOT NULL DEFAULT now()
+);
+```
+`labels` is the label set last sent. `state` is `open`, `acknowledged`, `silenced` or `resolved`. The maintenance loop deletes findings resolved more than 30 days ago (`alerts.Retention`). A missing `alert_baseline` row means the change-based check has no baseline yet. `TestPGAlertsMatchMemory` keeps the store equal to `alerts.MemoryStore`.
+
 Summaries without system actors are index-only scans of `audit_events_summary` (known actor kinds are written into the SQL as literals so the planner can prove its predicate). A page of the default view in at most 32 namespaces reads one `audit_events_scoped_view` range per namespace (plus one for events without a namespace with `ViewClusterAudit`), merged with `UNION ALL`. Summaries and coverage are cached stale-while-revalidate (30s fresh; a summary is served up to 5 minutes old while one background refresh per scope and window runs; coverage is served however old), with one computation per key at a time.
+
+## Alerting (phase B)
+
+`internal/alerts` (stdlib): the finding model and `Store`, the checks, the evaluator, the leadership runner and the Alertmanager sink. `docs/alerts.md` is the user guide and has a runbook per alert.
+
+| Alert (`alertname`) | `check` | Severity | Pending |
+|---|---|---|---|
+| `KubesentryCertificateExpiring` | `cert-expiring` | the cert detector's (lifetime-relative); never while renewal is scheduled and not overdue by `CertRenewalGrace` | |
+| `KubesentryCertificateNotReady` | `cert-not-ready` (annotation `reason`: `issuer-missing` or `not-ready`) | the cert detector's | 10m |
+| `KubesentryMemoryLeak` | `memory-leak` | warning; critical below `-alerts-leak-crit-hours` to the limit | |
+| `KubesentryWorkloadUnhealthy` | `workload-unhealthy` | critical with CrashLoopBackOff or a workload status crit, else warning | 5m |
+| `KubesentryPodEvicted` | `pod-evicted` | warning | |
+| `KubesentryPodStuckTerminating` | `pod-stuck-terminating` | warning | |
+| `KubesentryRBACDrift` | `cluster-admin`, `anonymous-binding`, `wildcard-rbac`, `aws-auth-masters` | critical; change-based (baseline in `alert_baseline`; the first evaluation records it; open 24h while the object exists) | |
+| `KubesentryFindingsDigest` | `digest` | warning; `kubesentry_digest="true"`, one per owner, when more than `-alerts-max-new` new alerts would fire at once | |
+
+Findings are folded per workload root (`Assoc.RootOf`). Dedupe key: `check/kind/namespace/name`.
+
+**Labels:**
+- `alertname`, `severity`, `check`, `owner`, `production` (`"true"`/`"false"`)
+- `namespace` (namespaced findings)
+- `workload` or `object` (`Kind/name`)
+- `node` (pod alerts on a single node)
+- `cluster` (`-cluster-name`)
+- `kubesentry_<x>` for every other `kubesentry.io/<x>` namespace annotation (sanitized, at most 10, values ≤ 256 bytes, `kubesentry_digest` reserved)
+
+**Annotations:**
+- `summary`, `description`, `runbook_url`, `dedupe_key`
+- `kubesentry_url` (with `-external-url`; also `generatorURL`)
+- per alert: `pods`, `reasons`, `latest_eviction`, `oldest_deletion`, `predicted_oom`, `container`, `pod`, `growth_bytes_per_hour`, `expires_at`, `issuer`, `reason`, `findings`
+
+**Lifecycle:**
+- New findings fire (`startsAt` = first seen).
+- Open ones are re-posted every `-alerts-resend` with `endsAt` = now + 4 × resend.
+- A label change retires the old set (`endsAt` = now).
+- Gone ones resolve after `-alerts-resolve-grace`, with `endsAt` = now, once.
+- Checks whose source is unreadable (`Inventory.Unavailable`, no leak scan) are skipped: their findings neither refresh nor resolve.
+
+Writes are committed before anything is sent. Losing the lease cancels the evaluation and drops the sink's queues. Duplicates during a leader change are harmless: Alertmanager dedupes by label set.

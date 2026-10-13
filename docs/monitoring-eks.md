@@ -17,7 +17,7 @@ Every alert from both has a runbook below, and every rule links to it with `runb
 6. [Validation](#6-validation)
 7. [Runbooks: platform alerts](#7-runbooks-platform-alerts)
 8. [Runbooks: kubesentry alerts](#8-runbooks-kubesentry-alerts)
-9. [Metrics proposed for phase B](#9-metrics-proposed-for-phase-b)
+9. [Metrics proposed for phase B](#9-metrics-proposed-for-phase-b) (shipped)
 
 ## 1. Why the profile looks like this
 
@@ -152,24 +152,53 @@ There are two ways to use AMP:
 
 ## 4. Routing by owner
 
-**How it works once kubesentry phase B ships:**
+**How kubesentry's alerts are routed** (`-alerts`, chart value `alerts.enabled`; `docs/alerts.md` has the details and a runbook per alert):
 
-1. **Finding.** kubesentry evaluates its findings after each snapshot. It sends each open finding to Alertmanager (`POST /api/v2/alerts`) with these labels:
-   - `alertname=Kubesentry<Check>`
-   - `severity`
-   - `namespace`
+1. **Finding.** kubesentry evaluates its findings after each snapshot build. It posts each open finding to Alertmanager (`POST /api/v2/alerts`), or to the AMP workspace's alert manager, with these labels:
+   - `alertname` (`KubesentryWorkloadUnhealthy`, `KubesentryCertificateExpiring`, ...)
+   - `severity` (`warning` or `critical`)
+   - `namespace`, absent for cluster-scoped findings
    - `owner`
-   - `dedupe_key`
-   - `kubesentry_digest="true"` on low-urgency digests
-2. **Owner.** The owner comes from the annotation `kubesentry.io/owner` on the object, otherwise on its namespace:
+   - `production` (`"true"` or `"false"`)
+   - `workload` or `object` (`Kind/name`)
+   - `check`
+   - `node` on pod alerts whose pods all run on one node
+   - `cluster` (`-cluster-name`)
+   - a `kubesentry_<x>` routing hint for every other `kubesentry.io/<x>` namespace annotation
+   - `kubesentry_digest="true"` on digests
+
+   The dedupe key (`check/kind/namespace/name`) and a link to the finding (`kubesentry_url`, with `externalURL`) are annotations.
+2. **Owner.** The owner comes from the annotation `kubesentry.io/owner` on the namespace:
 
    ```bash
    kubectl annotate namespace payments kubesentry.io/owner=payments
+   kubectl annotate namespace payments kubesentry.io/slack-channel='#payments-alerts'   # becomes kubesentry_slack_channel
    ```
 
-   A finding with no owner reaches the default receiver (the platform team).
-3. **Production.** The namespace label `environment=production` raises severity for production-only checks, such as exec into a production pod. Those come in phase C.
-4. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration.
+   A finding in a namespace without the annotation, or a cluster-scoped finding such as RBAC drift, gets `alerts.defaultOwner` (`platform`). It then falls through to the platform receivers, unless you give `owner="platform"` a branch of its own.
+3. **Production.** The namespace label `environment=production` sets `production="true"`, so a route can page for production only (`matchers: ['production = "true"', 'severity = "critical"']`). Production-only checks, such as exec into a production pod, come in phase C.
+4. **Storms.** When more than `alerts.maxNew` (50) new findings appear at once, as on a first install, kubesentry sends one `KubesentryFindingsDigest` per owner with `kubesentry_digest="true"`, which the digest route below keeps quiet.
+5. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration. Duplicate posts (an HA pair, a leader change) are harmless: Alertmanager knows an alert by its label set.
+
+**Routing hints.** A receiver can take its destination from a hint instead of needing one branch per team. For example, one Slack receiver for every team that set `kubesentry.io/slack-channel`:
+
+```yaml
+- receiver: team-slack
+  matchers: ['kubesentry_slack_channel =~ ".+"']
+  continue: true      # still reach the owner's pager branch below
+# receivers:
+- name: team-slack
+  slack_configs:
+    # A Slack app's bot token: incoming webhooks ignore the channel.
+    - api_url: https://slack.com/api/chat.postMessage
+      http_config:
+        authorization:
+          credentials_file: /etc/alertmanager/secrets/alertmanager-receivers/slack-bot-token
+      channel: '{{ .CommonLabels.kubesentry_slack_channel }}'
+      send_resolved: true
+```
+
+Group such a route by `kubesentry_slack_channel` as well, so that every notification has a single channel.
 
 **The routing tree in the profile**, in order:
 
@@ -194,11 +223,11 @@ There are two ways to use AMP:
 
 **Inhibitions:**
 
-- A critical alert mutes the warning or info alert with the same name about the same object.
-- A NotReady or unreachable node mutes alerts carrying its `node` label. The profile adds `node` to node-exporter series, and phase B will add it to kubesentry's pod findings. The rule requires `node` to be set on the muted alert; without that, every alert lacking a `node` label would be muted while any node is down.
+- A critical alert mutes the warning or info alert with the same name about the same object. The `equal` list includes kubesentry's `workload` and `object` labels: a label missing from both alerts counts as equal, so without them a critical alert about one workload would mute the warnings about every other workload in its namespace.
+- A NotReady or unreachable node mutes alerts carrying its `node` label. The profile adds `node` to node-exporter series, and kubesentry sets it on pod alerts whose pods all run on one node (pods stuck terminating, evictions). The rule requires `node` to be set on the muted alert; without that, every alert lacking a `node` label would be muted while any node is down.
 - `KubeAPIDown` mutes the client-side errors that follow it, kubesentry's included.
 
-**Before phase B.** Prometheus alerts carry no owner, so they all go to the platform team. Two ways to route a team's alerts sooner:
+**Prometheus alerts and owners.** Prometheus alerts, unlike kubesentry's, carry no owner, so they all go to the platform team. Two ways to route a team's Prometheus alerts too:
 
 - **Route by namespace.** The profile has a commented branch that sends `namespace=~"payments|payments-.+"` to the team's receivers.
 - **Copy the owner onto an alert in its rule.** The profile exposes the annotation as `kube_namespace_annotations{annotation_kubesentry_io_owner}`, so a rule can join it in:
@@ -218,7 +247,7 @@ There are two ways to use AMP:
 
 | Alert | Fires when | Value (default) |
 |---|---|---|
-| `KubesentrySnapshotStale` | served view older than the threshold for 5m | `snapshotStaleSeconds` (120) |
+| `KubesentrySnapshotStale` | served view older than the threshold while a cluster change waits for a rebuild, for 5m (a quiet cluster's old view does not count) | `snapshotStaleSeconds` (120) |
 | `KubesentrySnapshotBuildSlow` | p90 view rebuild over 15m above the threshold, for 15m | `snapshotBuildSeconds` (5) |
 | `KubesentryCloudWatchLag` | CloudWatch reader lag above the threshold for 10m (CloudWatch source only) | `cloudwatchLagSeconds` (300) |
 | `KubesentryPostgresErrors` | failed audit store operations for 10m (Postgres only) | |
@@ -228,6 +257,11 @@ There are two ways to use AMP:
 | `KubesentryCacheHitRateCollapsed` | 30m response-cache hit ratio below a fraction of the day's, with enough traffic, for 30m | `cacheHitCollapseRatio` (0.5), `cacheMinLookupsPerSecond` (0.5) |
 | `KubesentryRateLimited` | a route answers 429 to more than a share of its requests, for 15m | `rejectedRatio` (0.05), `rejectedMinPerSecond` (0.05) |
 | `KubesentryServiceUnavailable` | the same for 503 | same |
+| `KubesentryRequestsRejected` | the per-identity rate limit or the in-flight cap turns away more than a share of API requests, before routing, for 15m | `rejectedRatio`, `rejectedMinPerSecond` |
+| `KubesentryPrometheusUnreachable` | a replica cannot query its Prometheus for 10m | |
+| `KubesentryLeakScanFailing` | no background leak scan succeeded for about an hour while scans fail | |
+| `KubesentryAlertsNotEvaluated` | no replica holds the alerts lock for 10m (`alerts.enabled` only) | |
+| `KubesentryAlertmanagerFailing` | the replica that notifies fails or drops deliveries for 15m (with `alerts.alertmanager.urls`) | |
 | `KubesentryAgentNodesDropped` | nodes reporting processes drop by a fraction within an hour, for 10m (agent only) | `agentDropRatio` (0.2) |
 | `KubesentryCrashLooping` | a server, oauth2-proxy or agent container in CrashLoopBackOff, or restarting, for 10m (kube-state-metrics) | `kubeStateMetrics.restarts` (3 in 30m) |
 | `KubesentryOOMKilled` | one of those containers restarted after an OOM kill in the last 30m (kube-state-metrics) | |
@@ -248,6 +282,7 @@ There are two ways to use AMP:
 | Authorization | SubjectAccessReviews per replica against the budget (`auth.authzQPS`), review results, Kubernetes API requests by verb and resource |
 | Audit | ingest by source, write queue against its capacity, store errors, CloudWatch lag |
 | Agents and Prometheus | nodes with a fresh report, agent reports by status, Prometheus query latency p95 by kind |
+| Alerts and dependencies | dependencies up (`kubesentry_dependency_up`), requests rejected before routing, open alert findings by check, alerts posted to Alertmanager by result and queued, evaluation time and the leader, leak scans by result |
 | Go runtime | heap, heap goal, memory from the OS and GOMEMLIMIT; container working set; goroutines; GC CPU |
 
 The "Cluster health (EKS)" dashboard in `examples/grafana` has these rows:
@@ -429,13 +464,12 @@ curl -s localhost:9090/readyz      # degraded dependencies, by name and reason
 ```
 
 ### KubesentrySnapshotStale
-**Meaning:** a replica has served a view older than `snapshotStaleSeconds` for 5 minutes.
+**Meaning:** a replica has served a view older than `snapshotStaleSeconds` for 5 minutes while a cluster change waited for a rebuild (`kubesentry_snapshot_last_change_timestamp_seconds` newer than the view). The view rebuilds only when a watched object changes, so in a quiet cluster the age climbs too (stress Phase 4, bug 3). The rule leaves that case out: there, the last change is as old as the view.
 **Check:**
-- `/readyz` for a `snapshot` or API server problem.
+- `/readyz` for a `snapshot` or API server problem; `kubesentry_dependency_up{dependency="snapshot"}` is 0 while failed rebuilds keep the last good view.
 - `kubesentry_kube_requests_total{code!~"2.."}` for watch errors.
 - The pod's logs.
 
-The view rebuilds only when a watched object changes, so in a very quiet cluster the age also climbs (stress Phase 4, bug 3). If the cluster is quiet and the age resets on any change, this is that false positive.
 **Fix:** restore API server reachability or RBAC. A replica stuck after that recovers on restart.
 
 ### KubesentrySnapshotBuildSlow
@@ -512,7 +546,7 @@ The deny-cache TTL (`auth.authzDenyTTL`) is a known lever, and changing it is a 
 - Raise `server.snapshotMinInterval` to rebuild less often.
 
 ### KubesentryRateLimited
-**Meaning:** a route has answered 429 to more than `rejectedRatio` of its requests for 15 minutes. This counts the per-identity cap on the expensive routes (`server.maxInflightPerIdentity`: `/oom`, pod diagnostics, the audit summary). `auth_recheck` is excluded, because users cause its 429s by pressing the button. The per-identity rate limit (`server.rateLimit`) and the global in-flight cap answer before a route is known, so they are not counted (see [section 9](#9-metrics-proposed-for-phase-b)).
+**Meaning:** a route has answered 429 to more than `rejectedRatio` of its requests for 15 minutes. This counts the per-identity cap on the expensive routes (`server.maxInflightPerIdentity`: `/oom`, pod diagnostics, the audit summary). `auth_recheck` is excluded, because users cause its 429s by pressing the button. The per-identity rate limit (`server.rateLimit`) and the global in-flight cap answer before a route is known, so they are not counted here; `KubesentryRequestsRejected` covers them.
 **Check:**
 - The route's p95 latency: slow Prometheus or Postgres keeps slots busy.
 - `kubesentry_prometheus_query_seconds`.
@@ -536,6 +570,46 @@ The deny-cache TTL (`auth.authzDenyTTL`) is a known lever, and changing it is a 
 - `KubesentryAuditQueueFilling` and `KubesentryPostgresErrors`.
 
 **Fix:** follow the matching runbook. For an ingest route, set its token (`tokens.audit` or `tokens.agent`).
+
+### KubesentryRequestsRejected
+**Meaning:** for 15 minutes, more than `rejectedRatio` of API requests were turned away before routing (`kubesentry_http_rejected_total`):
+- `rate_limit` (429): one identity exceeded `server.rateLimit` and `server.rateBurst`
+- `max_inflight` (503): more requests were in flight at once than `server.maxInflight` allows
+
+Requests without credentials (`unauthenticated`) are counted but not alerted on: expired SSO sessions and scanners cause them.
+**Check:**
+- The access log: which identity sends most requests? A script polling the API, or a UI left open on many tabs, is the usual cause of `rate_limit`.
+- For `max_inflight`, the p95 latency by route: slow requests hold slots.
+
+**Fix:** give scripts their own identity and a sensible polling interval. Raise `server.rateLimit` only if the replica has headroom, and `server.maxInflight` only together with CPU and memory.
+
+### KubesentryPrometheusUnreachable
+**Meaning:** a replica has failed to query its Prometheus for 10 minutes (`kubesentry_dependency_up{dependency="prometheus"}`, the same judgement as `/readyz`). Memory charts, `/oom` and the background leak scan have no data, so `KubesentryMemoryLeak` alerts cannot fire. A replica that has no Prometheus configured or discovered reports 1, not 0.
+**Check:** the reason in `/info` (`unavailable.prometheus`) or the ops `/readyz`: an HTTP status (401 or 403 for credentials or SigV4, 5xx for an overloaded Prometheus) or a network error.
+**Fix:** fix the Prometheus, the network policy (`networkPolicy.egress.prometheus`), or the credentials (`PROMETHEUS_TOKEN`, or the IAM role for AMP: `aps:QueryMetrics`).
+
+### KubesentryLeakScanFailing
+**Meaning:** a replica's background leak scans keep failing and none succeeded for about an hour (`kubesentry_leak_scan_runs_total`). `/oom` and the leak alerts keep the last good findings, so new leaks go unnoticed.
+**Check:** `/api/v1/oom` returns the scan's errors in `warnings`, and the server log has them too. A failing candidate query often means a Prometheus that is too slow for the window: `-leak-scan-window` over many containers.
+**Fix:** fix Prometheus (`KubesentryPrometheusUnreachable`), or shorten `prometheus.leakScan.window`.
+
+### KubesentryAlertsNotEvaluated
+**Meaning:** for 10 minutes no replica has held the `alerts` lock, so kubesentry's findings are neither evaluated nor sent (`kubesentry_alerts_leader` is 0 everywhere).
+**Check:**
+- The server log for `alerts: could not try for the lock` (Postgres unreachable) or `alerts: leadership ended`.
+- `kubesentry_dependency_up{dependency="postgres"}`.
+
+**Fix:** restore Postgres (`KubesentryPostgresErrors`). A replica retries for the lock every 30 seconds and takes over by itself.
+
+### KubesentryAlertmanagerFailing
+**Meaning:** the replica that sends kubesentry's alerts has failed or dropped deliveries for 15 minutes (`kubesentry_alerts_sent_total{result=~"failed|dropped"}`), so findings are not reaching anyone. If Alertmanager itself is down, this alert cannot reach you through it either: watch the dead man's switch.
+**Check:** `/info` `alerts.lastError` names the Alertmanager by position (`alertmanager 2 of 2: ...`) and the error:
+- `HTTP 401` or `403`: the token, basic auth, or for AMP the IAM role (`aps:CreateAlertManagerAlerts`)
+- `HTTP 400`: Alertmanager refused the payload; its message is in the server log
+- `unreachable`: DNS, the network policy (`networkPolicy.egress.alertmanager`), or TLS (`alerts.alertmanager.ca`)
+
+`dropped` means the queue was full, because Alertmanager is too slow or down.
+**Fix:** fix the credentials, the network path or Alertmanager. Nothing is lost for long: every open alert is posted again each minute.
 
 ### KubesentryAgentNodesDropped
 **Meaning:** nodes reporting processes dropped by more than `agentDropRatio` within an hour.
@@ -567,18 +641,18 @@ Memory rose slowly over long runs in Phase 4 (bug 4). Heap profiles from `/debug
 
 ## 9. Metrics proposed for phase B
 
-Some rules here cannot be expressed with today's metrics, or have to hard-code a server setting. These metrics would close the gaps. None of them is used by a rule yet.
+Some rules here could not be expressed with the metrics phase A had, or had to hard-code a server setting. These metrics would close the gaps. Phase B shipped the ones marked shipped, and the rules and dashboard above use them.
 
 | Proposed metric | Why |
 |---|---|
-| `kubesentry_http_rejected_total{reason}`, reason `rate_limit`, `max_inflight` or `unauthenticated` | The per-identity rate limit and the global in-flight cap answer 429 and 503 before a route is known, so `KubesentryRateLimited` and `KubesentryServiceUnavailable` cannot see them |
+| `kubesentry_http_rejected_total{reason}`, reason `rate_limit`, `max_inflight` or `unauthenticated` (**shipped**: `KubesentryRequestsRejected`) | The per-identity rate limit and the global in-flight cap answer 429 and 503 before a route is known, so `KubesentryRateLimited` and `KubesentryServiceUnavailable` cannot see them |
 | `kubesentry_audit_queue_capacity` (gauge) | The queue rule and dashboard would read the real capacity instead of `auditQueueCapacity` |
 | `kubesentry_authz_qps_limit` (gauge, the effective `-authz-qps`) | The budget rule and panel would not depend on the values matching the server |
 | `kubesentry_authz_review_duration_seconds` (histogram) and `kubesentry_authz_throttled_seconds_total` (time spent waiting for the client-side limiter) | Review latency, and a direct measure of budget saturation rather than a rate near a threshold |
-| `kubesentry_dependency_up{dependency}` for `prometheus`, `postgres`, `cloudwatch` and `snapshot`, from the logic behind `/readyz` | The "Prometheus disconnected" alert from the proposal; today only `/readyz` and `/info` show it |
-| `kubesentry_leak_scan_runs_total{result}` and `kubesentry_leak_scan_last_success_timestamp_seconds` | Alert when the background leak scanner fails or stops (the proposal's "leak scan failures") |
-| `kubesentry_snapshot_last_change_timestamp_seconds` and `kubesentry_snapshot_build_failures_total` | Tell a quiet cluster from a stuck view (bug 3), so `KubesentrySnapshotStale` stops firing falsely |
+| `kubesentry_dependency_up{dependency}` for `prometheus`, `postgres`, `cloudwatch` and `snapshot`, from the logic behind `/readyz` (**shipped**, plus `alertmanager`: `KubesentryPrometheusUnreachable`) | The "Prometheus disconnected" alert from the proposal; until then only `/readyz` and `/info` showed it |
+| `kubesentry_leak_scan_runs_total{result}` (**shipped**, results `ok`, `partial`, `failed`: `KubesentryLeakScanFailing`) and `kubesentry_leak_scan_last_success_timestamp_seconds` | Alert when the background leak scanner fails or stops (the proposal's "leak scan failures") |
+| `kubesentry_snapshot_last_change_timestamp_seconds` (**shipped**: `KubesentrySnapshotStale` now needs a change waiting) and `kubesentry_snapshot_build_failures_total` | Tell a quiet cluster from a stuck view (bug 3), so `KubesentrySnapshotStale` stops firing falsely |
 | `kubesentry_cloudwatch_reader_leader` (1 on the lock holder) | The lag gauge may be stale on a replica that lost the lock; the lag rule would read only the leader |
-| `kubesentry_findings{check, severity, namespace, owner}` | Already part of phase B (Layer 2): finding counts for teams' own rules |
+| `kubesentry_findings{check, severity}` (**shipped**, without `namespace` and `owner` to keep it small; reported by the replica that evaluates) | Finding counts for teams' own rules |
 
-One more phase B change concerns labels rather than metrics: put a `node` label on pod-scoped findings sent to Alertmanager, so that the profile's node-down inhibition mutes them.
+One more phase B change concerned labels rather than metrics: kubesentry's pod alerts carry a `node` label when their pods all run on one node, so the profile's node-down inhibition mutes them (shipped).
