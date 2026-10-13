@@ -6,8 +6,10 @@
 package kube
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -25,6 +27,26 @@ type ClientOptions struct {
 	// Observe, if set, is told about every API request (for
 	// kubesentry_kube_requests_total), including those of NewReviewer.
 	Observe RequestObserver
+
+	// Context picks this kubeconfig context instead of the current one
+	// (-kube-context). Setting it skips the in-cluster configuration.
+	Context string
+	// Server, when set, is the API server URL to use instead of any
+	// kubeconfig, with CAData (PEM) to verify it: the endpoint and CA of an
+	// EKS cluster from DescribeCluster. It needs TokenSource.
+	Server string
+	CAData []byte
+	// TokenSource, if set, authenticates every request with the bearer token
+	// it returns, replacing the kubeconfig's credentials (tokens, client
+	// certificates, exec and auth provider plugins). This is how kubesentry
+	// signs in to EKS by itself (-eks-cluster), without the AWS CLI.
+	TokenSource TokenSource
+	// ExecFallback, if set, is asked for a TokenSource when the kubeconfig's
+	// credentials come from an EKS exec plugin ("aws eks get-token" or
+	// "aws-iam-authenticator token") whose command is not installed, as in a
+	// container without the AWS CLI. Without it the plugin is kept, and
+	// requests fail as kubectl's would.
+	ExecFallback func(EKSExec) (TokenSource, error)
 }
 
 // Defaults for ClientOptions.
@@ -49,25 +71,34 @@ func (o ClientOptions) withDefaults() ClientOptions {
 
 // Clients bundles the clients kubesentry uses. Config is the rest.Config they
 // were built from (nil for fakes in tests); NewReviewer copies it to give
-// SubjectAccessReviews their own rate limit.
+// SubjectAccessReviews their own rate limit. InCluster is true when Config
+// came from the pod's service account.
 type Clients struct {
-	CS     kubernetes.Interface
-	Dyn    dynamic.Interface
-	Disc   discovery.DiscoveryInterface
-	Config *rest.Config
+	CS        kubernetes.Interface
+	Dyn       dynamic.Interface
+	Disc      discovery.DiscoveryInterface
+	Config    *rest.Config
+	InCluster bool
+
+	proxyOnce sync.Once
+	proxyRT   http.RoundTripper
+	proxyErr  error
 }
 
-// ConnectWith builds the clients from a kubeconfig. Resolution order: an
-// explicit kubeconfig path, then the in-cluster service account, then the
-// default loading rules (KUBECONFIG, ~/.kube/config). The typed clientset
-// speaks protobuf, which decodes faster and allocates less than JSON for the
-// large lists informers fetch; the dynamic client (cert-manager) and
-// discovery stay on JSON.
+// ConnectWith builds the clients. The configuration comes from, in order:
+// o.Server (with o.TokenSource); the kubeconfig at the explicit path or with
+// o.Context; the in-cluster service account; the default loading rules
+// (KUBECONFIG, ~/.kube/config). The typed clientset speaks protobuf, which
+// decodes faster and allocates less than JSON for the large lists informers
+// fetch; the dynamic client (cert-manager) and discovery stay on JSON.
 func ConnectWith(kubeconfig string, o ClientOptions) (*Clients, error) {
 	o = o.withDefaults()
-	cfg, err := loadConfig(kubeconfig)
+	cfg, inCluster, err := loadConfig(kubeconfig, o)
 	if err != nil {
 		return nil, fmt.Errorf("load kube config: %w", err)
+	}
+	if err := applyCredentials(cfg, o); err != nil {
+		return nil, err
 	}
 	cfg.QPS, cfg.Burst, cfg.UserAgent = o.QPS, o.Burst, o.UserAgent
 	if o.Observe != nil {
@@ -89,7 +120,7 @@ func ConnectWith(kubeconfig string, o ClientOptions) (*Clients, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create discovery client: %w", err)
 	}
-	return &Clients{CS: cs, Dyn: dyn, Disc: disc, Config: cfg}, nil
+	return &Clients{CS: cs, Dyn: dyn, Disc: disc, Config: cfg, InCluster: inCluster}, nil
 }
 
 // Connect builds a per-request Source from a kubeconfig, resolved as in
@@ -102,13 +133,25 @@ func Connect(kubeconfig string) (*Source, error) {
 	return NewSource(c.CS, c.Dyn), nil
 }
 
-func loadConfig(kubeconfig string) (*rest.Config, error) {
-	if kubeconfig != "" {
-		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+// loadConfig resolves the rest.Config as ConnectWith documents, and reports
+// whether it is the in-cluster one.
+func loadConfig(kubeconfig string, o ClientOptions) (*rest.Config, bool, error) {
+	if o.Server != "" {
+		if o.TokenSource == nil {
+			return nil, false, errors.New("an API server address without a kubeconfig needs a token source")
+		}
+		return &rest.Config{Host: o.Server, TLSClientConfig: rest.TLSClientConfig{CAData: o.CAData}}, false, nil
 	}
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
+	if kubeconfig == "" && o.Context == "" {
+		if cfg, err := rest.InClusterConfig(); err == nil {
+			return cfg, true, nil
+		}
 	}
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if kubeconfig != "" {
+		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
+	}
+	overrides := &clientcmd.ConfigOverrides{CurrentContext: o.Context}
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+	return cfg, false, err
 }

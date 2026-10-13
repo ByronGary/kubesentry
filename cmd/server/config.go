@@ -37,6 +37,7 @@ type config struct {
 	clusterName         string
 	awsAuth             bool
 	nodeLabelKeysAdd    *listValue
+	remote              remoteConfig // remote.go: -kube-context, -eks-cluster, -prometheus-via-apiserver
 
 	apiToken, agentToken, auditToken string
 	authMode                         string
@@ -134,6 +135,7 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.StringVar(&c.clusterName, "cluster-name", "", "cluster name shown in the UI; also names the CloudWatch log group /aws/eks/<name>/cluster")
 	fs.BoolVar(&c.awsAuth, "aws-auth", false, "read kube-system/aws-auth (needs the chart's scoped Role)")
 	fs.Var(c.nodeLabelKeysAdd, "node-label-keys-add", "extra node labels to keep, comma-separated (\"prefix*\" keeps a prefix)")
+	c.remote.register(fs)
 
 	// Authentication and authorization.
 	fs.StringVar(&c.apiToken, "api-token", os.Getenv("KUBESENTRY_API_TOKEN"), "break-glass bearer token for /api/ routes, unrestricted (env KUBESENTRY_API_TOKEN)")
@@ -225,6 +227,9 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	fs.Visit(func(f *flag.Flag) { c.setFlags[f.Name] = true })
 	th.RestartWarn, th.RestartCrit = int32(restartWarn), int32(restartCrit)
 	c.leak.MinSlopeBytesPerHour = float64(minSlope)
+	if c.clusterName == "" {
+		c.clusterName = c.remote.eksCluster
+	}
 	return c, c.validate()
 }
 

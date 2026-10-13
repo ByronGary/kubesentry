@@ -67,10 +67,7 @@ func run(cfg *config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	clients, err := kube.ConnectWith(cfg.kubeconfig, kube.ClientOptions{
-		QPS: float32(cfg.kubeQPS), Burst: cfg.kubeBurst, UserAgent: "kubesentry/" + version,
-		Observe: func(verb, resource, code string) { metrics.KubeRequests.With(verb, resource, code).Inc() },
-	})
+	clients, err := connectKube(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
@@ -147,6 +144,10 @@ func run(cfg *config) error {
 	}
 
 	sel, _ := prom.ParseMatchers(cfg.promSelector) // validated with the flags
+	discover, promVia, err := cfg.promDiscovery(clients)
+	if err != nil {
+		return err
+	}
 	metricsSource := &promSource{}
 	err = promSetup{
 		url: cfg.promURL, service: cfg.promService, region: cfg.awsRegion, sigv4: cfg.promSigV4, ksmLimits: cfg.promKSMLimits,
@@ -158,9 +159,7 @@ func run(cfg *config) error {
 			}
 			return nil, errors.New("no cluster view yet")
 		},
-		discover: func(ctx context.Context) ([]string, error) {
-			return kube.DiscoverPrometheus(ctx, clients.CS, cfg.promService)
-		},
+		discover: discover, via: promVia,
 	}.start(ctx, metricsSource)
 	if err != nil {
 		return err

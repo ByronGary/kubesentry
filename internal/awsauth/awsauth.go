@@ -1,6 +1,8 @@
 // Package awsauth signs HTTP requests with AWS Signature Version 4, so the
-// Prometheus client can query Amazon Managed Prometheus (AMP). It is the only
-// package besides the CloudWatch reader that imports the AWS SDK.
+// Prometheus client can query Amazon Managed Prometheus (AMP), and mints the
+// bearer tokens EKS accepts (eks.go), so kubesentry can sign in to an EKS
+// cluster without the AWS CLI. It is the only package besides the CloudWatch
+// reader that imports the AWS SDK.
 //
 // Credentials come from the SDK's default chain: EKS Pod Identity and IRSA
 // (web identity) in a cluster, environment variables and profiles elsewhere.
@@ -58,6 +60,9 @@ type Options struct {
 	// host name, then from the SDK's default configuration (AWS_REGION,
 	// profile).
 	Region string
+	// Profile selects a shared configuration profile; empty uses AWS_PROFILE
+	// or the default profile.
+	Profile string
 	// Service is the signing name; default ServiceAPS.
 	Service string
 	// Base sends the signed request; default http.DefaultTransport.
@@ -88,29 +93,9 @@ func New(ctx context.Context, endpoint string, opts Options) (*Transport, error)
 	if region == "" {
 		region, _ = RegionFromURL(endpoint)
 	}
-	creds := opts.Credentials
-	if creds == nil {
-		var load []func(*config.LoadOptions) error
-		if region != "" {
-			load = append(load, config.WithRegion(region))
-		}
-		cfg, err := config.LoadDefaultConfig(ctx, load...)
-		if err != nil {
-			return nil, fmt.Errorf("load AWS configuration: %w", err)
-		}
-		if region == "" {
-			region = cfg.Region
-		}
-		creds = cfg.Credentials
-		if creds == nil {
-			return nil, errors.New("no AWS credentials provider configured")
-		}
-	}
-	if region == "" {
-		return nil, errors.New("AWS region unknown: set -aws-region or AWS_REGION")
-	}
-	if _, cached := creds.(*aws.CredentialsCache); !cached {
-		creds = aws.NewCredentialsCache(creds)
+	creds, region, err := resolve(ctx, region, opts.Profile, opts.Credentials)
+	if err != nil {
+		return nil, err
 	}
 	t := &Transport{
 		base:    opts.Base,
@@ -130,6 +115,39 @@ func New(ctx context.Context, endpoint string, opts Options) (*Transport, error)
 		t.now = time.Now
 	}
 	return t, nil
+}
+
+// resolve returns cached credentials and the region. Unless creds is given,
+// both come from the SDK's default configuration (with profile, when set),
+// which only reads local files and the environment; region, when set, wins.
+func resolve(ctx context.Context, region, profile string, creds aws.CredentialsProvider) (aws.CredentialsProvider, string, error) {
+	if creds == nil {
+		var load []func(*config.LoadOptions) error
+		if region != "" {
+			load = append(load, config.WithRegion(region))
+		}
+		if profile != "" {
+			load = append(load, config.WithSharedConfigProfile(profile))
+		}
+		cfg, err := config.LoadDefaultConfig(ctx, load...)
+		if err != nil {
+			return nil, "", fmt.Errorf("load AWS configuration: %w", err)
+		}
+		if region == "" {
+			region = cfg.Region
+		}
+		creds = cfg.Credentials
+		if creds == nil {
+			return nil, "", errors.New("no AWS credentials provider configured")
+		}
+	}
+	if region == "" {
+		return nil, "", errors.New("AWS region unknown: set -aws-region or AWS_REGION")
+	}
+	if _, cached := creds.(*aws.CredentialsCache); !cached {
+		creds = aws.NewCredentialsCache(creds)
+	}
+	return creds, region, nil
 }
 
 // Region is the region requests are signed for.

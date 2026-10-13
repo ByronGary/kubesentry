@@ -7,12 +7,9 @@ import (
 	"strings"
 )
 
-// cgroupLimitFiles are where the container's memory limit is read from:
-// cgroup v2, then v1.
-var cgroupLimitFiles = []string{
-	"/sys/fs/cgroup/memory.max",
-	"/sys/fs/cgroup/memory/memory.limit_in_bytes",
-}
+// cgroupLimitFiles (memlimit_linux.go) are where the container's memory
+// limit is read from. Elsewhere there are none, and setMemoryLimit does
+// nothing.
 
 // memLimitFraction leaves room for memory the Go runtime does not manage
 // (stacks, cgo, the kernel's page cache charged to the cgroup).
