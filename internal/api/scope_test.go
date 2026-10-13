@@ -165,6 +165,7 @@ func tenantServer(t *testing.T) *Server {
 		Authenticator: auth.HeaderAuthenticator{UserHeader: "X-Forwarded-Email", GroupsHeader: "X-Forwarded-Groups",
 			TrustedProxies: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}},
 		Authorizer: &auth.SARAuthorizer{Reviewer: tenantGrants(), Candidates: v.RBAC()},
+		Alerts:     &staticAlerts{board: tenantBoard()},
 	}
 }
 
@@ -251,6 +252,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		"/api/v1/map", "/api/v1/map?namespace=team-a", "/api/v1/certificates", "/api/v1/pvcs/unused", "/api/v1/audit/events",
 		"/api/v1/nodes", "/api/v1/nodes?summary=true", "/api/v1/nodes/n1", "/api/v1/oom", "/api/v1/audit/summary",
 		"/api/v1/overview", "/api/v1/overview?namespace=team-a", "/api/v1/overview?owner=team-alpha",
+		"/api/v1/alerts", "/api/v1/alerts?state=open", "/api/v1/alerts?owner=team-alpha",
 	}
 	for _, route := range routes {
 		seen := 0
@@ -406,10 +408,29 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	if strings.Join(ov.Namespaces, ",") != "team-a" || ov.Activity == nil || len(ov.Activity.ProductionNamespaces) != 0 {
 		t.Errorf("alice's namespaces %v, production namespaces %+v", ov.Namespaces, ov.Activity)
 	}
+	// Alerts: her namespace's findings (an open one and one resolved within
+	// the day), never RBAC drift (no ViewRBAC in team-a, no ViewClusterRBAC);
+	// the Overview's widget counts the same.
+	var al alertsResponse
+	getAs(t, h, "alice", "/api/v1/alerts", &al)
+	var keys []string
+	for _, f := range al.Items {
+		keys = append(keys, f.Key)
+	}
+	if strings.Join(keys, " ") != "workload-unhealthy/Deployment/team-a/web pod-evicted/Deployment/team-a/web" ||
+		al.Counts["open"] != 1 || al.Counts["resolved"] != 1 {
+		t.Errorf("alice's alerts = %v, counts %v", keys, al.Counts)
+	}
+	if ov.Alerts == nil || ov.Alerts.Open != 1 || len(ov.Alerts.ByOwner) != 1 || ov.Alerts.ByOwner["team-alpha"] != 1 {
+		t.Errorf("alice's overview alerts = %+v", ov.Alerts)
+	}
 	var carolOv overviewResponse
 	getAs(t, h, "carol", "/api/v1/overview", &carolOv)
 	if carolOv.Namespaces == nil || len(carolOv.Namespaces) != 0 {
 		t.Errorf("carol's namespaces = %#v, want []", carolOv.Namespaces)
+	}
+	if carolOv.Alerts == nil || carolOv.Alerts.Open != 0 || len(carolOv.Alerts.ByOwner) != 0 {
+		t.Errorf("carol's overview alerts = %+v", carolOv.Alerts)
 	}
 
 	// Single objects elsewhere are not found, rather than forbidden.

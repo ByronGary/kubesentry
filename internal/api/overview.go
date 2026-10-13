@@ -53,6 +53,8 @@ type overviewResponse struct {
 	Namespaces []string         `json:"namespaces"`
 	Badges     map[string]badge `json:"badges"`
 	History    overviewHistory  `json:"history"`
+	// Alerts is left out when alerting is off.
+	Alerts *overviewAlerts `json:"alerts,omitempty"`
 }
 
 type overviewScope struct {
@@ -730,6 +732,7 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 	}
 	resp.History, resp.Security.NewSince24h = s.overviewHistory(now, sel, base.security)
+	resp.Alerts = s.overviewAlerts(sel)
 	writeJSON(w, http.StatusOK, resp)
 }
 
