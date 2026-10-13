@@ -46,6 +46,10 @@ const (
 	// PrometheusAnnotation set to "true" on a Service marks the Prometheus to discover.
 	PrometheusAnnotation      = "kubesentry.io/prometheus"
 	certificateNameAnnotation = "cert-manager.io/certificate-name"
+	// namespaceAnnotationPrefix: every kubesentry.io/* annotation on a
+	// namespace is kept: the owner (kubesentry.io/owner) and the routing hints
+	// alerting reads (kubesentry.io/slack-channel, ...).
+	namespaceAnnotationPrefix = "kubesentry.io/"
 )
 
 // Labels, names and keys kubesentry reads.
@@ -128,6 +132,35 @@ func newNodeLabelFilter(add []string) labelFilter {
 	return f
 }
 
+// newNamespaceAnnotationFilter keeps kubesentry.io/* annotations and the
+// extra keys (the owner annotation, when -owner-annotation names one outside
+// kubesentry.io/; "prefix*" matches by prefix).
+func newNamespaceAnnotationFilter(add []string) labelFilter {
+	f := labelFilter{exact: map[string]bool{}, prefixes: []string{namespaceAnnotationPrefix}}
+	for _, k := range add {
+		k = strings.TrimSpace(k)
+		switch {
+		case k == "":
+		case strings.HasSuffix(k, "*"):
+			f.prefixes = append(f.prefixes, strings.TrimSuffix(k, "*"))
+		default:
+			f.exact[k] = true
+		}
+	}
+	return f
+}
+
+// filters are the configurable allowlists the transform and the conversions
+// apply: node labels and namespace annotations.
+type filters struct {
+	nodeLabels    labelFilter
+	nsAnnotations labelFilter
+}
+
+func newFilters(nodeLabelKeysAdd, namespaceAnnotationKeysAdd []string) filters {
+	return filters{nodeLabels: newNodeLabelFilter(nodeLabelKeysAdd), nsAnnotations: newNamespaceAnnotationFilter(namespaceAnnotationKeysAdd)}
+}
+
 func (f labelFilter) keep(k string) bool {
 	if f.exact[k] {
 		return true
@@ -171,20 +204,20 @@ func filterKeys(m map[string]string, allow map[string]bool) map[string]string {
 // newTransform returns the informer transform for every resource the Cache
 // watches (typed, aws-auth and cert-manager). Unknown types pass through
 // untouched.
-func newTransform(nodeLabels labelFilter) cache.TransformFunc {
+func newTransform(f filters) cache.TransformFunc {
 	return func(obj any) (any, error) {
-		transformObject(obj, nodeLabels)
+		transformObject(obj, f)
 		return obj, nil
 	}
 }
 
 // transformObject strips obj in place.
-func transformObject(obj any, nodeLabels labelFilter) {
+func transformObject(obj any, f filters) {
 	switch o := obj.(type) {
 	case *corev1.Pod:
 		transformPod(o)
 	case *corev1.Node:
-		transformNode(o, nodeLabels)
+		transformNode(o, f.nodeLabels)
 	case *corev1.PersistentVolumeClaim:
 		transformPVC(o)
 	case *corev1.PersistentVolume:
@@ -193,7 +226,9 @@ func transformObject(obj any, nodeLabels labelFilter) {
 		stripMeta(&o.ObjectMeta, storageClassAnnotations)
 		o.MountOptions, o.AllowedTopologies = nil, nil
 	case *corev1.Namespace:
+		ann := f.nsAnnotations.filter(o.Annotations)
 		stripMeta(&o.ObjectMeta, nil)
+		o.Annotations = ann
 		o.Spec = corev1.NamespaceSpec{}
 		o.Status.Conditions = nil
 	case *corev1.Service:

@@ -1,6 +1,8 @@
 package detectors
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/ByronGary/kubesentry/internal/model"
@@ -59,7 +61,59 @@ func (p Policy) WithDefaults() Policy {
 	if p.Leak == (LeakOptions{}) {
 		p.Leak = d.Leak
 	}
+	if p.OwnerAnnotation == "" {
+		p.OwnerAnnotation = d.OwnerAnnotation
+	}
+	if p.ProductionLabel == (LabelMatch{}) {
+		p.ProductionLabel = d.ProductionLabel
+	}
 	return p
+}
+
+// OwnerOf is the team that owns ns: its OwnerAnnotation, trimmed; "" when
+// it has none.
+func (p Policy) OwnerOf(ns model.Namespace) string {
+	key := p.OwnerAnnotation
+	if key == "" {
+		key = DefaultOwnerAnnotation
+	}
+	return strings.TrimSpace(ns.Annotations[key])
+}
+
+// IsProduction reports whether ns carries the ProductionLabel.
+func (p Policy) IsProduction(ns model.Namespace) bool {
+	m := p.ProductionLabel
+	if m == (LabelMatch{}) {
+		m = DefaultProductionLabel
+	}
+	return m.Matches(ns.Labels)
+}
+
+// Matches reports whether labels hold Key with exactly Value.
+func (m LabelMatch) Matches(labels map[string]string) bool {
+	v, ok := labels[m.Key]
+	return ok && m.Key != "" && v == m.Value
+}
+
+func (m LabelMatch) String() string { return m.Key + "=" + m.Value }
+
+var (
+	// A label or annotation key: an optional DNS subdomain prefix and a name
+	// of up to 63 characters.
+	labelKeyRE   = regexp.MustCompile(`^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$`)
+	labelValueRE = regexp.MustCompile(`^([A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?)?$`)
+)
+
+// ValidLabelKey reports whether k is a valid label or annotation key.
+func ValidLabelKey(k string) bool { return labelKeyRE.MatchString(k) }
+
+// ParseLabelMatch reads "key=value": a valid label key and label value.
+func ParseLabelMatch(s string) (LabelMatch, error) {
+	k, v, ok := strings.Cut(strings.TrimSpace(s), "=")
+	if !ok || !ValidLabelKey(k) || !labelValueRE.MatchString(v) {
+		return LabelMatch{}, fmt.Errorf("%q: want key=value with a valid label key and value", s)
+	}
+	return LabelMatch{Key: k, Value: v}, nil
 }
 
 // SystemNamespaceSet resolves which namespaces are cluster plumbing: the

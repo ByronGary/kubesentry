@@ -40,6 +40,9 @@ type CacheOptions struct {
 	// NodeLabelKeysAdd are node labels kept on top of DefaultNodeLabelKeys;
 	// "prefix*" keeps every key with that prefix.
 	NodeLabelKeysAdd []string
+	// NamespaceAnnotationKeysAdd are namespace annotations kept besides
+	// kubesentry.io/* (the owner annotation, when configured elsewhere).
+	NamespaceAnnotationKeysAdd []string
 	// CertManagerRecheck is how often discovery is re-run for cert-manager
 	// (and the server version); default 5m.
 	CertManagerRecheck time.Duration
@@ -56,13 +59,13 @@ type CacheOptions struct {
 // api.ClusterSource, api.InventorySource and api.CertSource from the same
 // informers.
 type Cache struct {
-	cs         kubernetes.Interface
-	dyn        dynamic.Interface // nil disables cert-manager
-	disc       discovery.DiscoveryInterface
-	opts       CacheOptions
-	nodeLabels labelFilter
-	transform  cache.TransformFunc
-	changes    chan struct{}
+	cs        kubernetes.Interface
+	dyn       dynamic.Interface // nil disables cert-manager
+	disc      discovery.DiscoveryInterface
+	opts      CacheOptions
+	filters   filters
+	transform cache.TransformFunc
+	changes   chan struct{}
 
 	starting, started, ready atomic.Bool
 	res                      map[string]*informerState // built-in resources; fixed once started
@@ -241,13 +244,13 @@ func NewCache(c *Clients, o CacheOptions) *Cache {
 	if disc == nil && c.CS != nil {
 		disc = c.CS.Discovery()
 	}
-	labels := newNodeLabelFilter(o.NodeLabelKeysAdd)
+	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd)
 	return &Cache{
 		cs: c.CS, dyn: c.Dyn, disc: disc, opts: o,
-		nodeLabels: labels,
-		transform:  newTransform(labels),
-		changes:    make(chan struct{}, 1),
-		res:        map[string]*informerState{},
+		filters:   f,
+		transform: newTransform(f),
+		changes:   make(chan struct{}, 1),
+		res:       map[string]*informerState{},
 	}
 }
 
@@ -616,7 +619,11 @@ func listCached[O metav1.Object, T any](c *Cache, st *informerState, m *memo[T],
 	return convertAll(m, sortedObjects[O](st.inf.GetStore()), conv), nil
 }
 
-func (c *Cache) convertNode(n *corev1.Node) model.Node { return convertNode(n, c.nodeLabels) }
+func (c *Cache) convertNode(n *corev1.Node) model.Node { return convertNode(n, c.filters.nodeLabels) }
+
+func (c *Cache) convertNamespace(n *corev1.Namespace) model.Namespace {
+	return convertNamespace(n, c.filters.nsAnnotations)
+}
 
 func issuerConv(kind string) func(*unstructured.Unstructured) model.Issuer {
 	return func(u *unstructured.Unstructured) model.Issuer { return convertIssuer(u, kind) }
@@ -645,7 +652,7 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 	inv.EndpointSlices = inventoryItems(c.st("endpointslices"), &m.slices, convertEndpointSlice, u)
 	inv.Ingresses = inventoryItems(c.st("ingresses"), &m.ingresses, convertIngress, u)
 	inv.Nodes = inventoryItems(c.st("nodes"), &m.nodes, c.convertNode, u)
-	inv.Namespaces = inventoryItems(c.st("namespaces"), &m.namespaces, convertNamespace, u)
+	inv.Namespaces = inventoryItems(c.st("namespaces"), &m.namespaces, c.convertNamespace, u)
 	inv.RBAC = c.rbac(u)
 	inv.Certs = c.certs(u)
 	if c.opts.AWSAuth {
@@ -816,7 +823,7 @@ func (c *Cache) ListStorageClasses(ctx context.Context) ([]model.StorageClass, e
 }
 
 func (c *Cache) ListNamespaces(ctx context.Context) ([]model.Namespace, error) {
-	return listCached(c, c.st("namespaces"), &c.m.namespaces, convertNamespace)
+	return listCached(c, c.st("namespaces"), &c.m.namespaces, c.convertNamespace)
 }
 
 // ListRBAC lists Roles, ClusterRoles, RoleBindings and ClusterRoleBindings.

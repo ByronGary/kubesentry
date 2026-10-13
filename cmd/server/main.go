@@ -80,6 +80,7 @@ func run(cfg *config) error {
 		UI:          web.Handler(),
 		SignOutURL:  cfg.signOutURL,
 		ClusterInfo: model.ClusterInfo{Name: cfg.clusterName},
+		Version:     version,
 		RateLimit:   cfg.rateLimit, RateBurst: cfg.rateBurst, MaxInflight: cfg.maxInflight,
 		LongInflightPerIdentity: cfg.maxInflightPerIdentity,
 		AccessLog:               slog.Default(),
@@ -88,15 +89,25 @@ func run(cfg *config) error {
 	}
 
 	// Views: the informer cache feeding a debounced snapshot manager, or a
-	// per-request LIST for debugging.
+	// per-request LIST for debugging. Every view built feeds the Overview's
+	// history (in memory, per replica).
 	var current func() *snapshot.View
 	var ready atomic.Bool
+	hist := snapshot.NewHistory(snapshot.DefaultHistoryStep, snapshot.DefaultHistoryBuckets)
+	srv.History = hist
 	if cfg.cache {
-		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, ClusterName: cfg.clusterName})
+		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
+			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName})
 		if err := cache.Start(ctx); err != nil {
 			return fmt.Errorf("start informer cache: %w", err)
 		}
-		mgr := &snapshot.Manager{Source: cache, Policy: policy, MinInterval: cfg.snapshotMinInterval, MaxDelay: cfg.snapshotMaxDelay, OnBuild: onBuild}
+		mgr := &snapshot.Manager{Source: cache, Policy: policy, MinInterval: cfg.snapshotMinInterval, MaxDelay: cfg.snapshotMaxDelay,
+			OnBuild: func(v *snapshot.View, took time.Duration, err error) {
+				onBuild(v, took, err)
+				if err == nil {
+					hist.Record(v)
+				}
+			}}
 		go func() {
 			start := time.Now()
 			if err := cache.WaitSynced(ctx); err != nil {
@@ -119,8 +130,9 @@ func run(cfg *config) error {
 		registerCacheMetrics(cache)
 	} else {
 		src := kube.NewSourceWithOptions(clients.CS, clients.Dyn, kube.SourceOptions{
-			AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, ClusterName: cfg.clusterName})
-		views := &recordingViews{inner: snapshot.OnDemand{Source: src, Policy: policy}}
+			AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(),
+			ClusterName: cfg.clusterName})
+		views := &recordingViews{inner: snapshot.OnDemand{Source: src, Policy: policy}, history: hist}
 		srv.Cluster, srv.Inventory, srv.Certs = src, src, src
 		srv.Views = views
 		current = views.latest
@@ -321,16 +333,21 @@ var (
 )
 
 // recordingViews remembers the last view an OnDemand provider built, for the
-// authorizer's candidates and metrics in -cache=false mode.
+// authorizer's candidates and metrics in -cache=false mode, and records it
+// in the history.
 type recordingViews struct {
-	inner snapshot.ViewProvider
-	last  atomic.Pointer[snapshot.View]
+	inner   snapshot.ViewProvider
+	last    atomic.Pointer[snapshot.View]
+	history *snapshot.History
 }
 
 func (r *recordingViews) View(ctx context.Context) (*snapshot.View, error) {
 	v, err := r.inner.View(ctx)
 	if err == nil {
 		r.last.Store(v)
+		if r.history != nil {
+			r.history.Record(v)
+		}
 	}
 	return v, err
 }

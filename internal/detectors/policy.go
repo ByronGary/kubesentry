@@ -26,7 +26,27 @@ type Policy struct {
 	Thresholds          Thresholds
 	Pricing             Pricing
 	Leak                LeakOptions
+	// OwnerAnnotation on a namespace names the team that owns it, for the
+	// Overview's owner filter and attention items (and alert routing).
+	// Empty means DefaultOwnerAnnotation.
+	OwnerAnnotation string
+	// ProductionLabel marks the namespaces that count as production, e.g.
+	// for "exec into production". The zero value means
+	// DefaultProductionLabel.
+	ProductionLabel LabelMatch
 }
+
+// LabelMatch is one key=value label requirement.
+type LabelMatch struct {
+	Key   string
+	Value string
+}
+
+// DefaultOwnerAnnotation is the namespace annotation naming its owner.
+const DefaultOwnerAnnotation = "kubesentry.io/owner"
+
+// DefaultProductionLabel marks production namespaces.
+var DefaultProductionLabel = LabelMatch{Key: "environment", Value: "production"}
 
 // Thresholds are the cut-offs between ok, warn and crit.
 type Thresholds struct {
@@ -109,6 +129,8 @@ func DefaultPolicy() Policy {
 			EBSProvisioners: []string{"ebs.csi.aws.com", "ebs.csi.eks.amazonaws.com", "kubernetes.io/aws-ebs"},
 			UsageBilled:     []string{"efs.csi.aws.com", "fsx.csi.aws.com", "fsx.openzfs.csi.aws.com"},
 		},
-		Leak: DefaultLeakOptions(),
+		Leak:            DefaultLeakOptions(),
+		OwnerAnnotation: DefaultOwnerAnnotation,
+		ProductionLabel: DefaultProductionLabel,
 	}
 }

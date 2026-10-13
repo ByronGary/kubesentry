@@ -131,10 +131,14 @@ type Store struct {
 	sumFlights map[string]*flight[audit.Summary] // refreshes in flight, by the same key
 	covCache   *covEntry
 	covFlight  *flight[audit.Coverage]
-	// summarizeFn and coverageFn compute uncached results; nil means
-	// s.summarizeNow and s.coverageNow. Tests replace them.
+	tagCache   map[string]*tagEntry                // by tagCacheKey
+	tagFlights map[string]*flight[audit.TagCounts] // refreshes in flight, by the same key
+	// summarizeFn, coverageFn and countTagsFn compute uncached results; nil
+	// means s.summarizeNow, s.coverageNow and s.countTagsNow. Tests replace
+	// them.
 	summarizeFn func(context.Context, audit.Query) (audit.Summary, error)
 	coverageFn  func(context.Context) (audit.Coverage, error)
+	countTagsFn func(context.Context, audit.TagCountQuery) (audit.TagCounts, error)
 	// exactCountBelow overrides the package's threshold (tests).
 	exactCountBelow float64
 }
