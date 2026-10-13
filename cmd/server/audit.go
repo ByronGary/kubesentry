@@ -20,11 +20,12 @@ import (
 // setupAudit builds the audit pipeline when any source or the Postgres
 // store is configured: the ingester and its store, the journal, the file
 // tailer and the CloudWatch reader, with their metrics and health checks.
-// The returned cleanups flush and close the store.
-func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *api.Server) (closers, error) {
+// The returned cleanups flush and close the store; the Postgres store is
+// returned too (nil with the memory store), for the alerts.
+func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *api.Server) (closers, *pgstore.Store, error) {
 	var cleanup closers
 	if cfg.auditLogFile == "" && cfg.auditToken == "" && cfg.auditJournal == "" && !cfg.cloudwatch && cfg.auditStore != "postgres" {
-		return cleanup, nil
+		return cleanup, nil, nil
 	}
 	ing := &audit.Ingester{SystemPrefixes: policy.SystemPrincipalPrefixes, RedactExecArgs: cfg.auditRedactExecArgs}
 	var pg *pgstore.Store
@@ -35,7 +36,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 			MaxConns: int32(cfg.pgMaxConns), QueryTimeout: cfg.pgQueryTimeout,
 		})
 		if err != nil {
-			return cleanup, fmt.Errorf("audit store: %w", err)
+			return cleanup, nil, fmt.Errorf("audit store: %w", err)
 		}
 		cleanup = append(cleanup, func() {
 			cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -48,6 +49,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		go pg.MaintainLoop(ctx, time.Hour)
 		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "postgres", Check: pg.Ping})
 		srv.AuditHealth = watchPostgres(ctx, pg, 15*time.Second)
+		dependencyUp("postgres", srv.AuditHealth)
 		metrics.AuditQueueDepth.SetFunc(func() float64 { return float64(pg.Stats().Queued) })
 		slog.Info("audit store: postgres", "schema", cfg.pgSchema, "retention", formatDuration(cfg.auditRetention))
 	} else {
@@ -55,12 +57,12 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		if cfg.auditJournal != "" {
 			n, err := audit.LoadJournal(cfg.auditJournal, ing.Store)
 			if err != nil {
-				return cleanup, fmt.Errorf("load audit journal: %w", err)
+				return cleanup, nil, fmt.Errorf("load audit journal: %w", err)
 			}
 			slog.Info("replayed audit journal", "events", n)
 			j, err := audit.OpenJournal(cfg.auditJournal)
 			if err != nil {
-				return cleanup, fmt.Errorf("open audit journal: %w", err)
+				return cleanup, nil, fmt.Errorf("open audit journal: %w", err)
 			}
 			cleanup = append(cleanup, func() { _ = j.Close() })
 			ing.Journal = j
@@ -90,7 +92,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 	if cfg.cloudwatch {
 		client, err := cloudwatch.New(ctx, cfg.awsRegion, cfg.cloudwatchEndpoint)
 		if err != nil {
-			return cleanup, err
+			return cleanup, nil, err
 		}
 		group := cfg.cloudwatchLogGroup
 		if group == "" {
@@ -108,18 +110,20 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 			},
 		}
 		go cw.run(ctx)
-		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "cloudwatch", Check: func(context.Context) error {
+		cwHealth := func() error {
 			if st, ok := cw.status(); ok && st.ErrorKind != "" {
 				return fmt.Errorf("%s: %s", st.ErrorKind, st.LastError)
 			}
 			return nil
-		}})
+		}
+		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "cloudwatch", Check: func(context.Context) error { return cwHealth() }})
+		dependencyUp("cloudwatch", cwHealth)
 		metrics.CloudWatchLag.SetFunc(cw.lagSeconds)
 		srv.CloudWatchLag = cw.lag
 		slog.Info("reading EKS audit logs from CloudWatch", "logGroup", group, "streamPrefix", cfg.cloudwatchPrefix)
 	}
 	go pollAuditCounters(ctx, pg, cw)
-	return cleanup, nil
+	return cleanup, pg, nil
 }
 
 // pollAuditCounters turns the store's and reader's running totals into the

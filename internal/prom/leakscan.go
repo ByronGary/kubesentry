@@ -34,7 +34,18 @@ type LeakScanOptions struct {
 	// fit; default 0.5.
 	CandidateFactor float64
 	Leak            detectors.LeakOptions // zero: detectors.DefaultLeakOptions()
+	// OnScan, if set, is told how each scan went: ScanOK, ScanPartial (some
+	// queries failed; their containers keep their previous findings) or
+	// ScanFailed (no fresh findings at all).
+	OnScan func(result string)
 }
+
+// Scan results, for LeakScanOptions.OnScan.
+const (
+	ScanOK      = "ok"
+	ScanPartial = "partial"
+	ScanFailed  = "failed"
+)
 
 func (o *LeakScanOptions) defaults() {
 	if o.Interval <= 0 {
@@ -165,6 +176,16 @@ func (s *LeakScanner) Scan(ctx context.Context) detectors.LeakReport {
 	s.latest, s.good, s.running = rep, ok || prevGood, nil
 	s.mu.Unlock()
 	close(ch)
+	if s.opts.OnScan != nil && ctx.Err() == nil {
+		switch {
+		case !ok:
+			s.opts.OnScan(ScanFailed)
+		case len(rep.Errors) > 0:
+			s.opts.OnScan(ScanPartial)
+		default:
+			s.opts.OnScan(ScanOK)
+		}
+	}
 	return rep
 }
 

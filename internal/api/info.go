@@ -34,6 +34,7 @@ type infoResponse struct {
 	// Namespaces is how many namespaces the caller can see (ViewNamespace).
 	Namespaces  *int              `json:"namespaces,omitempty"`
 	Unavailable map[string]string `json:"unavailable,omitempty"`
+	Alerts      *infoAlerts       `json:"alerts"`
 }
 
 type infoIdentity struct {
@@ -83,6 +84,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	resp := infoResponse{
 		Demo: s.Demo, Metrics: s.metrics() != nil, Audit: s.Audit != nil, Processes: s.Processes != nil,
 		Inventory: s.hasInventory(), Certs: s.hasCerts(), SignOutURL: s.SignOutURL, Version: s.Version,
+		Alerts: s.infoAlerts(),
 	}
 
 	// The view comes first: its RBAC index proposes the namespaces the

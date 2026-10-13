@@ -142,6 +142,9 @@ type Server struct {
 	// CloudWatchLag, if set, reports how far the CloudWatch audit reader is
 	// behind; ok is false on a replica that is not reading.
 	CloudWatchLag func() (lag time.Duration, ok bool)
+	// Alerts, if set, serves GET /api/v1/alerts, /info's alerts and the
+	// Overview's alerts widget from the alerting runner's board.
+	Alerts AlertsSource
 
 	cacheOnce sync.Once
 	recheckMu sync.Mutex
@@ -276,6 +279,7 @@ var cachedRoutes = map[string][]auth.Capability{
 	"GET /api/v1/map":          {auth.ViewNamespace, auth.ViewNodes},
 	"GET /api/v1/certificates": {auth.ViewNamespace, auth.ViewClusterIssuer},
 	"GET /api/v1/overview":     overviewCaps,
+	alertsRoute:                alertsCaps,
 }
 
 // cacheWindows bounds how long a cached route's response is served, for
@@ -286,7 +290,8 @@ var cacheWindows = map[string]time.Duration{
 }
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
-// over the route's capabilities and the view version. Other requests, and
+// over the route's capabilities and the view version (and for /alerts the
+// board's version). Other requests, and
 // every request while the provider cannot name its current view (before the
 // first view exists, too), are not cached. The scope is looked up through
 // the request's authzMemo, so the handler filters by exactly the scope the
@@ -300,6 +305,9 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 	key, ok := CacheKeyFunc(s.Authorizer, func() uint64 { return v }, caps...)(r)
 	if win := cacheWindows[r.Pattern]; ok && win > 0 {
 		key += "\x00" + strconv.FormatInt(s.now().UnixNano()/int64(win), 10)
+	}
+	if ok && r.Pattern == alertsRoute {
+		key += "\x00" + s.alertsCacheKey()
 	}
 	return key, ok
 }
@@ -363,6 +371,9 @@ func (s *Server) apiRoutes() http.Handler {
 	}
 	if s.hasCerts() {
 		s.route(mux, "GET /api/v1/certificates", "certificates", t, s.certificates)
+	}
+	if s.Alerts != nil {
+		s.route(mux, alertsRoute, "alerts", t, s.alertsList)
 	}
 	return withAuthzMemo(mux)
 }

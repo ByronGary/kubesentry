@@ -28,6 +28,16 @@ export interface Info {
   namespaces?: number
   /** Sources that could not be read, with the reason (e.g. RBAC forbidden). */
   unavailable?: Record<string, string>
+  /** Alerting (-alerts); absent from servers older than alerting. The delivery fields are this replica's: only the leader sends. */
+  alerts?: {
+    enabled: boolean
+    sink: 'alertmanager' | 'none'
+    /** This replica holds the alerts lock and notifies. */
+    leader?: boolean
+    lastSentAt?: string
+    /** Why the latest delivery failed, while it still fails ("alertmanager 1 of 2: HTTP 503 ..."). */
+    lastError?: string
+  }
 }
 
 export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'clusterIssuers' | 'processes' | 'audit' | 'clusterAudit' | 'agents'
@@ -560,6 +570,8 @@ export interface OverviewResponse {
   /** Sidebar badges, keyed by nav item; absent when zero. */
   badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates', { count: number; severity: AttentionSeverity }>>
   history: OverviewHistory
+  /** Alert findings not resolved, in the caller's scope and filter (cluster-scoped ones only without a filter). Absent when alerting is off. */
+  alerts?: { open: number; acknowledged: number; silenced: number; byOwner: Record<string, number> }
 }
 
 export interface OverviewPool {
@@ -593,3 +605,52 @@ export interface OverviewHistory {
   series: Partial<Record<'unhealthyWorkloads' | 'failingPods' | 'securityCrit' | 'securityWarn' | 'certsExpiringSoon', number[]>>
 }
 
+
+// ---- Alerts (GET /api/v1/alerts?namespace=&owner=&state=&limit=&continue=) ----
+// The findings kubesentry alerts on, scoped like every route: namespaced ones
+// need the namespace (RBAC ones also `list rolebindings` there), cluster-scoped
+// ones the clusterRBAC capability. Open, acknowledged and silenced findings,
+// and those resolved in the last 24 hours, most troubled first.
+// See docs/alerts.md.
+
+export type AlertState = 'open' | 'acknowledged' | 'silenced' | 'resolved'
+export type AlertSeverity = 'warning' | 'critical'
+
+export interface AlertFinding {
+  /** Stable dedupe key: check/kind/namespace/name. */
+  key: string
+  /** The alertname, e.g. "KubesentryWorkloadUnhealthy". */
+  alert: string
+  /** e.g. "workload-unhealthy", "cert-expiring", "cluster-admin". */
+  check: string
+  /** The object's kind: Deployment, Certificate, ClusterRoleBinding, ... (a bare pod: Pod). */
+  kind: string
+  namespace?: string
+  name: string
+  severity: AlertSeverity
+  title: string
+  owner: string
+  production: boolean
+  /** The label set last sent to Alertmanager. */
+  labels: Record<string, string>
+  /** summary, description, runbook_url, kubesentry_url (with -external-url), dedupe_key, and per alert e.g. pods, reasons, predicted_oom. */
+  annotations: Record<string, string>
+  state: AlertState
+  silencedUntil?: string
+  /** Announced in a per-owner digest (storm protection) rather than on its own. */
+  digest?: boolean
+  firstSeen: string
+  lastSeen: string
+  lastNotified?: string
+  resolvedAt?: string
+}
+
+export interface AlertsResponse extends Paged {
+  /** Items on this page. */
+  count: number
+  items: AlertFinding[]
+  /** Everything the caller can see by state, before the namespace, owner and state filters. */
+  counts: Record<AlertState, number>
+  /** When the findings were last evaluated (the leader) or read from the store; absent before the first evaluation. */
+  updatedAt?: string
+}

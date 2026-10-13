@@ -253,6 +253,7 @@ func TestMWETag(t *testing.T) {
 }
 
 func TestMWRateLimit(t *testing.T) {
+	rejected := metrics.HTTPRejected.With("rate_limit").Value()
 	h := Compose(WithAuthentication(mwTestAuthn{}), WithRateLimit(0.001, 2))(mwJSON("{}"))
 	for i := range 2 {
 		if w := mwServe(h, "GET", "/api/v1/x", "X-Test-User", "alice"); w.Code != 200 {
@@ -278,6 +279,9 @@ func TestMWRateLimit(t *testing.T) {
 	}
 	if w := mwServe(h, "GET", "/healthz"); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("ip bucket: %d", w.Code)
+	}
+	if n := metrics.HTTPRejected.With("rate_limit").Value() - rejected; n != 2 {
+		t.Errorf("kubesentry_http_rejected_total{reason=rate_limit} grew by %v, want 2", n)
 	}
 	if mwServe(WithRateLimit(0, 0)(mwJSON("{}")), "GET", "/").Code != 200 {
 		t.Fatal("disabled limiter limited")
@@ -317,9 +321,13 @@ func TestMWMaxInflight(t *testing.T) {
 		go func() { defer wg.Done(); mwServe(h, "GET", "/") }()
 	}
 	started.Wait()
+	rejected := metrics.HTTPRejected.With("max_inflight").Value()
 	w := mwServe(h, "GET", "/")
 	if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") != "1" || !strings.Contains(w.Body.String(), "server busy") {
 		t.Fatalf("%d %v %q", w.Code, w.Header(), w.Body.String())
+	}
+	if n := metrics.HTTPRejected.With("max_inflight").Value() - rejected; n != 1 {
+		t.Errorf("kubesentry_http_rejected_total{reason=max_inflight} grew by %v, want 1", n)
 	}
 	close(release)
 	wg.Wait()
@@ -372,7 +380,11 @@ func TestMWAuthentication(t *testing.T) {
 	})
 	h := WithAuthentication(mwTestAuthn{}, "/api/v1/public")(next)
 
+	rejected := metrics.HTTPRejected.With("unauthenticated").Value()
 	w := mwServe(h, "GET", "/api/v1/pods")
+	if n := metrics.HTTPRejected.With("unauthenticated").Value() - rejected; n != 1 {
+		t.Errorf("kubesentry_http_rejected_total{reason=unauthenticated} grew by %v, want 1", n)
+	}
 	if w.Code != 401 || w.Header().Get("WWW-Authenticate") != "Bearer" || w.Header().Get("Content-Type") != "application/json" {
 		t.Fatalf("%d %v", w.Code, w.Header())
 	}

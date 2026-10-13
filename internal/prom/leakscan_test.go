@@ -470,7 +470,8 @@ func TestLeakScanCandidateCap(t *testing.T) {
 func TestLeakScanKeepsLastGoodFindings(t *testing.T) {
 	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
 	f := newFakeProm(now)
-	s := newScanner(t, f, LeakScanOptions{ChunkSize: 10})
+	var results []string
+	s := newScanner(t, f, LeakScanOptions{ChunkSize: 10, OnScan: func(r string) { results = append(results, r) }})
 	if !s.Latest().GeneratedAt.IsZero() {
 		t.Fatal("report before any scan should have a zero time")
 	}
@@ -499,6 +500,9 @@ func TestLeakScanKeepsLastGoodFindings(t *testing.T) {
 	rep = s.Scan(context.Background())
 	if len(rep.Findings) != 20 || len(rep.Errors) == 0 || !rep.GeneratedAt.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("after failed chunks: %d findings, errors %v", len(rep.Findings), rep.Errors)
+	}
+	if strings.Join(results, ",") != "ok,failed,partial" {
+		t.Errorf("OnScan results = %v, want ok,failed,partial", results)
 	}
 
 	// A scanner that never succeeded reports errors and no findings.

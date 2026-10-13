@@ -199,6 +199,13 @@ routes team-payments alertname=KubesentryMemoryLeak severity=warning owner=payme
 routes team-payments-pager alertname=KubesentryCrashLooping severity=critical owner=payments
 routes platform-pager alertname=KubesentryCrashLooping severity=critical owner=unmapped-team
 routes digest alertname=KubesentryUnusedVolume severity=critical owner=payments kubesentry_digest=true
+# kubesentry's finding alerts (docs/alerts.md), as the server labels them.
+routes team-payments-pager alertname=KubesentryWorkloadUnhealthy severity=critical owner=payments namespace=payments \
+  workload=Deployment/api check=workload-unhealthy production=true
+routes team-payments alertname=KubesentryCertificateExpiring severity=warning owner=payments namespace=payments \
+  object=Certificate/api-tls check=cert-expiring production=false
+routes platform-pager alertname=KubesentryRBACDrift severity=critical owner=platform object=ClusterRoleBinding/erin-admin check=cluster-admin
+routes digest alertname=KubesentryFindingsDigest severity=warning owner=payments check=digest kubesentry_digest=true
 
 if [ -n "$kps" ]; then
   echo "== kube-prometheus-stack ($kps) rendered with $PROFILE"

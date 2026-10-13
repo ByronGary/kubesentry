@@ -95,6 +95,9 @@ func run(cfg *config) error {
 	var ready atomic.Bool
 	hist := snapshot.NewHistory(snapshot.DefaultHistoryStep, snapshot.DefaultHistoryBuckets)
 	srv.History = hist
+	// built tells the alerts a new view is ready (coalesced: one pending
+	// signal stands for many builds).
+	built := make(chan struct{}, 1)
 	if cfg.cache {
 		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
 			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName})
@@ -106,6 +109,10 @@ func run(cfg *config) error {
 				onBuild(v, took, err)
 				if err == nil {
 					hist.Record(v)
+					select {
+					case built <- struct{}{}:
+					default:
+					}
 				}
 			}}
 		go func() {
@@ -121,6 +128,7 @@ func run(cfg *config) error {
 		srv.Unavailable = cache.Unavailable
 		srv.ResponseCache = &api.ResponseCache{MaxBytes: 64 << 20}
 		current = mgr.Current
+		registerLastChange(mgr.LastChange)
 		srv.Ready = func() bool {
 			if !ready.Load() && cache.Ready() && mgr.Current() != nil {
 				ready.Store(true)
@@ -139,6 +147,7 @@ func run(cfg *config) error {
 		slog.Warn("-cache=false: every request lists the cluster; use only for debugging")
 	}
 	registerSnapshotMetrics(current)
+	dependencyUp("snapshot", snapshotHealth(current))
 
 	if cfg.authMode == "proxy" {
 		reviewer, err := kube.NewReviewer(clients, float32(cfg.authzQPS), 2*int(cfg.authzQPS))
@@ -164,7 +173,8 @@ func run(cfg *config) error {
 	err = promSetup{
 		url: cfg.promURL, service: cfg.promService, region: cfg.awsRegion, sigv4: cfg.promSigV4, ksmLimits: cfg.promKSMLimits,
 		autodiscover: cfg.promAutodiscover, selector: sel,
-		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak},
+		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak,
+			OnScan: func(result string) { metrics.LeakScanRuns.With(result).Inc() }},
 		pods: func(context.Context) ([]model.Pod, error) {
 			if v := current(); v != nil {
 				return v.Inv.Pods, nil // shared and read-only, which the scanner respects
@@ -179,12 +189,26 @@ func run(cfg *config) error {
 	srv.Metrics = metricsSource
 	srv.PrometheusInfo = metricsSource.Info
 	srv.PrometheusHealth = metricsSource.Health
+	if cfg.promURL != "" || cfg.promAutodiscover {
+		// 1 while none is known yet: nothing to be down.
+		dependencyUp("prometheus", metricsSource.Health)
+	}
 
-	closers, err := setupAudit(ctx, cfg, policy, srv)
+	closers, pg, err := setupAudit(ctx, cfg, policy, srv)
 	if err != nil {
 		return err
 	}
 	defer closers.close()
+
+	if cfg.alerts.enabled {
+		if cfg.auditStore != "postgres" {
+			slog.Warn("alerts with the memory store: run one replica; with more, each would notify on its own (use -audit-store=postgres)")
+		}
+		_, err := alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built}.start(ctx, srv)
+		if err != nil {
+			return fmt.Errorf("alerts: %w", err)
+		}
+	}
 
 	if cfg.agentToken != "" {
 		store := procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})

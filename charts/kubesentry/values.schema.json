@@ -464,10 +464,46 @@
         "classPrices": { "$ref": "#/definitions/priceMap" }
       }
     },
+    "externalURL": { "type": "string", "pattern": "^(https?://[^/?#@]+(/[^?#]*)?)?$" },
     "alerts": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "enabled": { "type": "boolean" },
+        "defaultOwner": { "type": "string", "minLength": 1 },
+        "interval": { "$ref": "#/definitions/duration" },
+        "resend": { "$ref": "#/definitions/duration" },
+        "resolveGrace": { "$ref": "#/definitions/duration" },
+        "maxNew": { "type": "integer", "minimum": 1 },
+        "leakCritHours": { "$ref": "#/definitions/numberOrNull" },
+        "runbookBaseURL": { "type": "string", "pattern": "^(https?://.+)?$" },
+        "alertmanager": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "urls": { "type": "array", "items": { "type": "string", "pattern": "^https?://[^/?#@]+(/[^?#]*)?$" } },
+            "existingSecret": { "type": "string" },
+            "tokenKey": { "type": "string", "minLength": 1 },
+            "basicAuth": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "username": { "type": "string" },
+                "passwordKey": { "type": "string", "minLength": 1 }
+              }
+            },
+            "sigv4": { "type": "boolean" },
+            "ca": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "configMap": { "type": "string" },
+                "secret": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
         "ownerAnnotation": {
           "description": "a namespace annotation key",
           "type": "string",
@@ -604,6 +640,15 @@
               }
             },
             "prometheus": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "toCIDRs": { "$ref": "#/definitions/cidrList" },
+                "toNamespaces": { "$ref": "#/definitions/stringList" },
+                "ports": { "$ref": "#/definitions/portList" }
+              }
+            },
+            "alertmanager": {
               "type": "object",
               "additionalProperties": false,
               "properties": {

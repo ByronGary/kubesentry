@@ -229,3 +229,183 @@ tests:
                 server in kubesentry/kubesentry-7d9f8c6b5-x2x4z restarted in the last 30 minutes after running out of
                 memory. Its memory limit is too small for the cluster's size or for the agents' report bursts.
               runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryoomkilled
+
+  # "quiet": nothing changed since the view was built (the age grows, the
+  # last change stays at the build). "stuck": changes keep arriving and no
+  # rebuild happens.
+  - name: snapshot stale only with a change waiting
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_snapshot_age_seconds{namespace="kubesentry",pod="quiet"}'
+        values: '0+60x30'
+      - series: 'kubesentry_snapshot_last_change_timestamp_seconds{namespace="kubesentry",pod="quiet"}'
+        values: '0x30'
+      - series: 'kubesentry_snapshot_age_seconds{namespace="kubesentry",pod="stuck"}'
+        values: '0+60x30'
+      - series: 'kubesentry_snapshot_last_change_timestamp_seconds{namespace="kubesentry",pod="stuck"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentrySnapshotStale
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KubesentrySnapshotStale
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: stuck}
+            exp_annotations:
+              summary: kubesentry is serving a stale view of the cluster.
+              description: >-
+                stuck has served a snapshot older than 120s for 5 minutes while cluster changes waited for a rebuild.
+                Its rebuilds are failing or its informers are not keeping up with the API server.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotstale
+
+  # 1 request/s turned away by the rate limit, of 11 (unauthenticated ones
+  # do not count: expired sessions, scanners).
+  - name: requests rejected before routing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_http_rejected_total{namespace="kubesentry",pod="a",reason="rate_limit"}'
+        values: '0+60x40'
+      - series: 'kubesentry_http_rejected_total{namespace="kubesentry",pod="a",reason="unauthenticated"}'
+        values: '0+600x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="pods",code="200"}'
+        values: '0+600x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryRequestsRejected
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryRequestsRejected
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, reason: rate_limit}
+            exp_annotations:
+              summary: kubesentry turns API requests away before routing them.
+              description: >-
+                kubesentry in kubesentry rejected requests (rate_limit) at 1.00/s, more than 5% of its API requests,
+                for 15 minutes: users exceed the per-identity rate limit (server.rateLimit, 429), or more requests are
+                in flight than server.maxInflight allows (503).
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryrequestsrejected
+
+  # 1 request/s turned away of 1,001: under the ratio.
+  - name: requests rarely rejected
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_http_rejected_total{namespace="kubesentry",pod="a",reason="max_inflight"}'
+        values: '0+60x40'
+      - series: 'kubesentry_http_requests_total{namespace="kubesentry",pod="a",route="pods",code="200"}'
+        values: '0+60000x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: KubesentryRequestsRejected
+        exp_alerts: []
+
+  - name: prometheus unreachable
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="a",dependency="prometheus"}'
+        values: '0x20'
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="b",dependency="prometheus"}'
+        values: '1x20'
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="b",dependency="postgres"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentryPrometheusUnreachable
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KubesentryPrometheusUnreachable
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry cannot query Prometheus.
+              description: >-
+                a has failed to query its Prometheus for 10 minutes: memory charts, the /oom page and the background
+                leak scan (and so memory leak alerts) have no data. /info and the ops /readyz name the error.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryprometheusunreachable
+
+  # "a" fails every scan; "b" fails some and succeeds others.
+  - name: leak scans failing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_leak_scan_runs_total{namespace="kubesentry",pod="a",result="failed"}'
+        values: '0+1x90'
+      - series: 'kubesentry_leak_scan_runs_total{namespace="kubesentry",pod="a",result="ok"}'
+        values: '0x90'
+      - series: 'kubesentry_leak_scan_runs_total{namespace="kubesentry",pod="b",result="failed"}'
+        values: '0+1x90'
+      - series: 'kubesentry_leak_scan_runs_total{namespace="kubesentry",pod="b",result="partial"}'
+        values: '0+1x90'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: KubesentryLeakScanFailing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: KubesentryLeakScanFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry's background leak scan keeps failing.
+              description: >-
+                No leak scan on a has succeeded for an hour: the /oom page and the memory leak alerts keep the last
+                good findings, so new leaks go unnoticed. The scan's errors are in /api/v1/oom warnings and the
+                server log.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryleakscanfailing
+
+  # No replica holds the alerts lock for a while, then one takes it.
+  - name: alerts not evaluated
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_alerts_leader{namespace="kubesentry",pod="a"}'
+        values: '0x40'
+      - series: 'kubesentry_alerts_leader{namespace="kubesentry",pod="b"}'
+        values: '0x20 1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentryAlertsNotEvaluated
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: KubesentryAlertsNotEvaluated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: KubesentryAlertsNotEvaluated
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry}
+            exp_annotations:
+              summary: No kubesentry replica evaluates alerts.
+              description: >-
+                For 10 minutes no replica in kubesentry has held the alerts lock, so findings are neither evaluated
+                nor sent to Alertmanager. With Postgres, check that the replicas reach it; the server log says why.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryalertsnotevaluated
+
+  # "a" leads and keeps failing; "b" once led and dropped its queue when it
+  # lost the lock; "c" fails but does not lead (it sends nothing anyway).
+  - name: alertmanager failing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_alerts_sent_total{namespace="kubesentry",pod="a",result="failed"}'
+        values: '0+5x40'
+      - series: 'kubesentry_alerts_leader{namespace="kubesentry",pod="a"}'
+        values: '1x40'
+      - series: 'kubesentry_alerts_sent_total{namespace="kubesentry",pod="b",result="dropped"}'
+        values: '0 0 0 40x37'
+      - series: 'kubesentry_alerts_leader{namespace="kubesentry",pod="b"}'
+        values: '1 1 1 0x37'
+      - series: 'kubesentry_alerts_sent_total{namespace="kubesentry",pod="c",result="failed"}'
+        values: '0+5x40'
+      - series: 'kubesentry_alerts_leader{namespace="kubesentry",pod="c"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryAlertmanagerFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryAlertmanagerFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry cannot deliver its alerts to Alertmanager.
+              description: >-
+                a, which sends kubesentry's alerts, has failed or dropped deliveries to Alertmanager for 15 minutes:
+                findings are not reaching anyone. /info (alerts.lastError) names the Alertmanager and the error. If
+                Alertmanager itself is down, this alert cannot reach you through it either.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryalertmanagerfailing

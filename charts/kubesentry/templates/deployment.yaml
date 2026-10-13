@@ -3,6 +3,8 @@
 {{- $o := .Values.oauth2Proxy -}}
 {{- $pg := .Values.audit.postgres -}}
 {{- $file := .Values.audit.sources.file -}}
+{{- $al := .Values.alerts -}}
+{{- $amCA := and $al.enabled (or $al.alertmanager.ca.configMap $al.alertmanager.ca.secret) -}}
 {{- $preStop := and (gt (int .Values.preStopSleepSeconds) 0) (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -136,6 +138,21 @@ spec:
               value: /etc/kubesentry/pg-ca/{{ $pg.sslRootCert.key }}
             {{- end }}
             {{- end }}
+            {{- if and $al.enabled $al.alertmanager.existingSecret }}
+            {{- if $al.alertmanager.basicAuth.username }}
+            - name: ALERTMANAGER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $al.alertmanager.existingSecret }}
+                  key: {{ $al.alertmanager.basicAuth.passwordKey }}
+            {{- else }}
+            - name: ALERTMANAGER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $al.alertmanager.existingSecret }}
+                  key: {{ $al.alertmanager.tokenKey }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.prometheus.bearerTokenSecret.name }}
             - name: PROMETHEUS_TOKEN
               valueFrom:
@@ -199,6 +216,11 @@ spec:
             {{- if and (eq .Values.audit.store "postgres") (or $pg.sslRootCert.configMap $pg.sslRootCert.secret) }}
             - name: pg-ca
               mountPath: /etc/kubesentry/pg-ca
+              readOnly: true
+            {{- end }}
+            {{- if $amCA }}
+            - name: alertmanager-ca
+              mountPath: /etc/kubesentry/alertmanager-ca
               readOnly: true
             {{- end }}
             {{- if and $file.path $file.hostPathDir }}
@@ -366,6 +388,16 @@ spec:
           secret:
             secretName: {{ $pg.sslRootCert.secret }}
         {{- end }}
+        {{- end }}
+        {{- if $amCA }}
+        - name: alertmanager-ca
+          {{- if $al.alertmanager.ca.configMap }}
+          configMap:
+            name: {{ $al.alertmanager.ca.configMap }}
+          {{- else }}
+          secret:
+            secretName: {{ $al.alertmanager.ca.secret }}
+          {{- end }}
         {{- end }}
         {{- if and $file.path $file.hostPathDir }}
         - name: audit-log

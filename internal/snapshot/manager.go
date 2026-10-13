@@ -41,6 +41,9 @@ type Manager struct {
 	cur       atomic.Pointer[View]
 	lastErr   atomic.Pointer[error]
 	lastBuild atomic.Int64 // nanoseconds the last build took
+	// lastChange is when the source last announced a change (Unix
+	// nanoseconds); without a Notifier, when the last poll began.
+	lastChange atomic.Int64
 
 	// after is time.After; tests replace it with a fake clock.
 	after func(time.Duration) <-chan time.Time
@@ -93,6 +96,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	if n, ok := m.Source.(Notifier); ok {
 		changes = n.Changes()
 	}
+	m.markChange()
 	ok := m.rebuild(ctx)
 	for {
 		if ctx.Err() != nil {
@@ -105,6 +109,9 @@ func (m *Manager) Run(ctx context.Context) error {
 				return ctx.Err()
 			case <-m.after(m.interval()):
 			}
+			if changes == nil {
+				m.markChange() // polling: every poll may see changes
+			}
 			ok = m.rebuild(ctx)
 			continue
 		}
@@ -116,6 +123,7 @@ func (m *Manager) Run(ctx context.Context) error {
 				changes = nil
 				continue
 			}
+			m.markChange()
 		}
 		timer := m.after(m.interval())
 	coalesce:
@@ -126,6 +134,8 @@ func (m *Manager) Run(ctx context.Context) error {
 			case _, open := <-changes:
 				if !open {
 					changes = nil // a nil channel never fires; wait for the timer
+				} else {
+					m.markChange()
 				}
 			case <-timer:
 				break coalesce
@@ -164,6 +174,19 @@ func (m *Manager) rebuild(ctx context.Context) bool {
 		m.OnBuild(v, took, nil)
 	}
 	return true
+}
+
+func (m *Manager) markChange() { m.lastChange.Store(m.now().UnixNano()) }
+
+// LastChange is when the source last announced a change (with a Notifier),
+// or when the last poll began (without one); zero before Run. A change
+// newer than the served view's Built time is waiting for a rebuild, so an
+// old view with an old change is a quiet cluster, not a stuck one.
+func (m *Manager) LastChange() time.Time {
+	if n := m.lastChange.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 // Current returns the view being served, or nil before the first build.
