@@ -7,7 +7,6 @@ package api
 import (
 	"fmt"
 	"math"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +14,7 @@ import (
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/model"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
+	"github.com/ByronGary/kubesentry/internal/uilink"
 )
 
 // attentionLimit is how many items the Overview lists.
@@ -148,28 +148,15 @@ func clip(s string) string {
 
 func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
-// Hash routes of the pages that explain an item, with the query parameters
-// those pages read (web/src/pages): Workloads namespace and q, Security
-// check and q, Certificates q, Nodes node.
-func workloadHref(ns, name string) string {
-	return "#/workloads?" + url.Values{"namespace": {ns}, "q": {name}}.Encode()
-}
-
-func podHref(ns, pod string) string {
-	return "#/pods/" + url.PathEscape(ns) + "/" + url.PathEscape(pod)
-}
-
-func securityHref(check, subject string) string {
-	return "#/security?" + url.Values{"check": {check}, "q": {subject}}.Encode()
-}
-
-func certHref(ns, name string) string {
-	return "#/certificates?" + url.Values{"q": {ns + "/" + name}}.Encode()
-}
-
-func nodeHref(name string) string {
-	return "#/nodes?" + url.Values{"node": {name}}.Encode()
-}
+// The pages that explain an item (their hash routes are shared with the
+// alerts' kubesentry_url).
+var (
+	workloadHref = uilink.Workload
+	podHref      = uilink.Pod
+	securityHref = uilink.Security
+	certHref     = uilink.Certificate
+	nodeHref     = uilink.Node
+)
 
 // buildAttention collects every item the view can raise and folds them into
 // groups. Leak findings come later, per request (the scanner runs on its
@@ -233,22 +220,17 @@ func buildAttention(v *snapshot.View, idx *ovIndex) {
 		}
 	}
 
-	issuers := map[string]bool{}
-	for _, is := range v.Issuers {
-		issuers[is.Kind+"/"+is.Namespace+"/"+is.Name] = true
-	}
+	issuers := detectors.IssuerSet(v.Issuers)
 	for ns, cs := range v.Certs {
 		for i := range cs {
 			c := &cs[i]
-			if c.Status != detectors.StatusCrit && c.Status != detectors.StatusWarn {
+			kind := detectors.CertProblem(c, issuers)
+			if kind == "" {
 				continue
 			}
-			kind, order := "cert-not-ready", -1e9
-			switch h := c.ExpiresInHours; {
-			case issuerMissing(c, issuers):
-				kind = "cert-issuer-missing"
-			case h != nil && (*h <= 0 || c.Ready == "True"):
-				kind, order = "cert-expiring", *h
+			order := -1e9
+			if kind == detectors.CertProblemExpiring {
+				order = *c.ExpiresInHours
 			}
 			add(groupKey{ns, "Certificate", c.Name}, c.Name, false, attnItem{
 				severity: c.Status, category: catCert, order: order, kind: kind, title: c.Detail, href: certHref(ns, c.Name),
@@ -302,18 +284,6 @@ func buildAttention(v *snapshot.View, idx *ovIndex) {
 	}
 }
 
-// issuerMissing reports whether c names a cert-manager issuer that does not
-// exist (its detail says so too). External issuer kinds are not judged.
-func issuerMissing(c *detectors.CertSummary, issuers map[string]bool) bool {
-	switch c.IssuerKind {
-	case "Issuer":
-		return !issuers["Issuer/"+c.Namespace+"/"+c.IssuerName]
-	case "ClusterIssuer":
-		return !issuers["ClusterIssuer//"+c.IssuerName]
-	}
-	return false
-}
-
 // workloadKind names the check behind an unhealthy workload, from its
 // worst waiting reason, else from what its status says.
 func workloadKind(w *detectors.WorkloadSummary) string {
@@ -341,36 +311,16 @@ func workloadKind(w *detectors.WorkloadSummary) string {
 // workloadTitle is "CrashLoopBackOff ×3" for pods stuck waiting (most pods
 // first, as the Workloads page lists them), else the workload's detail.
 func workloadTitle(w *detectors.WorkloadSummary) string {
-	type rn struct {
-		r string
-		n int
-	}
-	var stuck []rn
+	stuck := map[string]int{}
 	for r, n := range w.Waiting {
-		if n > 0 && workloadStuck[r] {
-			stuck = append(stuck, rn{r, n})
+		if detectors.IsStuckReason(r) {
+			stuck[r] = n
 		}
 	}
-	if len(stuck) == 0 {
-		return w.Detail
+	if t := detectors.ReasonCounts(stuck); t != "" {
+		return t
 	}
-	sort.Slice(stuck, func(i, j int) bool {
-		if stuck[i].n != stuck[j].n {
-			return stuck[i].n > stuck[j].n
-		}
-		return stuck[i].r < stuck[j].r
-	})
-	parts := make([]string, len(stuck))
-	for i, s := range stuck {
-		parts[i] = fmt.Sprintf("%s ×%d", s.r, s.n)
-	}
-	return strings.Join(parts, ", ")
-}
-
-// workloadStuck are the waiting reasons that do not clear by themselves.
-var workloadStuck = map[string]bool{
-	"CrashLoopBackOff": true, "ImagePullBackOff": true, "ErrImagePull": true, "ErrImageNeverPull": true, "InvalidImageName": true,
-	"CreateContainerConfigError": true, "CreateContainerError": true, "RunContainerError": true,
+	return w.Detail
 }
 
 // workloadSince is when the trouble started, if known: the earliest
@@ -401,39 +351,16 @@ func workloadSince(a *detectors.Assoc, w *detectors.WorkloadSummary, mw *model.W
 // leakItem turns a leak scanner finding into an item: crit when the
 // container reaches its limit sooner than LeakCritHours.
 func leakItem(f detectors.LeakFinding, critHours float64) attnItem {
-	it := attnItem{severity: detectors.StatusWarn, category: catLeak, kind: "leak", href: podHref(f.Namespace, f.Pod), order: math.MaxFloat64}
-	rate := formatRate(f.SlopeBytesPerHour)
+	it := attnItem{severity: detectors.StatusWarn, category: catLeak, kind: "leak", href: podHref(f.Namespace, f.Pod), order: math.MaxFloat64,
+		title: detectors.LeakTitle(f)}
 	if f.TimeToLimitHours != nil {
 		h := *f.TimeToLimitHours
 		it.order = h
 		if h < critHours {
 			it.severity = detectors.StatusCrit
 		}
-		it.title = fmt.Sprintf("Memory leak in %s: %s, reaches its limit in %s", f.Container, rate, approxHours(h))
-	} else {
-		it.title = fmt.Sprintf("Memory leak in %s: %s, no memory limit", f.Container, rate)
 	}
 	return it
-}
-
-func formatRate(b float64) string {
-	switch {
-	case b >= 1<<30:
-		return fmt.Sprintf("%.1f GiB/h", b/(1<<30))
-	case b >= 1<<20:
-		return fmt.Sprintf("%.0f MiB/h", b/(1<<20))
-	}
-	return fmt.Sprintf("%.0f KiB/h", b/(1<<10))
-}
-
-func approxHours(h float64) string {
-	switch {
-	case h < 1:
-		return fmt.Sprintf("~%dm", max(1, int(h*60)))
-	case h < 48:
-		return fmt.Sprintf("~%dh", int(math.Round(h)))
-	}
-	return fmt.Sprintf("~%dd", int(math.Round(h/24)))
 }
 
 // mergeLeaks folds the leak findings into the selection's groups and
@@ -454,12 +381,9 @@ func mergeLeaks(v *snapshot.View, idx *ovIndex, groups []*attnGroup, leaks []det
 	var order []groupKey
 	for _, f := range leaks {
 		k, name := groupKey{f.Namespace, "Pod", f.Pod}, f.Pod
-		for _, p := range a.PodsIn(f.Namespace) {
-			if p.Name == f.Pod {
-				kind, root := a.RootOf(p)
-				k, name = groupKey{f.Namespace, kind, root}, root
-				break
-			}
+		if p, ok := a.PodNamed(f.Namespace, f.Pod); ok {
+			kind, root := a.RootOf(p)
+			k, name = groupKey{f.Namespace, kind, root}, root
 		}
 		g := merged[k]
 		if g == nil {

@@ -233,10 +233,7 @@ func buildOverviewIndex(v *snapshot.View) *ovIndex {
 			}
 		}
 	}
-	issuers := map[string]bool{}
-	for _, is := range v.Issuers {
-		issuers[is.Kind+"/"+is.Namespace+"/"+is.Name] = true
-	}
+	issuers := detectors.IssuerSet(v.Issuers)
 	for ns, cs := range v.Certs {
 		n := idx.namespace(ns)
 		for i := range cs {
@@ -245,7 +242,7 @@ func buildOverviewIndex(v *snapshot.View) *ovIndex {
 			if c.Ready != "True" {
 				n.certsNotReady++
 			}
-			if issuerMissing(c, issuers) {
+			if detectors.IssuerMissing(c, issuers) {
 				n.certsIssuerMissing++
 			}
 			switch c.Status {
