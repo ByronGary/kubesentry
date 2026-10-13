@@ -277,6 +277,7 @@ func WithAuthentication(authn auth.Authenticator, open ...string) func(http.Hand
 			}
 			p := r.URL.Path
 			if (p == "/api" || strings.HasPrefix(p, "/api/")) && !openPaths[p] {
+				metrics.HTTPRejected.With("unauthenticated").Inc()
 				w.Header().Set("WWW-Authenticate", "Bearer")
 				writeError(w, http.StatusUnauthorized, "unauthorized")
 				return
@@ -361,6 +362,7 @@ func WithRateLimit(perIdentityRPS float64, burst int) func(http.Handler) http.Ha
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ok, wait := l.allow(rateKey(r))
 			if !ok {
+				metrics.HTTPRejected.With("rate_limit").Inc()
 				w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(wait.Seconds())))))
 				writeError(w, http.StatusTooManyRequests, "rate limited")
 				return
@@ -384,6 +386,7 @@ func WithMaxInflight(n int) func(http.Handler) http.Handler {
 				defer func() { <-sem }()
 				next.ServeHTTP(w, r)
 			default:
+				metrics.HTTPRejected.With("max_inflight").Inc()
 				w.Header().Set("Retry-After", "1")
 				writeError(w, http.StatusServiceUnavailable, "server busy")
 			}

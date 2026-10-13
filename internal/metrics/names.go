@@ -49,6 +49,37 @@ var (
 	AgentReports = NewCounterVec("kubesentry_agent_reports_total", "Process agent reports by status code.", "code")
 	// AgentNodesReporting is the number of nodes with a fresh agent report.
 	AgentNodesReporting = NewGauge("kubesentry_agent_nodes_reporting", "Nodes whose process agent reported recently.")
+
+	// HTTPRejected counts /api/ requests turned away before a route is
+	// known. Label: reason ("rate_limit", "max_inflight", "unauthenticated").
+	HTTPRejected = NewCounterVec("kubesentry_http_rejected_total", "API requests rejected before routing, by reason.", "reason")
+	// DependencyUp is 1 while a configured dependency works, from the logic
+	// behind /readyz. Label: dependency ("snapshot", "prometheus",
+	// "postgres", "cloudwatch", "alertmanager"); only configured ones appear.
+	DependencyUp = NewGaugeVec("kubesentry_dependency_up", "Whether a configured dependency works (1) or not (0).", "dependency")
+	// LeakScanRuns counts background leak scans. Label: result ("ok",
+	// "partial": some queries failed, "failed": no fresh findings).
+	LeakScanRuns = NewCounterVec("kubesentry_leak_scan_runs_total", "Background leak scans by result.", "result")
+	// SnapshotLastChange is when the informers last reported a cluster
+	// change (Unix seconds; every poll without informers). Newer than the
+	// served view's build time means a change is waiting for a rebuild; a
+	// quiet cluster has an old view and an old change.
+	SnapshotLastChange = NewGauge("kubesentry_snapshot_last_change_timestamp_seconds", "When the cluster last changed, as the informers saw it.")
+
+	// Findings counts open alert findings (not resolved) on the replica that
+	// evaluates them; others report 0. Labels: check, severity
+	// ("warning", "critical"). No object names, so it stays small.
+	Findings = NewGaugeVec("kubesentry_findings", "Open alert findings by check and severity (on the evaluating replica).", "check", "severity")
+	// AlertsSent counts alerts handed to Alertmanager, per URL. Label:
+	// result ("sent", "failed", "dropped").
+	AlertsSent = NewCounterVec("kubesentry_alerts_sent_total", "Alerts posted to Alertmanager by result, per URL.", "result")
+	// AlertsQueueDepth is the alerts waiting to be posted (all URLs).
+	AlertsQueueDepth = NewGauge("kubesentry_alerts_queue_depth", "Alerts queued for Alertmanager.")
+	// AlertsEvaluation observes how long one alert evaluation takes.
+	AlertsEvaluation = NewHistogram("kubesentry_alerts_evaluation_seconds", "Time to evaluate the alert findings of one view.",
+		[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
+	// AlertsLeader is 1 on the replica that evaluates and notifies.
+	AlertsLeader = NewGauge("kubesentry_alerts_leader", "1 on the replica that evaluates alerts and notifies.")
 )
 
 func init() { Default.RegisterRuntime() }

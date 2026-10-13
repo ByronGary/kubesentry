@@ -48,6 +48,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		go pg.MaintainLoop(ctx, time.Hour)
 		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "postgres", Check: pg.Ping})
 		srv.AuditHealth = watchPostgres(ctx, pg, 15*time.Second)
+		dependencyUp("postgres", srv.AuditHealth)
 		metrics.AuditQueueDepth.SetFunc(func() float64 { return float64(pg.Stats().Queued) })
 		slog.Info("audit store: postgres", "schema", cfg.pgSchema, "retention", formatDuration(cfg.auditRetention))
 	} else {
@@ -108,12 +109,14 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 			},
 		}
 		go cw.run(ctx)
-		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "cloudwatch", Check: func(context.Context) error {
+		cwHealth := func() error {
 			if st, ok := cw.status(); ok && st.ErrorKind != "" {
 				return fmt.Errorf("%s: %s", st.ErrorKind, st.LastError)
 			}
 			return nil
-		}})
+		}
+		srv.Checks = append(srv.Checks, api.HealthCheck{Name: "cloudwatch", Check: func(context.Context) error { return cwHealth() }})
+		dependencyUp("cloudwatch", cwHealth)
 		metrics.CloudWatchLag.SetFunc(cw.lagSeconds)
 		srv.CloudWatchLag = cw.lag
 		slog.Info("reading EKS audit logs from CloudWatch", "logGroup", group, "streamPrefix", cfg.cloudwatchPrefix)

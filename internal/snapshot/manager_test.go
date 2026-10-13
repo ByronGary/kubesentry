@@ -296,3 +296,39 @@ func TestOnDemandAndStatic(t *testing.T) {
 		t.Error("a zero policy builds with the defaults")
 	}
 }
+
+// LastChange follows the source's change signals, so an unbuilt change
+// shows as newer than the served view while a quiet cluster's view and
+// change are both old.
+func TestManagerLastChange(t *testing.T) {
+	src := notifyingSource{&fakeSource{inv: smallInventory()}, make(chan struct{})}
+	clock := newFakeClock()
+	var mu sync.Mutex
+	at := synthNow
+	now := func() time.Time { mu.Lock(); defer mu.Unlock(); return at }
+	set := func(t time.Time) { mu.Lock(); at = t; mu.Unlock() }
+	m := &Manager{Source: src, Now: now}
+	m.after = clock.after
+	if !m.LastChange().IsZero() {
+		t.Fatal("a change before Run")
+	}
+	builds, stop := startManager(t, m)
+	defer stop()
+	waitBuild(t, builds)
+	if !m.LastChange().Equal(synthNow) || !m.Current().Built.Equal(synthNow) {
+		t.Fatalf("after the first build: change %v, built %v", m.LastChange(), m.Current().Built)
+	}
+
+	set(synthNow.Add(time.Minute)) // quiet for a minute, then a change
+	src.changes <- struct{}{}
+	tm := clock.next(t)
+	if got := m.LastChange(); !got.Equal(synthNow.Add(time.Minute)) || !got.After(m.Current().Built) {
+		t.Fatalf("pending change %v, view built %v", got, m.Current().Built)
+	}
+	set(synthNow.Add(time.Minute + 2*time.Second))
+	tm.fire <- synthNow
+	waitBuild(t, builds)
+	if m.LastChange().After(m.Current().Built) {
+		t.Errorf("after the rebuild the change %v is still newer than the view %v", m.LastChange(), m.Current().Built)
+	}
+}

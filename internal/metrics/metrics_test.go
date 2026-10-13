@@ -175,6 +175,9 @@ func TestDefaultRegistry(t *testing.T) {
 		"kubesentry_authz_cache_total", "kubesentry_prometheus_query_seconds", "kubesentry_prometheus_cache_total",
 		"kubesentry_audit_ingested_total", "kubesentry_audit_queue_depth", "kubesentry_audit_store_errors_total",
 		"kubesentry_cloudwatch_lag_seconds", "kubesentry_agent_reports_total", "kubesentry_agent_nodes_reporting",
+		"kubesentry_http_rejected_total", "kubesentry_dependency_up", "kubesentry_leak_scan_runs_total",
+		"kubesentry_snapshot_last_change_timestamp_seconds", "kubesentry_findings", "kubesentry_alerts_sent_total",
+		"kubesentry_alerts_queue_depth", "kubesentry_alerts_evaluation_seconds", "kubesentry_alerts_leader",
 	} {
 		Default.mu.Lock()
 		_, ok := Default.metrics[name]

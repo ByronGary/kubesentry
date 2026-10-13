@@ -121,6 +121,7 @@ func run(cfg *config) error {
 		srv.Unavailable = cache.Unavailable
 		srv.ResponseCache = &api.ResponseCache{MaxBytes: 64 << 20}
 		current = mgr.Current
+		registerLastChange(mgr.LastChange)
 		srv.Ready = func() bool {
 			if !ready.Load() && cache.Ready() && mgr.Current() != nil {
 				ready.Store(true)
@@ -139,6 +140,7 @@ func run(cfg *config) error {
 		slog.Warn("-cache=false: every request lists the cluster; use only for debugging")
 	}
 	registerSnapshotMetrics(current)
+	dependencyUp("snapshot", snapshotHealth(current))
 
 	if cfg.authMode == "proxy" {
 		reviewer, err := kube.NewReviewer(clients, float32(cfg.authzQPS), 2*int(cfg.authzQPS))
@@ -164,7 +166,8 @@ func run(cfg *config) error {
 	err = promSetup{
 		url: cfg.promURL, service: cfg.promService, region: cfg.awsRegion, sigv4: cfg.promSigV4, ksmLimits: cfg.promKSMLimits,
 		autodiscover: cfg.promAutodiscover, selector: sel,
-		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak},
+		scan: prom.LeakScanOptions{Interval: cfg.leakScanInterval, Window: cfg.leakScanWindow, Leak: policy.Leak,
+			OnScan: func(result string) { metrics.LeakScanRuns.With(result).Inc() }},
 		pods: func(context.Context) ([]model.Pod, error) {
 			if v := current(); v != nil {
 				return v.Inv.Pods, nil // shared and read-only, which the scanner respects
@@ -179,6 +182,10 @@ func run(cfg *config) error {
 	srv.Metrics = metricsSource
 	srv.PrometheusInfo = metricsSource.Info
 	srv.PrometheusHealth = metricsSource.Health
+	if cfg.promURL != "" || cfg.promAutodiscover {
+		// 1 while none is known yet: nothing to be down.
+		dependencyUp("prometheus", metricsSource.Health)
+	}
 
 	closers, err := setupAudit(ctx, cfg, policy, srv)
 	if err != nil {
