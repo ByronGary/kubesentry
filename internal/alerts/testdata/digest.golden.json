@@ -1,0 +1,22 @@
+[
+  {
+    "labels": {
+      "alertname": "KubesentryFindingsDigest",
+      "check": "digest",
+      "cluster": "prod-eks",
+      "kubesentry_digest": "true",
+      "owner": "payments",
+      "severity": "warning"
+    },
+    "annotations": {
+      "description": "More new findings appeared at once than kubesentry alerts on one by one (-alerts-max-new), so they are summed up here: KubesentryCertificateExpiring ×1, KubesentryMemoryLeak ×1, KubesentryPodEvicted ×1, KubesentryPodStuckTerminating ×1.\n- [critical] Certificate payments/api-tls: Expires in 3 days.\n- [critical] Deployment payments/cache: Memory leak in cache: 120 MiB/h, reaches its limit in ~3h\n- [warning] Deployment payments/batch: 2 pods evicted\n- [warning] Deployment payments/web: 2 pods stuck terminating",
+      "findings": "4",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=payments",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryfindingsdigest",
+      "summary": "4 kubesentry findings for payments, sent as a digest"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:04:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=payments"
+  }
+]

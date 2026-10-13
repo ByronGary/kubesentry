@@ -1,0 +1,203 @@
+[
+  {
+    "labels": {
+      "alertname": "KubesentryCertificateExpiring",
+      "check": "cert-expiring",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "object": "Certificate/api-tls",
+      "owner": "payments",
+      "production": "true",
+      "severity": "critical"
+    },
+    "annotations": {
+      "dedupe_key": "cert-expiring/Certificate/payments/api-tls",
+      "description": "Certificate payments/api-tls for api.example.com (issuer ClusterIssuer/le, secret api-tls): Expires in 3 days. cert-manager has not renewed it on schedule; check the issuer and the latest CertificateRequest.",
+      "expires_at": "2026-10-15T12:00:00Z",
+      "issuer": "ClusterIssuer/le",
+      "kubesentry_url": "https://kubesentry.example.com/#/certificates?q=payments%2Fapi-tls",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrycertificateexpiring",
+      "summary": "Certificate payments/api-tls: Expires in 3 days."
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/certificates?q=payments%2Fapi-tls"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryCertificateNotReady",
+      "check": "cert-not-ready",
+      "cluster": "prod-eks",
+      "namespace": "team-a",
+      "object": "Certificate/lost-tls",
+      "owner": "platform",
+      "production": "false",
+      "severity": "critical"
+    },
+    "annotations": {
+      "dedupe_key": "cert-not-ready/Certificate/team-a/lost-tls",
+      "description": "Certificate team-a/lost-tls (issuer Issuer/gone, secret lost-tls) is not ready: Issuer gone not found.",
+      "issuer": "Issuer/gone",
+      "kubesentry_url": "https://kubesentry.example.com/#/certificates?q=team-a%2Flost-tls",
+      "reason": "issuer-missing",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrycertificatenotready",
+      "summary": "Certificate team-a/lost-tls is not ready: Issuer gone not found."
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/certificates?q=team-a%2Flost-tls"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryMemoryLeak",
+      "check": "memory-leak",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "owner": "payments",
+      "production": "true",
+      "severity": "critical",
+      "workload": "Deployment/cache"
+    },
+    "annotations": {
+      "container": "cache",
+      "dedupe_key": "memory-leak/Deployment/payments/cache",
+      "description": "Container cache of pod cache-7d9f-0 grows 120 MiB/h (R² 0.97, high confidence) and reaches its memory limit in about 3h, around 2026-10-12 15:10 UTC: expect an OOM kill then.",
+      "growth_bytes_per_hour": "125829120",
+      "kubesentry_url": "https://kubesentry.example.com/#/pods/payments/cache-7d9f-0",
+      "pod": "cache-7d9f-0",
+      "pods": "1",
+      "predicted_oom": "2026-10-12T15:10:00Z",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrymemoryleak",
+      "summary": "Deployment payments/cache: Memory leak in cache: 120 MiB/h, reaches its limit in ~3h"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/pods/payments/cache-7d9f-0"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryPodEvicted",
+      "check": "pod-evicted",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "owner": "payments",
+      "production": "true",
+      "severity": "warning",
+      "workload": "Deployment/batch"
+    },
+    "annotations": {
+      "dedupe_key": "pod-evicted/Deployment/payments/batch",
+      "description": "2 pods of Deployment payments/batch were evicted in the last day, the latest 2026-10-12T10:00:00Z on node node-0. The node was low on resource: memory.",
+      "kubesentry_url": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=batch",
+      "latest_eviction": "2026-10-12T10:00:00Z",
+      "pods": "2",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrypodevicted",
+      "summary": "Deployment payments/batch: 2 pods evicted"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=batch"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryPodStuckTerminating",
+      "check": "pod-stuck-terminating",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "node": "node-1",
+      "owner": "payments",
+      "production": "true",
+      "severity": "warning",
+      "workload": "Deployment/web"
+    },
+    "annotations": {
+      "dedupe_key": "pod-stuck-terminating/Deployment/payments/web",
+      "description": "2 pods of Deployment payments/web are still terminating more than 5 minutes after their deletion time (the oldest, pod web-7d9f-3 on node node-1, since 2026-10-12T11:30:00Z); a finalizer or an unreachable node may be holding them.",
+      "kubesentry_url": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=web",
+      "oldest_deletion": "2026-10-12T11:30:00Z",
+      "pods": "2",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrypodstuckterminating",
+      "summary": "Deployment payments/web: 2 pods stuck terminating"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=web"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryWorkloadUnhealthy",
+      "check": "workload-unhealthy",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "owner": "payments",
+      "production": "true",
+      "severity": "critical",
+      "workload": "Deployment/api"
+    },
+    "annotations": {
+      "dedupe_key": "workload-unhealthy/Deployment/payments/api",
+      "description": "3 of 4 pods of Deployment payments/api cannot run: CrashLoopBackOff ×3. api-7d9f-0: api: back-off 5m0s restarting failed container",
+      "kubesentry_url": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=api",
+      "pods": "3",
+      "reasons": "CrashLoopBackOff=3",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryworkloadunhealthy",
+      "summary": "Deployment payments/api: CrashLoopBackOff ×3"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/workloads?namespace=payments\u0026q=api"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryWorkloadUnhealthy",
+      "check": "workload-unhealthy",
+      "cluster": "prod-eks",
+      "namespace": "team-a",
+      "owner": "platform",
+      "production": "false",
+      "severity": "critical",
+      "workload": "Deployment/img"
+    },
+    "annotations": {
+      "dedupe_key": "workload-unhealthy/Deployment/team-a/img",
+      "description": "1 of 1 pod of Deployment team-a/img cannot run: ImagePullBackOff ×1. img-7d9f-0: img: Back-off pulling image \"nope:latest\"",
+      "kubesentry_url": "https://kubesentry.example.com/#/workloads?namespace=team-a\u0026q=img",
+      "pods": "1",
+      "reasons": "ImagePullBackOff=1",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryworkloadunhealthy",
+      "summary": "Deployment team-a/img: ImagePullBackOff ×1"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/workloads?namespace=team-a\u0026q=img"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryWorkloadUnhealthy",
+      "check": "workload-unhealthy",
+      "cluster": "prod-eks",
+      "namespace": "team-a",
+      "owner": "platform",
+      "production": "false",
+      "severity": "warning",
+      "workload": "Pod/huge"
+    },
+    "annotations": {
+      "dedupe_key": "workload-unhealthy/Pod/team-a/huge",
+      "description": "1 of 1 pod of Pod team-a/huge cannot run: Unschedulable ×1. huge: 0/3 nodes are available: 3 Insufficient memory.",
+      "kubesentry_url": "https://kubesentry.example.com/#/pods/team-a/huge",
+      "pods": "1",
+      "reasons": "Unschedulable=1",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryworkloadunhealthy",
+      "summary": "Pod team-a/huge: Unschedulable ×1"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/pods/team-a/huge"
+  }
+]
