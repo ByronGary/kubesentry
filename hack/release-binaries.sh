@@ -9,7 +9,7 @@
 #   hack/release-binaries.sh v0.1.0 out/       another directory (emptied first)
 #
 # Each archive holds the binary (static, CGO off, the UI embedded from the
-# committed internal/web/dist) and README.md: <name>_<version>_<os>_<arch>.tar.gz,
+# committed internal/web/dist), LICENSE and README.md: <name>_<version>_<os>_<arch>.tar.gz,
 # or .zip for Windows. SHA256SUMS lists them all. The version is stamped into
 # the binaries (-X main.version) as given, e.g. v0.1.0, and the archive names
 # drop the v. Files carry the commit time and archives no owner, so a rebuild
@@ -58,12 +58,12 @@ build() {
   mkdir -p "$dir"
   CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
     go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$dir/$name$ext" "./cmd/$cmd"
-  cp README.md "$dir/"
+  cp LICENSE README.md "$dir/"
   touch -d "@$epoch" "$dir"/*
   if [ "$os" = windows ]; then
-    zipfiles "$out/$base.zip" "$dir" "$name$ext" README.md
+    zipfiles "$out/$base.zip" "$dir" "$name$ext" LICENSE README.md
   else
-    tar -C "$dir" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -cf - "$name" README.md |
+    tar -C "$dir" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" -cf - "$name" LICENSE README.md |
       gzip -n -9 >"$out/$base.tar.gz"
   fi
   echo "built $base"

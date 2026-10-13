@@ -34,7 +34,9 @@ LABEL org.opencontainers.image.title="kubesentry-${CMD}" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
-      org.opencontainers.image.base.name="gcr.io/distroless/static:nonroot"
+      org.opencontainers.image.base.name="gcr.io/distroless/static:nonroot" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY LICENSE /licenses/LICENSE
 COPY --from=build /out/app /app
 USER 65532:65532
 ENTRYPOINT ["/app"]

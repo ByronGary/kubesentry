@@ -336,3 +336,7 @@ Only `internal/kube` imports client-go, only `internal/pgstore` pgx, and only `i
 **Process monitoring, next steps.** Process history and a per-process memory trend, so a leaking child process is named in the leak finding; a process tree view; an optional eBPF mode for short-lived processes.
 
 **Also planned.** Persisted history of findings.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
