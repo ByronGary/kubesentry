@@ -342,6 +342,32 @@ func TestEvaluatorSendsOnlyAfterCommit(t *testing.T) {
 	}
 }
 
+// A finding that waited out its pending time when a commit failed fires at
+// the next evaluation, still starting when it was first seen.
+func TestEvaluatorPendingSurvivesAFailedCommit(t *testing.T) {
+	h := newHarness(t, Options{})
+	fs := &failStore{Store: h.store}
+	h.ev = NewEvaluator(fs, h.sink, Options{Now: h.clk.now})
+	h.at(0)
+	h.sink.take()
+	fs.fail = true
+	h.clk.t = t0.Add(5 * time.Minute)
+	if _, err := h.ev.Evaluate(context.Background(), Input{View: view(h.inv, h.clk.t), Leaks: leakReport(h.clk.t), Now: h.clk.t}); err == nil {
+		t.Fatal("commit failure not reported")
+	}
+	fs.fail = false
+	_, sent := h.at(5*time.Minute + 30*time.Second)
+	var api *Alert
+	for i, a := range sent {
+		if a.Annotations["dedupe_key"] == "workload-unhealthy/Deployment/payments/api" {
+			api = &sent[i]
+		}
+	}
+	if api == nil || !api.StartsAt.Equal(t0) {
+		t.Fatalf("after the failed commit: %v (api %+v)", names(sent), api)
+	}
+}
+
 // A new evaluator (another replica took over, or a restart) on the same
 // store carries on: nothing re-fires before its Resend is due.
 func TestEvaluatorTakeOverCarriesOn(t *testing.T) {

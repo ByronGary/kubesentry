@@ -179,6 +179,7 @@ func (e *Evaluator) Load(ctx context.Context) error {
 		e.state[f.Key] = &f
 		e.persisted[f.Key] = f.LastSeen
 	}
+	e.digests = map[string]digestState{} // re-post the digests at once
 	e.baselines = make(map[string]map[string]bool, len(bl))
 	for check, keys := range bl {
 		set := make(map[string]bool, len(keys))
@@ -301,7 +302,6 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		if f == nil || f.Resolved() {
 			nf.State, nf.FirstSeen, nf.LastSeen = StateOpen, firstSeen[k], now
 			e.state[k] = &nf
-			delete(e.pending, k)
 			dirty[k] = true
 			opened = append(opened, &nf)
 			continue
@@ -422,8 +422,13 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		c.Baselines = nil
 	}
 	if err := e.store.Commit(ctx, c); err != nil {
-		e.loaded = false // memory may be ahead of the store: start again from it
+		// Memory may be ahead of the store: start again from it. Pending
+		// timers stay, so what waited out its pending time fires next time.
+		e.loaded = false
 		return res, fmt.Errorf("alerts: commit: %w", err)
+	}
+	for _, f := range opened {
+		delete(e.pending, f.Key)
 	}
 	for _, f := range c.Findings {
 		e.persisted[f.Key] = f.LastSeen
