@@ -715,6 +715,16 @@ func (a *Assoc) Pod(uid string) (*model.Pod, bool) {
 	return &a.inv.Pods[i], true
 }
 
+// PodByName returns the pod with this namespace and name: how metrics and
+// events, which name pods rather than give their UID, find them.
+func (a *Assoc) PodByName(ns, name string) (*model.Pod, bool) {
+	i, ok := a.podAt[nsName{ns, name}]
+	if !ok {
+		return nil, false
+	}
+	return &a.inv.Pods[i], true
+}
+
 // ReplicaSet returns a ReplicaSet by namespace and name.
 func (a *Assoc) ReplicaSet(ns, name string) (*model.ReplicaSet, bool) {
 	i, ok := a.rs[nsName{ns, name}]

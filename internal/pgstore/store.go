@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 )
 
 // Options configures a Store. Zero values take the defaults shown.
@@ -34,6 +35,11 @@ type Options struct {
 	QueueSize     int           // 50,000 events waiting to be written before Add returns ErrBackpressure
 	BatchSize     int           // 5,000 events per COPY
 	FlushInterval time.Duration // 250ms: a partial batch is written after this long
+	// EventsRetention keeps Kubernetes events (k8s_events) by last seen, and
+	// IncidentRetention resolved incidents by end; 48h and 7 days, negative
+	// keeps them forever.
+	EventsRetention   time.Duration
+	IncidentRetention time.Duration
 	// CacheTTL is how long a Summarize or Coverage result counts as fresh
 	// (30s). Older results are still served while one refresh per result
 	// runs in the background (see cache.go). Negative disables caching.
@@ -62,6 +68,12 @@ func (o *Options) defaults() error {
 	}
 	if o.Retention == 0 {
 		o.Retention = 30 * 24 * time.Hour
+	}
+	if o.EventsRetention == 0 {
+		o.EventsRetention = incidents.DefaultEventsKeep
+	}
+	if o.IncidentRetention == 0 {
+		o.IncidentRetention = incidents.DefaultRetention
 	}
 	if o.QueueSize <= 0 {
 		o.QueueSize = 50_000

@@ -191,6 +191,33 @@ func TestAssociateOwners(t *testing.T) {
 	}
 }
 
+func TestAssocPodByName(t *testing.T) {
+	inv := model.Inventory{
+		Workloads:   []model.Workload{deployment("shop", "api", nil)},
+		ReplicaSets: []model.ReplicaSet{replicaSet("shop", "api-7d9f", ctrl("Deployment", "api"))},
+		Pods: []model.Pod{
+			runningPod("shop", "api-7d9f-x1", ctrl("ReplicaSet", "api-7d9f"), nil),
+			runningPod("other", "api-7d9f-x1", nil, nil), // same name, another namespace
+		},
+	}
+	a := Associate(inv, DefaultPolicy())
+	p, ok := a.PodByName("shop", "api-7d9f-x1")
+	if !ok || p.Namespace != "shop" || p.UID != "uid-api-7d9f-x1" {
+		t.Fatalf("PodByName(shop) = %+v, %v", p, ok)
+	}
+	if kind, name := a.RootOf(p); kind != "Deployment" || name != "api" {
+		t.Errorf("RootOf = %s/%s, want Deployment/api", kind, name)
+	}
+	if p, ok := a.PodByName("other", "api-7d9f-x1"); !ok || p.Namespace != "other" {
+		t.Errorf("PodByName(other) = %+v, %v", p, ok)
+	}
+	for _, c := range [][2]string{{"shop", "gone"}, {"", "api-7d9f-x1"}, {"nowhere", "api-7d9f-x1"}} {
+		if p, ok := a.PodByName(c[0], c[1]); ok {
+			t.Errorf("PodByName(%s, %s) = %+v, want none", c[0], c[1], p)
+		}
+	}
+}
+
 func TestAssociateStaleUIDIsMissing(t *testing.T) {
 	inv := model.Inventory{
 		Workloads: []model.Workload{{Kind: "StatefulSet", Namespace: "a", Name: "db", UID: "uid-new"}},
