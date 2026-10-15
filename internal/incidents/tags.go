@@ -156,7 +156,7 @@ func contains(l []string, s string) bool {
 // app.kubernetes.io/part-of, app.kubernetes.io/instance or the custom tag
 // (same value), or a Service in the same namespace, and their [start, end]
 // ranges overlap (open ones end now). Related incidents are never merged;
-// they are listed newest first, in excluded.
+// they are listed newest first, in itself left out.
 func Related(in Incident, candidates []Incident, custom string, now time.Time) []Incident {
 	keys := []string{"app.kubernetes.io/part-of", "app.kubernetes.io/instance"}
 	if custom != "" {
