@@ -88,6 +88,8 @@ var (
 		"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type",
 		// Security groups tie CloudTrail changes to the Service's NLB.
 		"service.beta.kubernetes.io/aws-load-balancer-security-groups",
+		"service.beta.kubernetes.io/aws-load-balancer-extra-security-groups",
+		"service.beta.kubernetes.io/aws-load-balancer-name",
 		PrometheusAnnotation,
 	)
 	ingressAnnotations = keySet(

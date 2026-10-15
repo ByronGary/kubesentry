@@ -173,17 +173,22 @@ func (in Incident) Window(lead, lag time.Duration, now time.Time) (from, to time
 // means none (the caller sees nothing namespaced). ClusterScoped admits
 // incidents without a namespace (node and cluster subjects).
 type Query struct {
-	From, To      time.Time
+	From, To time.Time
+	// Severity matches PeakSeverity (an incident that was ever critical stays
+	// in a critical filter).
 	Severity      Severity
 	Types         []string
 	State         State
 	Namespaces    map[string]bool
 	ClusterScoped bool
 	Owner         string
-	App           string
-	Service       string
-	Tags          map[string]string
-	Limit         int
+	// App matches the reserved tag TagApp ("kubesentry.io/app"), the display
+	// app chosen from the custom key, app.kubernetes.io/name, app, or the
+	// workload name. Service matches the comma-separated "service" tag.
+	App     string
+	Service string
+	Tags    map[string]string
+	Limit   int
 	// Before is the keyset cursor (start, id), newest first.
 	Before *Cursor
 }

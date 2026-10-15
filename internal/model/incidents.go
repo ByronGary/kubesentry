@@ -6,26 +6,26 @@ import "time"
 // use. Events are watched separately from the inventory (they churn) and are
 // never part of Inventory.
 type KubeEvent struct {
-	UID       string
-	Namespace string
-	Type      string // "Warning" or "Normal"
-	Reason    string
-	Message   string // truncated
-	Count     int32  // series count, at least 1
-	FirstSeen time.Time
-	LastSeen  time.Time
+	UID       string    `json:"uid"`
+	Namespace string    `json:"namespace,omitempty"`
+	Type      string    `json:"type"` // "Warning" or "Normal"
+	Reason    string    `json:"reason"`
+	Message   string    `json:"message"` // truncated
+	Count     int32     `json:"count"`   // series count, at least 1
+	FirstSeen time.Time `json:"firstSeen"`
+	LastSeen  time.Time `json:"lastSeen"`
 	// Regarding is the involved object.
-	Regarding ObjectRef
+	Regarding ObjectRef `json:"regarding"`
 	// Source is the reporting component, e.g. "kubelet" or "default-scheduler".
-	Source string
+	Source string `json:"source,omitempty"`
 }
 
 // ObjectRef names a Kubernetes object.
 type ObjectRef struct {
-	Kind      string
-	Namespace string
-	Name      string
-	UID       string
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	UID       string `json:"uid,omitempty"`
 }
 
 // ServiceAccount is kept only for its IRSA role, which links CloudTrail
