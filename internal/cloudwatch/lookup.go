@@ -392,11 +392,11 @@ const (
 	LevelDebug = "debug"
 )
 
-// levelRanks orders the levels a query may ask for; a query for a level
-// returns that level and more severe ones.
+// levelRanks orders the levels: LogQuery.Level is a minimum severity
+// (debug < info < warn < error).
 var levelRanks = map[string]int{"": 0, LevelDebug: 0, LevelInfo: 1, LevelWarn: 2, LevelError: 3}
 
-// levelRank ranks a line's level; unknown counts as info.
+// levelRank ranks a line's level; anything unknown counts as info.
 func levelRank(level string) int {
 	if r, ok := levelRanks[level]; ok && level != "" {
 		return r
@@ -404,73 +404,69 @@ func levelRank(level string) int {
 	return 1
 }
 
-// NormalizeLevel maps a level word or number (bunyan/pino: 10 to 60) to
-// LevelError, LevelWarn, LevelInfo, LevelDebug, or "" when unknown.
+// NormalizeLevel maps a level word to LevelError, LevelWarn, LevelInfo or
+// LevelDebug, or "" when it is not one.
 func NormalizeLevel(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	switch s {
-	case "error", "err", "e", "fatal", "f", "critical", "crit", "panic", "alert", "emerg", "emergency", "severe":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "error", "err", "fatal", "critical", "crit", "panic", "alert", "emerg", "emergency", "severe":
 		return LevelError
-	case "warn", "warning", "w":
+	case "warn", "warning":
 		return LevelWarn
-	case "info", "information", "informational", "notice", "i":
+	case "info", "information", "informational", "notice":
 		return LevelInfo
-	case "debug", "trace", "verbose", "d", "t":
+	case "debug", "trace", "verbose":
 		return LevelDebug
-	}
-	if n, err := strconv.Atoi(s); err == nil {
-		switch {
-		case n >= 50:
-			return LevelError
-		case n >= 40:
-			return LevelWarn
-		case n >= 30:
-			return LevelInfo
-		case n > 0:
-			return LevelDebug
-		}
 	}
 	return ""
 }
 
+// The level rules are the Kubernetes PodLogs source's, so both sources
+// classify a line alike: a JSON level/lvl/severity field, then logfmt
+// level=, then a klog header, then an upper-case FATAL, PANIC, ERROR or
+// WARN(ING) word, otherwise info.
 var (
-	levelField = regexp.MustCompile(`(?i)\b(?:level|lvl|severity)\s*[=:]\s*"?([A-Za-z]+)`)
-	levelWord  = regexp.MustCompile(`\b(FATAL|PANIC|CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG|TRACE)\b`)
-	levelTag   = regexp.MustCompile(`(?i)\[(fatal|panic|critical|crit|error|err|warning|warn|info|debug|trace)\]`)
-	klogHeader = regexp.MustCompile(`^([IWEF])\d{4} \d{2}:\d{2}:\d{2}`)
+	logfmtLevel = regexp.MustCompile(`(?:^|\s)level="?([A-Za-z]+)`)
+	klogHeader  = regexp.MustCompile(`^([IWEF])\d{4} \d{2}:\d{2}:\d{2}`)
+	levelWord   = regexp.MustCompile(`\b(FATAL|PANIC|ERROR|WARN(ING)?)\b`)
 )
 
-// DetectLevel finds a log line's level in its text: a level=/level: field,
-// a klog header (E1015 …), a bracketed level ([warning]), or an upper-case
-// level word. "" when none.
+// levelKeys are the JSON fields that carry a level.
+var levelKeys = []string{"level", "lvl", "severity"}
+
+// DetectLevel finds the level of a line of text (after any JSON level field
+// was looked for): logfmt level=, a klog header (E1015 …), an upper-case
+// FATAL, PANIC, ERROR or WARN(ING) word, otherwise LevelInfo.
 func DetectLevel(text string) string {
-	if m := levelField.FindStringSubmatch(text); m != nil {
+	if m := logfmtLevel.FindStringSubmatch(text); m != nil {
 		if l := NormalizeLevel(m[1]); l != "" {
 			return l
 		}
 	}
 	if m := klogHeader.FindStringSubmatch(text); m != nil {
-		return NormalizeLevel(m[1])
-	}
-	if m := levelTag.FindStringSubmatch(text); m != nil {
-		return NormalizeLevel(m[1])
+		switch m[1] {
+		case "E", "F":
+			return LevelError
+		case "W":
+			return LevelWarn
+		}
+		return LevelInfo
 	}
 	if m := levelWord.FindStringSubmatch(text); m != nil {
-		return NormalizeLevel(m[1])
+		if m[1] == "FATAL" || m[1] == "PANIC" || m[1] == "ERROR" {
+			return LevelError
+		}
+		return LevelWarn
 	}
-	return ""
+	return LevelInfo
 }
-
-// levelKeys are the JSON fields that carry a level.
-var levelKeys = []string{"level", "lvl", "severity", "log_level", "loglevel", "levelname"}
 
 // ParseContainerLog turns one CloudWatch log event into a log line. It reads
 // Fluent Bit and Fluentd records (log, stream, kubernetes.pod_name and
 // container_name, time or @timestamp), including records whose application
 // JSON was merged in (message or msg, and a level field); anything else is
 // kept as raw text at the event's timestamp. The level comes from a JSON
-// field (of the record, or of the application's own JSON line), then from
-// the text.
+// level, lvl or severity field (of the record, or of the application's own
+// JSON line), then from the text (DetectLevel).
 func ParseContainerLog(message string, timestampMs int64) incidents.LogLine {
 	line := incidents.LogLine{Time: time.UnixMilli(timestampMs).UTC(), Text: message, Source: LogSourceName}
 	trimmed := strings.TrimSpace(message)

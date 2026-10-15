@@ -189,7 +189,7 @@ func TestLogLookupReadsAndFilters(t *testing.T) {
 	}
 	add(1, "shop", "web-0", "app", "level=info msg=\"started\"\n")
 	add(2, "shop", "web-1", "app", `{"level":"warn","msg":"upstream timeout, retrying"}`)
-	add(3, "shop", "web-0", "envoy", "[2026-10-15 10:00:03][warning] upstream Timeout")
+	add(3, "shop", "web-0", "envoy", "[2026-10-15 10:00:03][WARNING] upstream Timeout")
 	add(4, "other", "web-0", "app", "ERROR timeout in another namespace")
 	add(5, "shop", "web-2", "app", "ERROR timeout on a pod not asked for")
 	add(6, "shop", "web-0", "app", "E1015 10:00:06.000000       1 main.go:42] request timeout")
@@ -215,7 +215,7 @@ func TestLogLookupReadsAndFilters(t *testing.T) {
 	}
 	want := []string{
 		`10:00:02 web-1/app warn cloudwatch {"level":"warn","msg":"upstream timeout, retrying"}`,
-		`10:00:03 web-0/envoy warn cloudwatch [2026-10-15 10:00:03][warning] upstream Timeout`,
+		`10:00:03 web-0/envoy warn cloudwatch [2026-10-15 10:00:03][WARNING] upstream Timeout`,
 		`10:00:06 web-0/app error cloudwatch E1015 10:00:06.000000       1 main.go:42] request timeout`,
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -314,7 +314,7 @@ func TestLogLookupStreamPrefix(t *testing.T) {
 	for _, ln := range res.Lines {
 		got = append(got, ln.Pod+":"+ln.Level+":"+ln.Text)
 	}
-	if want := "web-1::plain line from web-1,web-2:warn:WARN from web-2"; strings.Join(got, ",") != want {
+	if want := "web-1:info:plain line from web-1,web-2:warn:WARN from web-2"; strings.Join(got, ",") != want {
 		t.Errorf("lines = %s, want %s", strings.Join(got, ","), want)
 	}
 	var prefixes []string
@@ -344,15 +344,21 @@ func TestParseContainerLog(t *testing.T) {
 			"pay-0", "api", "warn", "payment declined", "10:00:02"},
 		{"application JSON inside log", fluent("shop", "web-0", "app", "stdout", `{"lvl":"debug","msg":"cache hit"}`, lt0),
 			"web-0", "app", "debug", `{"lvl":"debug","msg":"cache hit"}`, "10:00:00"},
-		{"pino numeric level", `{"log":"{\"level\":50,\"msg\":\"db down\"}","kubernetes":{"pod_name":"a"}}`,
-			"a", "", "error", `{"level":50,"msg":"db down"}`, "10:00:01"},
+		{"numeric JSON level is not a level word", `{"log":"{\"level\":50,\"msg\":\"db down\"}","kubernetes":{"pod_name":"a"}}`,
+			"a", "", "info", `{"level":50,"msg":"db down"}`, "10:00:01"},
+		{"severity field", `{"severity":"ERROR","message":"payment failed"}`,
+			"", "", "error", "payment failed", "10:00:01"},
 		{"epoch @timestamp", `{"@timestamp":1792058403.25,"msg":"tick","kubernetes":{"pod_name":"a"}}`,
-			"a", "", "", "tick", "10:00:03.25"},
+			"a", "", "info", "tick", "10:00:03.25"},
 		{"logfmt", `{"log":"time=x level=Error msg=\"no route\"","kubernetes":{"pod_name":"a"}}`,
 			"a", "", "error", `time=x level=Error msg="no route"`, "10:00:01"},
 		{"plain text", "WARN disk at 91%", "", "", "warn", "WARN disk at 91%", "10:00:01"},
-		{"broken JSON", `{"log": "unterminated`, "", "", "", `{"log": "unterminated`, "10:00:01"},
-		{"lower-case words are not levels", "no error here", "", "", "", "no error here", "10:00:01"},
+		{"broken JSON", `{"log": "unterminated`, "", "", "info", `{"log": "unterminated`, "10:00:01"},
+		{"lower-case words are not levels", "no error here", "", "", "info", "no error here", "10:00:01"},
+		{"lower-case tags are not levels", "[warning] slow upstream", "", "", "info", "[warning] slow upstream", "10:00:01"},
+		{"klog warning", "W1015 10:00:01.000000       1 reflector.go:1] watch closed", "", "", "warn", "W1015 10:00:01.000000       1 reflector.go:1] watch closed", "10:00:01"},
+		{"upper-case PANIC", "PANIC: nil map", "", "", "error", "PANIC: nil map", "10:00:01"},
+		{"upper-case DEBUG is not detected", "DEBUG cache miss", "", "", "info", "DEBUG cache miss", "10:00:01"},
 	}
 	for _, tc := range cases {
 		ln := ParseContainerLog(tc.msg, ts)
