@@ -358,9 +358,9 @@ func (q Query) Matches(in *Incident) bool {
 // CursorOf is the keyset cursor after in.
 func CursorOf(in *Incident) *Cursor { return &Cursor{Start: in.Start, ID: in.ID} }
 
-// Overlaps reports whether in's [Start, End] (End now while open) overlaps
+// overlaps reports whether in's [Start, End] (End now while open) overlaps
 // [from, to].
-func (in *Incident) overlaps(from, to, now time.Time) bool {
+func overlaps(in *Incident, from, to, now time.Time) bool {
 	end := now
 	if in.End != nil {
 		end = *in.End

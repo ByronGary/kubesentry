@@ -572,6 +572,32 @@ func TestLateTrigger(t *testing.T) {
 	}
 }
 
+// A trigger reported again after its incident resolved, while the subject
+// has a newer open incident, joins the open one and leaves the resolved one
+// as it was.
+func TestRepeatedTriggerJoinsTheOpenIncident(t *testing.T) {
+	h := newHarness(t, Options{})
+	h.step(0, trig("alert-1", TypeAlert, Warning, 0))
+	h.step(5, ended(trig("alert-1", TypeAlert, Warning, 0), 5))
+	h.step(21)
+	h.step(30, trig("oom", TypeOOMKill, Critical, 30))
+	h.step(31, trig("alert-1", TypeAlert, Critical, 0)) // the episode again, active
+	ins := h.all()
+	if len(ins) != 2 {
+		t.Fatalf("%s", describe(ins))
+	}
+	newer, older := ins[0], ins[1]
+	if ss := h.signals(older.ID); len(ss) != 1 || ss[0].End == nil || ss[0].Severity != Warning {
+		t.Errorf("the resolved incident changed: %+v", ss)
+	}
+	if got := ids(h.signals(newer.ID)); !reflect.DeepEqual(got, []string{"alert-1", "oom"}) {
+		t.Errorf("open incident signals = %v", got)
+	}
+	if older.State != Resolved || newer.State != Open {
+		t.Errorf("%s", describe(ins))
+	}
+}
+
 func TestQueryMatches(t *testing.T) {
 	end := at(30)
 	in := Incident{ID: "b", Subject: api, State: Resolved, Severity: Warning, PeakSeverity: Critical, Start: at(0), End: &end,

@@ -39,7 +39,11 @@ func NewCloudTrailPoll(src CloudTrailSource, o Options, red *Redactor, checkpoin
 
 // Poll returns the signals of new changes, the source's new checkpoint,
 // and how many events it read and kept.
+// Without a view nothing can be matched, so it reads nothing.
 func (p *CloudTrailPoll) Poll(ctx context.Context, v *snapshot.View, now time.Time) (sigs []Signal, cp []byte, read, kept int, err error) {
+	if v == nil {
+		return nil, nil, 0, 0, nil
+	}
 	evs, cp, err := p.src.Changes(ctx, p.since, p.cp)
 	if err != nil {
 		return nil, nil, 0, 0, fmt.Errorf("incidents: cloudtrail %s: %w", p.src.Name(), err)
@@ -47,10 +51,7 @@ func (p *CloudTrailPoll) Poll(ctx context.Context, v *snapshot.View, now time.Ti
 	if len(cp) > 0 {
 		p.cp = slices.Clone(cp)
 	}
-	var idx *RelatedIndex
-	if v != nil {
-		idx = RelatedIndexOf(v, p.o.Cluster)
-	}
+	idx := RelatedIndexOf(v, p.o.Cluster)
 	for i := range evs {
 		e := &evs[i]
 		read++
@@ -61,9 +62,6 @@ func (p *CloudTrailPoll) Poll(ctx context.Context, v *snapshot.View, now time.Ti
 			continue
 		}
 		p.seen[e.ID] = e.Time
-		if idx == nil {
-			continue
-		}
 		out := CloudTrailSignals(idx, e, p.red)
 		if len(out) > 0 {
 			kept++

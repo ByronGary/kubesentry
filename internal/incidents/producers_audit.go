@@ -81,7 +81,11 @@ func NewAuditPoll(store audit.Store, o Options, checkpoint []byte, now time.Time
 }
 
 // Poll returns the signals of new writes and the checkpoint to commit.
+// Without a view nothing can be placed, so it reads nothing.
 func (p *AuditPoll) Poll(ctx context.Context, v *snapshot.View, now time.Time) ([]Signal, []byte, error) {
+	if v == nil {
+		return nil, nil, nil
+	}
 	from := p.since.Add(-auditOverlap)
 	q := audit.Query{Since: from, Actors: map[string]bool{"user": true}, Limit: auditPage}
 	var evs []audit.Event
@@ -108,9 +112,6 @@ func (p *AuditPoll) Poll(ctx context.Context, v *snapshot.View, now time.Time) (
 			continue
 		}
 		p.seen[e.AuditID] = e.Time
-		if v == nil {
-			continue
-		}
 		out = append(out, AuditSignals(v, e)...)
 	}
 	if floor := now.Add(-auditMaxLag); newest.Before(floor) {

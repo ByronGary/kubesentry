@@ -364,6 +364,15 @@ func (r *Runner) lead(ctx context.Context, l Lease) {
 	r.setLeading(true)
 	defer r.setLeading(false)
 	r.log.Info("incidents: this replica runs the engine", "open", len(eng.Open()))
+	// The producers map what they see through the view: until there is one,
+	// a poller would move its checkpoint past changes it could not place.
+	for r.c.View() == nil {
+		select {
+		case <-lctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 
 	in := make(chan batch, 64)
 	var wg sync.WaitGroup
@@ -400,6 +409,15 @@ func (r *Runner) lead(ctx context.Context, l Lease) {
 	for {
 		select {
 		case <-lctx.Done():
+			// Shutting down while still holding the lease: commit what is
+			// pending (after a lost lease this fails, as it must).
+			if eng.Dirty() && ctx.Err() != nil {
+				fctx, fcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				if err := eng.Flush(fctx); err != nil {
+					r.log.Warn("incidents: the last commit failed", "err", err)
+				}
+				fcancel()
+			}
 			return
 		case <-r.c.Kick:
 			onView()

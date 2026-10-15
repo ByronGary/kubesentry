@@ -326,6 +326,11 @@ func (e *Engine) mergeHomes(s Signal, now time.Time) bool {
 		if t == nil {
 			continue
 		}
+		if s.Role == Trigger && t.in.State == Resolved {
+			if id, ok := e.open[t.in.Subject]; ok && id != t.in.ID {
+				continue // the subject has a newer open incident: the trigger joins that one
+			}
+		}
 		merged = true
 		if t.in.Capped && IsCondition(s.Type) {
 			continue // a capped incident keeps its conditions as they were at the cap

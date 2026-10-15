@@ -168,7 +168,7 @@ func Related(in Incident, candidates []Incident, custom string, now time.Time) [
 	}
 	var out []Incident
 	for _, c := range candidates {
-		if c.ID == in.ID || !c.overlaps(from, to, now) {
+		if c.ID == in.ID || !overlaps(&c, from, to, now) {
 			continue
 		}
 		if shareTags(&in, &c, keys) || shareService(&in, &c) {
