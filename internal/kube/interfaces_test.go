@@ -23,4 +23,7 @@ var (
 	_ auth.Reviewer = (*Reviewer)(nil)
 
 	_ incidents.EventSource = (*EventWatcher)(nil)
+	_ incidents.LogSource   = (*PodLogs)(nil)
+	_ PodGetter             = (*Cache)(nil)
+	_ PodGetter             = (*Source)(nil)
 )
