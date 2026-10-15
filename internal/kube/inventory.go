@@ -684,6 +684,10 @@ func (s *Source) Inventory(ctx context.Context) (model.Inventory, error) {
 	read("nodes", err)
 	inv.Namespaces, err = s.ListNamespaces(ctx)
 	read("namespaces", err)
+	inv.ServiceAccounts, err = s.listServiceAccounts(ctx)
+	read("serviceaccounts", err)
+	inv.TargetGroupBindings, err = s.targetGroupBindings(ctx, inv.Unavailable)
+	read(targetGroupBindingResource, err)
 	for _, r := range []struct {
 		name string
 		list func(context.Context) ([]model.Role, error)

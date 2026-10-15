@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,8 +30,10 @@ import (
 const eksVersion = "v1.33.4-eks-a737599"
 
 // newFakes builds a fake clientset whose SelfSubjectAccessReviews allow
-// everything deny does not match, and a dynamic fake holding certs.
-func newFakes(objs, certs []runtime.Object, deny func(*authorizationv1.ResourceAttributes) bool) (*fake.Clientset, *dynfake.FakeDynamicClient) {
+// everything deny does not match, and a dynamic fake holding the custom
+// resources in crs (cert-manager, TargetGroupBindings), whose APIs discovery
+// then serves.
+func newFakes(objs, crs []runtime.Object, deny func(*authorizationv1.ResourceAttributes) bool) (*fake.Clientset, *dynfake.FakeDynamicClient) {
 	cs := fake.NewClientset(objs...)
 	cs.PrependReactor("create", "selfsubjectaccessreviews", func(a k8stesting.Action) (bool, runtime.Object, error) {
 		r := a.(k8stesting.CreateAction).GetObject().(*authorizationv1.SelfSubjectAccessReview).DeepCopy()
@@ -42,10 +45,14 @@ func newFakes(objs, certs []runtime.Object, deny func(*authorizationv1.ResourceA
 	})
 	disc := cs.Discovery().(*fakediscovery.FakeDiscovery)
 	disc.FakedServerVersion = &version.Info{GitVersion: eksVersion}
-	if certs != nil {
-		disc.Resources = []*metav1.APIResourceList{{GroupVersion: certManagerGroupVersion}}
+	served := map[string]bool{}
+	for _, o := range crs {
+		if gv := o.(*unstructured.Unstructured).GetAPIVersion(); !served[gv] {
+			served[gv] = true
+			disc.Resources = append(disc.Resources, &metav1.APIResourceList{GroupVersion: gv})
+		}
 	}
-	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), certListKinds, certs...)
+	dyn := dynfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), certListKinds, crs...)
 	return cs, dyn
 }
 
@@ -200,7 +207,7 @@ func fieldDiff(got, want model.Inventory) []string {
 }
 
 func TestCacheInventoryMatchesSource(t *testing.T) {
-	cs, dyn := newFakes(fixtureObjects(), certObjects(), nil)
+	cs, dyn := newFakes(fixtureObjects(), append(certObjects(), tgbObjects()...), nil)
 	fixed := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	add, apps := []string{"example.com/rack"}, []string{"team"}
 	src := NewSourceWithOptions(cs, dyn, SourceOptions{AWSAuth: true, NodeLabelKeysAdd: add, AppLabelKeys: apps, ClusterName: "prod", Now: func() time.Time { return fixed }})
@@ -239,6 +246,17 @@ func TestCacheInventoryMatchesSource(t *testing.T) {
 	}
 	if w := got.Workloads[0]; w.Revision != "7" || w.Labels["team"] != "payments" || w.Labels["app.kubernetes.io/part-of"] != "shop" {
 		t.Errorf("deployment tags and revision: %q %v", w.Revision, w.Labels)
+	}
+	// Only the account with an IRSA role is kept.
+	if want := []model.ServiceAccount{{Namespace: "app", Name: "web", RoleARN: "arn:aws:iam::123456789012:role/web"}}; !reflect.DeepEqual(got.ServiceAccounts, want) {
+		t.Errorf("service accounts: %+v", got.ServiceAccounts)
+	}
+	wantTGB := []model.TargetGroupBinding{
+		{Namespace: "app", Name: "api", TargetGroupARN: "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-api-3c4d/fedcba9876543210", ServiceName: "api", ServicePort: "http"},
+		{Namespace: "app", Name: "web", TargetGroupARN: "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-web-1a2b/0123456789abcdef", ServiceName: "web", ServicePort: "80"},
+	}
+	if !reflect.DeepEqual(got.TargetGroupBindings, wantTGB) {
+		t.Errorf("target group bindings: %+v", got.TargetGroupBindings)
 	}
 
 	// The older per-resource interfaces agree as well.
@@ -320,7 +338,8 @@ func TestCacheInventoryMatchesSource(t *testing.T) {
 
 func TestForbiddenResourceIsUnavailable(t *testing.T) {
 	deny := func(a *authorizationv1.ResourceAttributes) bool {
-		return a.Resource == "nodes" || (a.Resource == "clusterrolebindings" && a.Verb == "watch") || a.Resource == "configmaps"
+		return a.Resource == "nodes" || (a.Resource == "clusterrolebindings" && a.Verb == "watch") || a.Resource == "configmaps" ||
+			a.Resource == "serviceaccounts"
 	}
 	cs, _ := newFakes(fixtureObjects(), nil, deny)
 	// The probe allows persistentvolumes, but the LIST itself is forbidden: the
@@ -337,7 +356,7 @@ func TestForbiddenResourceIsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"nodes", "clusterrolebindings", "persistentvolumes", awsAuthName} {
+	for _, name := range []string{"nodes", "clusterrolebindings", "persistentvolumes", awsAuthName, "serviceaccounts"} {
 		if r := inv.Unavailable[name]; !strings.Contains(r, "forbidden") {
 			t.Errorf("Unavailable[%s] = %q", name, r)
 		}
@@ -345,10 +364,10 @@ func TestForbiddenResourceIsUnavailable(t *testing.T) {
 	if !strings.Contains(inv.Unavailable["clusterrolebindings"], "cannot watch") {
 		t.Errorf("reason should name the verb: %q", inv.Unavailable["clusterrolebindings"])
 	}
-	if len(inv.Unavailable) != 4 {
+	if len(inv.Unavailable) != 5 {
 		t.Errorf("unavailable: %v", inv.Unavailable)
 	}
-	if inv.Nodes != nil || inv.PVs != nil || inv.AWSAuth != nil || len(inv.RBAC.Bindings) != 1 || len(inv.Pods) != 3 {
+	if inv.Nodes != nil || inv.PVs != nil || inv.AWSAuth != nil || inv.ServiceAccounts != nil || len(inv.RBAC.Bindings) != 1 || len(inv.Pods) != 3 {
 		t.Errorf("inventory: nodes %v, pvs %v, aws-auth %v, bindings %v, pods %d", inv.Nodes, inv.PVs, inv.AWSAuth, inv.RBAC.Bindings, len(inv.Pods))
 	}
 	// Without nodes the cluster is identified by its version only.
@@ -378,14 +397,20 @@ func TestForbiddenResourceIsUnavailable(t *testing.T) {
 	}
 }
 
-// switchDiscovery serves cert-manager.io/v1 only while served is set.
+// switchDiscovery serves one API group version (cert-manager.io/v1 unless gv
+// names another) only while served is set.
 type switchDiscovery struct {
 	*fakediscovery.FakeDiscovery
+	gv     string
 	served atomic.Bool
 }
 
 func (d *switchDiscovery) ServerResourcesForGroupVersion(gv string) (*metav1.APIResourceList, error) {
-	if gv == certManagerGroupVersion && d.served.Load() {
+	want := d.gv
+	if want == "" {
+		want = certManagerGroupVersion
+	}
+	if gv == want && d.served.Load() {
 		return &metav1.APIResourceList{GroupVersion: gv}, nil
 	}
 	return nil, apierrors.NewNotFound(schema.GroupResource{Group: "discovery"}, gv)
@@ -425,5 +450,89 @@ func TestCertManagerAppearsLater(t *testing.T) {
 	})
 	if n := c.m.certificates.size(); n != 0 {
 		t.Errorf("certificate memo keeps %d entries after removal", n)
+	}
+}
+
+// TargetGroupBindings are rediscovered like cert-manager: absent is no error
+// and no unavailable resource, and the informer starts once the CRD appears.
+func TestTargetGroupBindingsAppearLater(t *testing.T) {
+	cs, dyn := newFakes(nil, tgbObjects(), nil)
+	disc := &switchDiscovery{FakeDiscovery: cs.Discovery().(*fakediscovery.FakeDiscovery), gv: "elbv2.k8s.aws/v1beta1"}
+	c := NewCache(&Clients{CS: cs, Dyn: dyn, Disc: disc}, CacheOptions{CertManagerRecheck: 20 * time.Millisecond})
+	startCache(t, c)
+	ctx := context.Background()
+
+	inv, err := c.Inventory(ctx)
+	if err != nil || inv.TargetGroupBindings != nil || len(inv.Unavailable) != 0 || inv.Certs.Installed {
+		t.Fatalf("before install: %+v, unavailable %v, %v", inv.TargetGroupBindings, inv.Unavailable, err)
+	}
+	drain(c.Changes())
+
+	disc.served.Store(true)
+	waitSignal(t, c.Changes(), "TargetGroupBinding CRD install")
+	eventually(t, "TargetGroupBinding informer", func() bool {
+		inv, err := c.Inventory(ctx)
+		return err == nil && len(inv.TargetGroupBindings) == 2 && len(inv.Unavailable) == 0
+	})
+	inv, _ = c.Inventory(ctx)
+	if b := inv.TargetGroupBindings[1]; b.Name != "web" || b.ServiceName != "web" || b.ServicePort != "80" || !strings.HasSuffix(b.TargetGroupARN, "/0123456789abcdef") {
+		t.Errorf("binding: %+v", b)
+	}
+	// The cached object went through the transform.
+	obj, _, _ := c.crd(targetGroupBindingAPI).res[targetGroupBindingResource].inf.GetStore().GetByKey("app/web")
+	if u := obj.(*unstructured.Unstructured); u.Object["status"] != nil || u.GetAnnotations() != nil || u.GetManagedFields() != nil {
+		t.Errorf("informer kept %v", u.Object)
+	}
+
+	// New bindings flow through the watch.
+	drain(c.Changes())
+	extra := tgbObjects()[0].(*unstructured.Unstructured).DeepCopy()
+	extra.SetName("admin")
+	extra.SetUID("tgb-admin")
+	if _, err := dyn.Resource(targetGroupBindingAPI.gvr(targetGroupBindingResource)).Namespace("app").Create(ctx, extra, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitSignal(t, c.Changes(), "TargetGroupBinding create")
+	eventually(t, "third binding", func() bool { inv, _ := c.Inventory(ctx); return len(inv.TargetGroupBindings) == 3 })
+
+	disc.served.Store(false)
+	eventually(t, "CRD removal", func() bool {
+		inv, err := c.Inventory(ctx)
+		return err == nil && inv.TargetGroupBindings == nil
+	})
+	if n := c.m.targetgroupbindings.size(); n != 0 {
+		t.Errorf("binding memo keeps %d entries after removal", n)
+	}
+	if counts := c.ObjectCounts(); counts[targetGroupBindingResource] != 0 {
+		t.Errorf("object counts after removal: %v", counts)
+	}
+}
+
+// A served TargetGroupBinding API that kubesentry may not list is reported
+// unavailable by both the Cache (permission probe) and the Source.
+func TestTargetGroupBindingsForbidden(t *testing.T) {
+	deny := func(a *authorizationv1.ResourceAttributes) bool { return a.Resource == targetGroupBindingResource }
+	cs, dyn := newFakes(nil, tgbObjects(), deny)
+	c := NewCache(&Clients{CS: cs, Dyn: dyn, Disc: cs.Discovery()}, CacheOptions{})
+	startCache(t, c)
+	ctx := context.Background()
+	inv, err := c.Inventory(ctx)
+	if err != nil || inv.TargetGroupBindings != nil || !strings.Contains(inv.Unavailable[targetGroupBindingResource], "forbidden") {
+		t.Fatalf("cache: %+v, unavailable %v, %v", inv.TargetGroupBindings, inv.Unavailable, err)
+	}
+
+	forbidden := apierrors.NewForbidden(schema.GroupResource{Group: "elbv2.k8s.aws", Resource: targetGroupBindingResource}, "", errors.New("RBAC: access denied"))
+	dyn.PrependReactor("list", targetGroupBindingResource, func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, forbidden
+	})
+	srcInv, err := NewSource(cs, dyn).Inventory(ctx)
+	if err != nil || srcInv.TargetGroupBindings != nil || !strings.Contains(srcInv.Unavailable[targetGroupBindingResource], "forbidden") {
+		t.Errorf("source: %+v, unavailable %v, %v", srcInv.TargetGroupBindings, srcInv.Unavailable, err)
+	}
+	// Without the API there is nothing to report.
+	cs2, dyn2 := newFakes(nil, nil, nil)
+	srcInv, err = NewSource(cs2, dyn2).Inventory(ctx)
+	if err != nil || srcInv.TargetGroupBindings != nil || len(srcInv.Unavailable) != 0 {
+		t.Errorf("source without the API: %+v, unavailable %v, %v", srcInv.TargetGroupBindings, srcInv.Unavailable, err)
 	}
 }

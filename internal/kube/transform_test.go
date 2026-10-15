@@ -66,8 +66,12 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	case *corev1.ConfigMap:
 		a, _ := ParseAWSAuth(o.Data)
 		return a
+	case *corev1.ServiceAccount:
+		return convertServiceAccount(o)
 	case *unstructured.Unstructured:
 		switch o.GetKind() {
+		case "TargetGroupBinding":
+			return convertTargetGroupBinding(o)
 		case "Certificate":
 			return convertCertificate(o)
 		case "Issuer", "ClusterIssuer":
@@ -80,7 +84,9 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	return nil
 }
 
-func allFixtures() []runtime.Object { return append(fixtureObjects(), certObjects()...) }
+func allFixtures() []runtime.Object {
+	return append(append(fixtureObjects(), certObjects()...), tgbObjects()...)
+}
 
 func transformed(obj runtime.Object, f filters) runtime.Object {
 	c := obj.DeepCopyObject()
@@ -228,6 +234,32 @@ func TestTransformStrips(t *testing.T) {
 			if o.Spec.NodeAffinity != nil || (o.Spec.CSI != nil && o.Spec.CSI.VolumeAttributes != nil) {
 				t.Errorf("pv: %+v", o.Spec)
 			}
+		}
+	}
+	for _, obj := range fixtureObjects() {
+		sa, ok := transformed(obj, labels).(*corev1.ServiceAccount)
+		if !ok {
+			continue
+		}
+		if sa.Labels != nil || sa.Secrets != nil || sa.ImagePullSecrets != nil || sa.AutomountServiceAccountToken != nil || sa.ManagedFields != nil {
+			t.Errorf("serviceaccount %s not stripped: %+v", sa.Name, sa)
+		}
+		if a := sa.Annotations; len(a) > 1 || (sa.Name == "web" && a[irsaRoleAnnotation] == "") {
+			t.Errorf("serviceaccount %s annotations: %v", sa.Name, a)
+		}
+	}
+	for _, obj := range tgbObjects() {
+		u := transformed(obj, labels).(*unstructured.Unstructured)
+		want := map[string]any{
+			"apiVersion": "elbv2.k8s.aws/v1beta1", "kind": "TargetGroupBinding",
+			"metadata": map[string]any{"namespace": u.GetNamespace(), "name": u.GetName(), "uid": string(u.GetUID()), "resourceVersion": "1"},
+			"spec": map[string]any{
+				"targetGroupARN": str(u, "spec", "targetGroupARN"),
+				"serviceRef":     obj.(*unstructured.Unstructured).Object["spec"].(map[string]any)["serviceRef"],
+			},
+		}
+		if !reflect.DeepEqual(u.Object, want) {
+			t.Errorf("targetgroupbinding %s:\n got %v\nwant %v", u.GetName(), u.Object, want)
 		}
 	}
 	for _, obj := range certObjects() {

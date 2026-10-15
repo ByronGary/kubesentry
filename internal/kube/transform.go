@@ -237,8 +237,8 @@ func filterKeys(m map[string]string, allow map[string]bool) map[string]string {
 }
 
 // newTransform returns the informer transform for every resource the Cache
-// watches (typed, aws-auth and cert-manager). Unknown types pass through
-// untouched.
+// watches (typed, aws-auth, cert-manager and TargetGroupBindings). Unknown
+// types pass through untouched.
 func newTransform(f filters) cache.TransformFunc {
 	return func(obj any) (any, error) {
 		transformObject(obj, f)
@@ -314,10 +314,16 @@ func transformObject(obj any, f filters) {
 		stripMeta(&o.ObjectMeta, nil)
 	case *rbacv1.ClusterRoleBinding:
 		stripMeta(&o.ObjectMeta, nil)
+	case *corev1.ServiceAccount:
+		transformServiceAccount(o)
 	case *corev1.ConfigMap:
 		transformConfigMap(o)
 	case *unstructured.Unstructured:
-		transformCertManager(o)
+		if isTargetGroupBinding(o) {
+			transformTargetGroupBinding(o)
+		} else {
+			transformCertManager(o)
+		}
 	}
 }
 

@@ -409,7 +409,16 @@ func fixtureObjects() []runtime.Object {
 	}}
 	otherCM := &corev1.ConfigMap{ObjectMeta: meta(awsAuthNamespace, "coredns", "cm-coredns"), Data: map[string]string{"Corefile": ".:53 {}"}}
 
-	return append(objs, nsApp, nsSys, data, scratch, pvCSI, pvInTree, pvHost, gp3, efs, svc, headless, slice, ing,
+	// Service accounts: only the one with an IRSA role is kept.
+	saWeb := &corev1.ServiceAccount{ObjectMeta: meta("app", "web", "sa-web"),
+		Secrets:          []corev1.ObjectReference{{Name: "web-token-abcde"}},
+		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}}, AutomountServiceAccountToken: ptr(false)}
+	saWeb.Annotations[irsaRoleAnnotation] = "arn:aws:iam::123456789012:role/web"
+	saDefault := &corev1.ServiceAccount{ObjectMeta: meta("app", "default", "sa-default")}
+	saBlank := &corev1.ServiceAccount{ObjectMeta: meta("app", "blank", "sa-blank")}
+	saBlank.Annotations[irsaRoleAnnotation] = " "
+
+	return append(objs, saWeb, saDefault, saBlank, nsApp, nsSys, data, scratch, pvCSI, pvInTree, pvHost, gp3, efs, svc, headless, slice, ing,
 		dep, rs, orphanRS, sts, ds, job, cj, role, crole, empty, rb, crb, awsAuth, otherCM)
 }
 
@@ -465,10 +474,44 @@ func certObjects() []runtime.Object {
 	return []runtime.Object{cert, issuer, clusterIssuer, request}
 }
 
-// certListKinds registers the cert-manager list kinds with the dynamic fake.
+// tgbObjects are AWS Load Balancer Controller TargetGroupBindings: one by
+// port number, one by port name, with the fields kubesentry does not read.
+func tgbObjects() []runtime.Object {
+	tgb := func(ns, name, uid, arn string, port any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "elbv2.k8s.aws/v1beta1", "kind": "TargetGroupBinding",
+			"metadata": map[string]any{
+				"namespace": ns, "name": name, "uid": uid, "resourceVersion": "1", "generation": int64(2),
+				"creationTimestamp": t0.UTC().Format(time.RFC3339),
+				"labels":            map[string]any{"ingress.k8s.aws/stack": "shop"},
+				"annotations":       map[string]any{"kubectl.kubernetes.io/last-applied-configuration": "{}"},
+				"finalizers":        []any{"elbv2.k8s.aws/resources"},
+				"managedFields":     []any{map[string]any{"manager": "controller", "operation": "Update"}},
+			},
+			"spec": map[string]any{
+				"targetGroupARN": arn, "targetType": "ip", "ipAddressType": "ipv4",
+				"serviceRef": map[string]any{"name": name, "port": port},
+				"networking": map[string]any{"ingress": []any{map[string]any{
+					"from":  []any{map[string]any{"securityGroup": map[string]any{"groupID": "sg-0ccc"}}},
+					"ports": []any{map[string]any{"protocol": "TCP", "port": int64(8080)}},
+				}}},
+				"nodeSelector": map[string]any{"matchLabels": map[string]any{"pool": "web"}},
+			},
+			"status": map[string]any{"observedGeneration": int64(2)},
+		}}
+	}
+	return []runtime.Object{
+		tgb("app", "web", "tgb-web", "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-web-1a2b/0123456789abcdef", int64(80)),
+		tgb("app", "api", "tgb-api", "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-api-3c4d/fedcba9876543210", "http"),
+	}
+}
+
+// certListKinds registers the cert-manager and TargetGroupBinding list
+// kinds with the dynamic fake.
 var certListKinds = map[schema.GroupVersionResource]string{
-	certGVR("certificates"):        "CertificateList",
-	certGVR("issuers"):             "IssuerList",
-	certGVR("clusterissuers"):      "ClusterIssuerList",
-	certGVR("certificaterequests"): "CertificateRequestList",
+	certGVR("certificates"):                               "CertificateList",
+	certGVR("issuers"):                                    "IssuerList",
+	certGVR("clusterissuers"):                             "ClusterIssuerList",
+	certGVR("certificaterequests"):                        "CertificateRequestList",
+	targetGroupBindingAPI.gvr(targetGroupBindingResource): "TargetGroupBindingList",
 }
