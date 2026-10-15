@@ -300,6 +300,7 @@ func fixtureObjects() []runtime.Object {
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-scheme"] = "internal"
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "external"
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"] = "ip"
+	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-security-groups"] = "sg-0aaa,sg-0bbb"
 	headless := &corev1.Service{ObjectMeta: meta("app", "web-headless", "svc-headless"), Spec: corev1.ServiceSpec{
 		Type: corev1.ServiceTypeClusterIP, ClusterIP: corev1.ClusterIPNone, Selector: map[string]string{"app": "web"},
 	}}
@@ -337,6 +338,10 @@ func fixtureObjects() []runtime.Object {
 	ing.Annotations["alb.ingress.kubernetes.io/certificate-arn"] = "arn:aws:acm:us-east-1:123:certificate/abc"
 	ing.Annotations["alb.ingress.kubernetes.io/listen-ports"] = `[{"HTTPS":443}]`
 	ing.Annotations["kubernetes.io/ingress.class"] = "alb"
+	ing.Annotations["alb.ingress.kubernetes.io/group.name"] = "shop"
+	ing.Annotations["alb.ingress.kubernetes.io/load-balancer-name"] = "shop-alb"
+	ing.Annotations["alb.ingress.kubernetes.io/security-groups"] = "sg-0ccc"
+	ing.Annotations["alb.ingress.kubernetes.io/healthcheck-path"] = "/healthz"
 
 	dep := &appsv1.Deployment{ObjectMeta: meta("app", "web", "dep-web"), Spec: appsv1.DeploymentSpec{
 		Replicas: ptr(int32(3)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"},
@@ -345,20 +350,26 @@ func fixtureObjects() []runtime.Object {
 	}, Status: appsv1.DeploymentStatus{ReadyReplicas: 2, UpdatedReplicas: 3, AvailableReplicas: 2, Replicas: 3,
 		Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "NewReplicaSetAvailable", Message: longMsg, LastTransitionTime: t1, LastUpdateTime: t1}}}}
 	dep.Annotations["deployment.kubernetes.io/revision"] = "7"
+	dep.Labels["app.kubernetes.io/name"] = "web"
+	dep.Labels["app.kubernetes.io/part-of"] = "shop"
 	rs := &appsv1.ReplicaSet{ObjectMeta: meta("app", "web-5d8f", "rs-web"), Spec: appsv1.ReplicaSetSpec{
 		Replicas: ptr(int32(3)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web", "pod-template-hash": "5d8f"}}, Template: fixtureTemplate(),
 	}, Status: appsv1.ReplicaSetStatus{Replicas: 3, ReadyReplicas: 2,
 		Conditions: []appsv1.ReplicaSetCondition{{Type: appsv1.ReplicaSetReplicaFailure, Status: corev1.ConditionTrue, Message: longMsg}}}}
 	rs.OwnerReferences = []metav1.OwnerReference{owner("Deployment", "web", "dep-web", true)}
+	rs.Annotations["deployment.kubernetes.io/revision"] = "7"
+	rs.Annotations["deployment.kubernetes.io/desired-replicas"] = "3"
 	orphanRS := &appsv1.ReplicaSet{ObjectMeta: meta("app", "orphan-1", "rs-orphan"), Spec: appsv1.ReplicaSetSpec{Template: fixtureTemplate()}}
 	sts := &appsv1.StatefulSet{ObjectMeta: meta("app", "crash", "sts-crash"), Spec: appsv1.StatefulSetSpec{
 		Replicas: ptr(int32(1)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "crash"}}, Template: fixtureTemplate(),
 		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}},
-	}, Status: appsv1.StatefulSetStatus{ReadyReplicas: 0, UpdatedReplicas: 1,
+	}, Status: appsv1.StatefulSetStatus{ReadyReplicas: 0, UpdatedReplicas: 1, CurrentRevision: "crash-5c3e", UpdateRevision: "crash-6d4f",
 		Conditions: []appsv1.StatefulSetCondition{{Type: "Odd", Status: corev1.ConditionFalse, Message: longMsg}}}}
 	ds := &appsv1.DaemonSet{ObjectMeta: meta("kube-system", "agent", "ds-agent"), Spec: appsv1.DaemonSetSpec{
 		Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "agent"}}, Template: fixtureTemplate(),
 	}, Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, NumberReady: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3}}
+	ds.Annotations[appsv1.DeprecatedTemplateGeneration] = "4"
+	ds.Labels["k8s-app"] = "agent"
 	job := &batchv1.Job{ObjectMeta: meta("app", "backup-29000", "job-backup"), Spec: batchv1.JobSpec{
 		Completions: ptr(int32(2)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"batch.kubernetes.io/controller-uid": "job-backup"}},
 		Template: fixtureTemplate(),

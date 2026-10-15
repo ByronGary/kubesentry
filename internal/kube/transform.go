@@ -46,6 +46,12 @@ const (
 	// PrometheusAnnotation set to "true" on a Service marks the Prometheus to discover.
 	PrometheusAnnotation      = "kubesentry.io/prometheus"
 	certificateNameAnnotation = "cert-manager.io/certificate-name"
+	// revisionAnnotation numbers a Deployment's rollouts; each ReplicaSet
+	// carries the revision it was created for.
+	revisionAnnotation = "deployment.kubernetes.io/revision"
+	// daemonSetGenerationAnnotation counts a DaemonSet's pod template
+	// changes (the API server keeps spec.templateGeneration here in apps/v1).
+	daemonSetGenerationAnnotation = appsv1.DeprecatedTemplateGeneration
 	// namespaceAnnotationPrefix: every kubesentry.io/* annotation on a
 	// namespace is kept: the owner (kubesentry.io/owner) and the routing hints
 	// alerting reads (kubesentry.io/slack-channel, ...).
@@ -77,6 +83,8 @@ var (
 		"service.beta.kubernetes.io/aws-load-balancer-internal",
 		"service.beta.kubernetes.io/aws-load-balancer-type",
 		"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type",
+		// Security groups tie CloudTrail changes to the Service's NLB.
+		"service.beta.kubernetes.io/aws-load-balancer-security-groups",
 		PrometheusAnnotation,
 	)
 	ingressAnnotations = keySet(
@@ -85,7 +93,14 @@ var (
 		"alb.ingress.kubernetes.io/listen-ports",
 		"alb.ingress.kubernetes.io/ssl-redirect",
 		"kubernetes.io/ingress.class",
+		// The ALB's name and security groups tie CloudTrail changes to the
+		// Ingress (incidents' related-resource index).
+		"alb.ingress.kubernetes.io/group.name",
+		"alb.ingress.kubernetes.io/load-balancer-name",
+		"alb.ingress.kubernetes.io/security-groups",
 	)
+	revisionAnnotations     = keySet(revisionAnnotation)
+	daemonSetAnnotations    = keySet(daemonSetGenerationAnnotation)
 	storageClassAnnotations = keySet(defaultClassAnnotation, betaDefaultClassAnnotation, PriceAnnotation)
 	certAnnotations         = keySet(certificateNameAnnotation)
 	endpointSliceLabels     = keySet(serviceNameLabel, managedByLabel)
@@ -108,6 +123,17 @@ var DefaultNodeLabelKeys = []string{
 	"karpenter.k8s.aws/instance-family",
 }
 
+// DefaultAppLabelKeys are the workload labels kept: the app and service tags
+// incidents correlate on.
+var DefaultAppLabelKeys = []string{
+	"app.kubernetes.io/name",
+	"app.kubernetes.io/instance",
+	"app.kubernetes.io/part-of",
+	"app.kubernetes.io/component",
+	"app",
+	"k8s-app",
+}
+
 // labelFilter keeps an allowlist of label keys. A key ending in "*" matches
 // by prefix.
 type labelFilter struct {
@@ -115,11 +141,9 @@ type labelFilter struct {
 	prefixes []string
 }
 
-// newNodeLabelFilter keeps DefaultNodeLabelKeys, node-role.kubernetes.io/*
-// and the extra keys (from -node-label-keys-add).
-func newNodeLabelFilter(add []string) labelFilter {
-	f := labelFilter{exact: keySet(DefaultNodeLabelKeys...), prefixes: []string{nodeRolePrefix}}
-	for _, k := range add {
+// add allows more keys; "prefix*" matches by prefix, blanks are ignored.
+func (f *labelFilter) add(keys []string) {
+	for _, k := range keys {
 		k = strings.TrimSpace(k)
 		switch {
 		case k == "":
@@ -129,6 +153,13 @@ func newNodeLabelFilter(add []string) labelFilter {
 			f.exact[k] = true
 		}
 	}
+}
+
+// newNodeLabelFilter keeps DefaultNodeLabelKeys, node-role.kubernetes.io/*
+// and the extra keys (from -node-label-keys-add).
+func newNodeLabelFilter(add []string) labelFilter {
+	f := labelFilter{exact: keySet(DefaultNodeLabelKeys...), prefixes: []string{nodeRolePrefix}}
+	f.add(add)
 	return f
 }
 
@@ -137,28 +168,32 @@ func newNodeLabelFilter(add []string) labelFilter {
 // kubesentry.io/; "prefix*" matches by prefix).
 func newNamespaceAnnotationFilter(add []string) labelFilter {
 	f := labelFilter{exact: map[string]bool{}, prefixes: []string{namespaceAnnotationPrefix}}
-	for _, k := range add {
-		k = strings.TrimSpace(k)
-		switch {
-		case k == "":
-		case strings.HasSuffix(k, "*"):
-			f.prefixes = append(f.prefixes, strings.TrimSuffix(k, "*"))
-		default:
-			f.exact[k] = true
-		}
-	}
+	f.add(add)
+	return f
+}
+
+// newAppLabelFilter keeps DefaultAppLabelKeys and the extra keys (the custom
+// tag from -incident-app-label; "prefix*" matches by prefix).
+func newAppLabelFilter(add []string) labelFilter {
+	f := labelFilter{exact: keySet(DefaultAppLabelKeys...)}
+	f.add(add)
 	return f
 }
 
 // filters are the configurable allowlists the transform and the conversions
-// apply: node labels and namespace annotations.
+// apply: node labels, namespace annotations and workload (app tag) labels.
 type filters struct {
 	nodeLabels    labelFilter
 	nsAnnotations labelFilter
+	appLabels     labelFilter
 }
 
-func newFilters(nodeLabelKeysAdd, namespaceAnnotationKeysAdd []string) filters {
-	return filters{nodeLabels: newNodeLabelFilter(nodeLabelKeysAdd), nsAnnotations: newNamespaceAnnotationFilter(namespaceAnnotationKeysAdd)}
+func newFilters(nodeLabelKeysAdd, namespaceAnnotationKeysAdd, appLabelKeys []string) filters {
+	return filters{
+		nodeLabels:    newNodeLabelFilter(nodeLabelKeysAdd),
+		nsAnnotations: newNamespaceAnnotationFilter(namespaceAnnotationKeysAdd),
+		appLabels:     newAppLabelFilter(appLabelKeys),
+	}
 }
 
 func (f labelFilter) keep(k string) bool {
@@ -239,30 +274,30 @@ func transformObject(obj any, f filters) {
 		stripMeta(&o.ObjectMeta, ingressAnnotations)
 		o.Status = networkingv1.IngressStatus{}
 	case *appsv1.Deployment:
-		stripMeta(&o.ObjectMeta, nil)
+		stripWorkloadMeta(&o.ObjectMeta, revisionAnnotations, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.DeploymentCondition) *string { return &c.Message })
 	case *appsv1.ReplicaSet:
-		stripMeta(&o.ObjectMeta, nil)
+		stripMeta(&o.ObjectMeta, revisionAnnotations)
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.ReplicaSetCondition) *string { return &c.Message })
 	case *appsv1.StatefulSet:
-		stripMeta(&o.ObjectMeta, nil)
+		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		o.Spec.VolumeClaimTemplates = nil
 		trimMessages(o.Status.Conditions, func(c *appsv1.StatefulSetCondition) *string { return &c.Message })
 	case *appsv1.DaemonSet:
-		stripMeta(&o.ObjectMeta, nil)
+		stripWorkloadMeta(&o.ObjectMeta, daemonSetAnnotations, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.DaemonSetCondition) *string { return &c.Message })
 	case *batchv1.Job:
-		stripMeta(&o.ObjectMeta, nil)
+		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		o.Spec.PodFailurePolicy, o.Spec.SuccessPolicy = nil, nil
 		o.Status.UncountedTerminatedPods = nil
 		trimMessages(o.Status.Conditions, func(c *batchv1.JobCondition) *string { return &c.Message })
 	case *batchv1.CronJob:
-		stripMeta(&o.ObjectMeta, nil)
+		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
 		o.Spec.JobTemplate.ObjectMeta = metav1.ObjectMeta{}
 		trimTemplate(&o.Spec.JobTemplate.Spec.Template)
 		o.Spec.JobTemplate.Spec.PodFailurePolicy, o.Spec.JobTemplate.Spec.SuccessPolicy = nil, nil
@@ -298,6 +333,13 @@ func stripMeta(m *metav1.ObjectMeta, allow map[string]bool) {
 		r := &m.OwnerReferences[i]
 		*r = metav1.OwnerReference{Kind: r.Kind, Name: r.Name, UID: r.UID, Controller: r.Controller}
 	}
+}
+
+// stripWorkloadMeta is stripMeta for workloads, which keep only the app tag
+// labels (Workload.Labels).
+func stripWorkloadMeta(m *metav1.ObjectMeta, allow map[string]bool, apps labelFilter) {
+	stripMeta(m, allow)
+	m.Labels = apps.filter(m.Labels)
 }
 
 // trimMessages truncates each condition's message in place.

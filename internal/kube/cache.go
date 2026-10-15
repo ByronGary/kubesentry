@@ -10,7 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +45,9 @@ type CacheOptions struct {
 	// NamespaceAnnotationKeysAdd are namespace annotations kept besides
 	// kubesentry.io/* (the owner annotation, when configured elsewhere).
 	NamespaceAnnotationKeysAdd []string
+	// AppLabelKeys are workload labels kept besides DefaultAppLabelKeys
+	// (the custom app tag, -incident-app-label; "prefix*" matches by prefix).
+	AppLabelKeys []string
 	// CertManagerRecheck is how often discovery is re-run for cert-manager
 	// (and the server version); default 5m.
 	CertManagerRecheck time.Duration
@@ -244,7 +249,7 @@ func NewCache(c *Clients, o CacheOptions) *Cache {
 	if disc == nil && c.CS != nil {
 		disc = c.CS.Discovery()
 	}
-	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd)
+	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd, o.AppLabelKeys)
 	return &Cache{
 		cs: c.CS, dyn: c.Dyn, disc: disc, opts: o,
 		filters:   f,
@@ -676,11 +681,12 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 func (c *Cache) workloads(unavailable map[string]string) []model.Workload {
 	m := &c.m
 	var out []model.Workload
-	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, convertDeployment, unavailable)...)
-	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, convertStatefulSet, unavailable)...)
-	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, convertDaemonSet, unavailable)...)
-	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, convertJob, unavailable)...)
-	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, convertCronJob, unavailable)...)
+	apps := c.filters.appLabels
+	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, func(o *batchv1.Job) model.Workload { return convertJob(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps) }, unavailable)...)
 	return out
 }
 

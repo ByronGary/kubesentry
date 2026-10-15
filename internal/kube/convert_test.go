@@ -88,11 +88,12 @@ func TestConvertPodStateFields(t *testing.T) {
 }
 
 func TestConvertWorkloadIdentity(t *testing.T) {
-	job := convertJob(fixture[*batchv1.Job](t, "backup-29000"))
+	apps := newAppLabelFilter(nil)
+	job := convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps)
 	if job.UID != "job-backup" || len(job.Owners) != 1 || job.Owners[0].Kind != "CronJob" || job.Owners[0].Name != "backup" || !job.Owners[0].Controller {
 		t.Errorf("job: %+v", job)
 	}
-	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"))
+	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps)
 	if dep.UID != "dep-web" || dep.Owners != nil || len(dep.Conditions[0].Message) > maxMessage {
 		t.Errorf("deployment: %+v", dep)
 	}
@@ -101,15 +102,59 @@ func TestConvertWorkloadIdentity(t *testing.T) {
 	}
 }
 
+// Workloads keep only the app tag labels, and a revision that changes on
+// every rollout.
+func TestConvertWorkloadTagsAndRevision(t *testing.T) {
+	apps := newAppLabelFilter(nil)
+	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps)
+	if want := map[string]string{"app": "web", "app.kubernetes.io/name": "web", "app.kubernetes.io/part-of": "shop"}; !reflect.DeepEqual(dep.Labels, want) {
+		t.Errorf("deployment labels: %v", dep.Labels)
+	}
+	if dep.Revision != "7" {
+		t.Errorf("deployment revision: %q", dep.Revision)
+	}
+	sts := convertStatefulSet(fixture[*appsv1.StatefulSet](t, "crash"), apps)
+	if sts.Revision != "crash-6d4f" || !reflect.DeepEqual(sts.Labels, map[string]string{"app": "crash"}) {
+		t.Errorf("statefulset: revision %q labels %v", sts.Revision, sts.Labels)
+	}
+	ds := convertDaemonSet(fixture[*appsv1.DaemonSet](t, "agent"), apps)
+	if ds.Revision != "4" || !reflect.DeepEqual(ds.Labels, map[string]string{"app": "agent", "k8s-app": "agent"}) {
+		t.Errorf("daemonset: revision %q labels %v", ds.Revision, ds.Labels)
+	}
+	for _, w := range []model.Workload{
+		convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps),
+		convertCronJob(fixture[*batchv1.CronJob](t, "backup"), apps),
+	} {
+		if w.Revision != "" {
+			t.Errorf("%s revision: %q", w.Kind, w.Revision)
+		}
+	}
+	// The custom tag key (-incident-app-label) is kept as well; "prefix*" matches by prefix.
+	custom := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{" team ", ""}))
+	if custom.Labels["team"] != "payments" || len(custom.Labels) != 4 {
+		t.Errorf("custom tag: %v", custom.Labels)
+	}
+	if p := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{"te*"})); p.Labels["team"] != "payments" {
+		t.Errorf("custom tag prefix: %v", p.Labels)
+	}
+	// No tag labels at all: nil, not an empty map.
+	bare := fixture[*appsv1.Deployment](t, "web").DeepCopy()
+	bare.Labels = map[string]string{"team": "payments"}
+	if l := convertDeployment(bare, apps).Labels; l != nil {
+		t.Errorf("untagged labels: %#v", l)
+	}
+}
+
 func TestConvertReplicaSet(t *testing.T) {
 	rs := convertReplicaSet(fixture[*appsv1.ReplicaSet](t, "web-5d8f"))
 	want := model.ReplicaSet{Namespace: "app", Name: "web-5d8f", UID: "rs-web", Desired: 3, Ready: 2, Created: t0.Time,
-		Owners: []model.OwnerRef{{Kind: "Deployment", Name: "web", UID: "dep-web", Controller: true}}}
+		Owners:   []model.OwnerRef{{Kind: "Deployment", Name: "web", UID: "dep-web", Controller: true}},
+		Revision: "7", Images: []string{"registry.example.com/web:1.2.3", "envoy:1.30", "registry.example.com/migrate:1.2.3"}}
 	if !reflect.DeepEqual(rs, want) {
 		t.Errorf("replicaset:\n got %+v\nwant %+v", rs, want)
 	}
 	orphan := convertReplicaSet(fixture[*appsv1.ReplicaSet](t, "orphan-1"))
-	if orphan.Owners != nil || orphan.Desired != 1 {
+	if orphan.Owners != nil || orphan.Desired != 1 || orphan.Revision != "" {
 		t.Errorf("orphan: %+v", orphan)
 	}
 }
@@ -136,6 +181,7 @@ func TestConvertServiceAndIngressAnnotations(t *testing.T) {
 		"service.beta.kubernetes.io/aws-load-balancer-scheme":          "internal",
 		"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
 		"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type": "ip",
+		"service.beta.kubernetes.io/aws-load-balancer-security-groups": "sg-0aaa,sg-0bbb",
 	}
 	if !reflect.DeepEqual(svc.Annotations, wantAnn) || svc.LoadBalancerClass != "service.k8s.aws/nlb" ||
 		!reflect.DeepEqual(svc.SourceRanges, []string{"10.0.0.0/8"}) || !svc.PublishNotReady ||
@@ -147,10 +193,13 @@ func TestConvertServiceAndIngressAnnotations(t *testing.T) {
 	}
 	ing := convertIngress(fixture[*networkingv1.Ingress](t, "web"))
 	wantIng := map[string]string{
-		"alb.ingress.kubernetes.io/scheme":          "internet-facing",
-		"alb.ingress.kubernetes.io/certificate-arn": "arn:aws:acm:us-east-1:123:certificate/abc",
-		"alb.ingress.kubernetes.io/listen-ports":    `[{"HTTPS":443}]`,
-		"kubernetes.io/ingress.class":               "alb",
+		"alb.ingress.kubernetes.io/scheme":             "internet-facing",
+		"alb.ingress.kubernetes.io/certificate-arn":    "arn:aws:acm:us-east-1:123:certificate/abc",
+		"alb.ingress.kubernetes.io/listen-ports":       `[{"HTTPS":443}]`,
+		"kubernetes.io/ingress.class":                  "alb",
+		"alb.ingress.kubernetes.io/group.name":         "shop",
+		"alb.ingress.kubernetes.io/load-balancer-name": "shop-alb",
+		"alb.ingress.kubernetes.io/security-groups":    "sg-0ccc",
 	}
 	if !reflect.DeepEqual(ing.Annotations, wantIng) || len(ing.Rules) != 2 || ing.Rules[1].Port != "8080" {
 		t.Errorf("ingress: %+v", ing)

@@ -202,9 +202,9 @@ func fieldDiff(got, want model.Inventory) []string {
 func TestCacheInventoryMatchesSource(t *testing.T) {
 	cs, dyn := newFakes(fixtureObjects(), certObjects(), nil)
 	fixed := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
-	add := []string{"example.com/rack"}
-	src := NewSourceWithOptions(cs, dyn, SourceOptions{AWSAuth: true, NodeLabelKeysAdd: add, ClusterName: "prod", Now: func() time.Time { return fixed }})
-	c := NewCache(&Clients{CS: cs, Dyn: dyn, Disc: cs.Discovery()}, CacheOptions{AWSAuth: true, NodeLabelKeysAdd: add, ClusterName: "prod", Now: func() time.Time { return fixed }})
+	add, apps := []string{"example.com/rack"}, []string{"team"}
+	src := NewSourceWithOptions(cs, dyn, SourceOptions{AWSAuth: true, NodeLabelKeysAdd: add, AppLabelKeys: apps, ClusterName: "prod", Now: func() time.Time { return fixed }})
+	c := NewCache(&Clients{CS: cs, Dyn: dyn, Disc: cs.Discovery()}, CacheOptions{AWSAuth: true, NodeLabelKeysAdd: add, AppLabelKeys: apps, ClusterName: "prod", Now: func() time.Time { return fixed }})
 	startCache(t, c)
 	ctx := context.Background()
 
@@ -236,6 +236,9 @@ func TestCacheInventoryMatchesSource(t *testing.T) {
 	}
 	if kinds := []string{got.Workloads[0].Kind, got.Workloads[4].Kind}; kinds[0] != "Deployment" || kinds[1] != "CronJob" {
 		t.Errorf("workload order: %v", kinds)
+	}
+	if w := got.Workloads[0]; w.Revision != "7" || w.Labels["team"] != "payments" || w.Labels["app.kubernetes.io/part-of"] != "shop" {
+		t.Errorf("deployment tags and revision: %q %v", w.Revision, w.Labels)
 	}
 
 	// The older per-resource interfaces agree as well.
