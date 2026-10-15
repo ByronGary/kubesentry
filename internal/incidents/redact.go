@@ -18,6 +18,9 @@ type Redactor struct {
 type rule struct {
 	re   *regexp.Regexp
 	repl string // regexp.Expand template
+	// hints: the rule can only match text holding one of these (lower
+	// case); none means always try it.
+	hints []string
 }
 
 // Redacted is what a secret is replaced with.
@@ -25,18 +28,20 @@ const Redacted = "[REDACTED]"
 
 var builtinRules = []rule{
 	// PEM private keys, whole blocks, then a block cut off before its end.
-	{regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), Redacted},
-	{regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*`), Redacted},
-	// Bearer tokens (an Authorization header's value).
-	{regexp.MustCompile(`(?i)\b(bearer)\s+[A-Za-z0-9\-._~+/]+=*`), "${1} " + Redacted},
+	{regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----`), Redacted, []string{"private key"}},
+	{regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*`), Redacted, []string{"private key"}},
+	// key=value and "key": "value" secrets; the key (and an Authorization
+	// scheme) stays.
+	{regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization)(["']?\s*[:=]\s*["']?)((?:bearer|basic)\s+)?[^\s"',;&}]+`),
+		"${1}${2}${3}" + Redacted, []string{"pass", "secret", "token", "key", "authorization"}},
+	// Bearer tokens anywhere else.
+	{regexp.MustCompile(`(?i)\b(bearer)\s+[A-Za-z0-9\-._~+/]+=*`), "${1} " + Redacted, []string{"bearer"}},
 	// JWTs anywhere.
-	{regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`), Redacted},
+	{regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*`), Redacted, []string{"eyj"}},
 	// AWS access key IDs.
-	{regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), Redacted},
-	// key=value and "key": "value" secrets; the key stays.
-	{regexp.MustCompile(`(?i)(password|passwd|secret|token|api[_-]?key|authorization)(["']?\s*[:=]\s*["']?)([^\s"',;&}]+)`), "${1}${2}" + Redacted},
+	{regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), Redacted, []string{"akia", "asia"}},
 	// user:password@ in URLs.
-	{regexp.MustCompile(`(://)[^/\s:@]+:[^/\s@]+@`), "${1}" + Redacted + "@"},
+	{regexp.MustCompile(`(://)[^/\s:@]+:[^/\s@]+@`), "${1}" + Redacted + "@", []string{"://"}},
 }
 
 // NewRedactor returns a redactor with the built-in rules plus extra
@@ -67,8 +72,13 @@ func (r *Redactor) String(s string) string {
 	if r != nil {
 		rules = r.rules
 	}
+	lower := strings.ToLower(s)
 	for _, ru := range rules {
+		if len(ru.hints) > 0 && !containsAny(lower, ru.hints) {
+			continue
+		}
 		s = ru.re.ReplaceAllString(s, ru.repl)
+		lower = strings.ToLower(s)
 	}
 	return s
 }
@@ -92,4 +102,13 @@ func (r *Redactor) Signal(s Signal) Signal {
 	s.Title = r.String(s.Title)
 	s.Attrs = r.Map(s.Attrs)
 	return s
+}
+
+func containsAny(s string, subs []string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
