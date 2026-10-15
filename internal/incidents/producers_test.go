@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -595,12 +596,15 @@ func TestCloudTrailPoll(t *testing.T) {
 // fakeLogs counts lines per window.
 type fakeLogs struct {
 	perMinute func(from time.Time) int
+	mu        sync.Mutex
 	queries   []LogQuery
 }
 
 func (f *fakeLogs) Name() string { return "kubernetes" }
 func (f *fakeLogs) Logs(_ context.Context, q LogQuery) (LogResult, error) {
+	f.mu.Lock()
 	f.queries = append(f.queries, q)
+	f.mu.Unlock()
 	var res LogResult
 	for t := q.From; t.Before(q.To); t = t.Add(time.Minute) {
 		for i := 0; i < f.perMinute(t); i++ {

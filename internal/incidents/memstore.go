@@ -50,7 +50,9 @@ func (m *MemoryStore) LoadOpen(ctx context.Context) ([]Incident, map[string][]Si
 			continue
 		}
 		out = append(out, CloneIncident(in))
-		sigs[id] = m.signalList(id)
+		if ss := m.signalList(id); len(ss) > 0 {
+			sigs[id] = ss
+		}
 	}
 	SortNewest(out)
 	return out, sigs, nil

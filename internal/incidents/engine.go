@@ -938,7 +938,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 			e.enrich(t)
 			e.recompute(t, now)
 		}
-		c.Incidents = append(c.Incidents, CloneIncident(t.in))
+		c.Incidents = append(c.Incidents, NormalizeIncident(CloneIncident(t.in)))
 		sids := make([]string, 0, len(e.dirty[id]))
 		for sid := range e.dirty[id] {
 			sids = append(sids, sid)
@@ -946,7 +946,7 @@ func (e *Engine) Flush(ctx context.Context) error {
 		sort.Strings(sids)
 		for _, sid := range sids {
 			if s := t.sigs[sid]; s != nil {
-				c.Signals[id] = append(c.Signals[id], CloneSignal(*s))
+				c.Signals[id] = append(c.Signals[id], NormalizeSignal(CloneSignal(*s)))
 			}
 		}
 	}
