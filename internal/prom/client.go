@@ -449,33 +449,45 @@ func (c *Client) ContainerMemoryLimitsIn(ctx context.Context, namespaces []strin
 // each short enough that a query of overhead bytes plus the extra selector
 // plus the matcher stays under maxNamespaceQuery.
 func (c *Client) namespaceMatchers(namespaces []string, overhead int) []string {
+	budget := maxNamespaceQuery - overhead - len(c.selector.String()) - len(`namespace=~""`)
+	var out []string
+	for _, chunk := range chunkNames(validNames(namespaces), budget) {
+		out = append(out, nameMatcher("namespace", chunk))
+	}
+	return out
+}
+
+// validNames returns the valid DNS-1123 names in names, sorted and unique.
+func validNames(names []string) []string {
 	var valid []string
-	for _, ns := range uniqueSorted(namespaces) {
-		if validName(ns) {
-			valid = append(valid, ns)
+	for _, n := range uniqueSorted(names) {
+		if validName(n) {
+			valid = append(valid, n)
 		}
 	}
-	budget := maxNamespaceQuery - overhead - len(c.selector.String())
-	var out []string
+	return valid
+}
+
+// chunkNames cuts names into chunks whose escaped alternation (nameMatcher)
+// stays within budget bytes.
+func chunkNames(names []string, budget int) [][]string {
+	var out [][]string
 	var chunk []string
 	size := 0
-	flush := func() {
-		if len(chunk) > 0 {
-			out = append(out, nameMatcher("namespace", chunk))
-			chunk, size = nil, 0
-		}
-	}
-	for _, ns := range valid {
+	for _, ns := range names {
 		// Escaped, a DNS-1123 name grows by its dots (each "\\." in the
 		// quoted regex), plus a "|" separator.
 		n := len(ns) + 2*strings.Count(ns, ".") + 1
-		if size+n > budget-len(`namespace=~""`) {
-			flush()
+		if size+n > budget && len(chunk) > 0 {
+			out = append(out, chunk)
+			chunk, size = nil, 0
 		}
 		chunk = append(chunk, ns)
 		size += n
 	}
-	flush()
+	if len(chunk) > 0 {
+		out = append(out, chunk)
+	}
 	return out
 }
 
