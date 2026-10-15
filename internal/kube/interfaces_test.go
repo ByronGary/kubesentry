@@ -3,6 +3,7 @@ package kube
 import (
 	"github.com/ByronGary/kubesentry/internal/api"
 	"github.com/ByronGary/kubesentry/internal/auth"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
@@ -20,4 +21,6 @@ var (
 	_ api.CertSource      = (*Source)(nil)
 
 	_ auth.Reviewer = (*Reviewer)(nil)
+
+	_ incidents.EventSource = (*EventWatcher)(nil)
 )

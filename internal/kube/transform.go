@@ -26,11 +26,14 @@ import (
 const maxMessage = 512
 
 // truncate cuts s to maxMessage bytes without splitting a UTF-8 sequence.
-func truncate(s string) string {
-	if len(s) <= maxMessage {
+func truncate(s string) string { return truncateTo(s, maxMessage) }
+
+// truncateTo cuts s to at most n bytes without splitting a UTF-8 sequence.
+func truncateTo(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	cut := maxMessage
+	cut := n
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}

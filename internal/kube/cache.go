@@ -157,13 +157,16 @@ func (s *informerState) settled() bool {
 
 // access is what a permission probe checks.
 type access struct {
-	group, resource, namespace, name string
+	group, resource, subresource, namespace, name string
 }
 
 func (a access) String() string {
 	s := a.resource
 	if a.group != "" {
 		s += "." + a.group
+	}
+	if a.subresource != "" {
+		s += "/" + a.subresource
 	}
 	if a.name != "" {
 		s += " " + a.name
@@ -350,14 +353,21 @@ func (c *Cache) probe(ctx context.Context, checks []access) ([]bool, []string) {
 }
 
 func (c *Cache) permitted(ctx context.Context, a access) (bool, string) {
-	for _, verb := range []string{"list", "watch"} {
-		r, err := c.cs.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
+	return permitted(ctx, c.cs, a, "list", "watch")
+}
+
+// permitted asks with SelfSubjectAccessReviews whether kubesentry may do
+// every verb on a. A review that cannot be made counts as allowed: the
+// reader then finds out for itself.
+func permitted(ctx context.Context, cs kubernetes.Interface, a access, verbs ...string) (bool, string) {
+	for _, verb := range verbs {
+		r, err := cs.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
 			Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: a.namespace, Verb: verb, Group: a.group, Resource: a.resource, Name: a.name,
+				Namespace: a.namespace, Verb: verb, Group: a.group, Resource: a.resource, Subresource: a.subresource, Name: a.name,
 			}},
 		}, metav1.CreateOptions{})
 		if err != nil {
-			slog.Warn("permission probe failed; starting the informer anyway", "resource", a.String(), "err", err)
+			slog.Warn("permission probe failed; trying anyway", "resource", a.String(), "err", err)
 			return true, ""
 		}
 		if !r.Status.Allowed || r.Status.Denied {
