@@ -48,6 +48,8 @@ const NOUN: Record<Capability, string> = {
   audit: 'the audit log',
   clusterAudit: 'cluster-scoped audit events',
   agents: 'node agents',
+  podLogs: 'pod logs',
+  cloudtrail: 'AWS CloudTrail events',
 }
 
 /** Inline note where the server degrades a source to names only. */
@@ -65,6 +67,8 @@ const HIDDEN: Record<Capability, string> = {
   audit: 'Activity is hidden: your access does not include the audit log.',
   clusterAudit: 'Events without a namespace (cluster-scoped objects) are hidden: they need cluster-wide audit access.',
   agents: 'Agent status is hidden: it needs cluster-wide access.',
+  podLogs: 'Logs are hidden: your access does not include pod logs (get pods/log) in this namespace.',
+  cloudtrail: 'CloudTrail changes are hidden: they need the kubesentry CloudTrail viewer role.',
 }
 
 /** Note for a section hidden because the user lacks a capability. */
@@ -76,7 +80,10 @@ export function hiddenNote(cap: Capability): string {
 export function missingCapabilities(info: Pick<Info, 'capabilities'> | undefined): Capability[] {
   const caps = info?.capabilities
   if (!caps) return []
-  return (Object.keys(NOUN) as Capability[]).filter((c) => caps[c] !== true)
+  // Only what the server reports as denied: an older server that doesn't know
+  // a capability (e.g. podLogs) must not make it look missing. Gating with
+  // can() still treats an absent key as not allowed.
+  return (Object.keys(NOUN) as Capability[]).filter((c) => c in caps && caps[c] !== true)
 }
 
 export function capabilityNoun(cap: Capability): string {

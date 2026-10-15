@@ -249,3 +249,96 @@ Findings are folded per workload root (`Assoc.RootOf`). Dedupe key: `check/kind/
 - Checks whose source is unreadable (`Inventory.Unavailable`, no leak scan) are skipped: their findings neither refresh nor resolve.
 
 Writes are committed before anything is sent. Losing the lease cancels the evaluation and drops the sink's queues. Duplicates during a leader change are harmless: Alertmanager dedupes by label set.
+
+## Incidents (`-incidents`)
+
+One incident per **workload root** (`Assoc.RootOf`). **Trigger** signals open an incident and set its severity (`critical`/`warning`; "caution" in the UI is `warning`). **Context** signals only attach. An incident resolves once no trigger has been active for `-incident-quiet`. It is capped at **24h**: it then closes with `capped` and continues in a new incident linked through `previous`. Logs and events are read in the padded window `[start − log-lead, end + log-lag]`.
+
+**Dashboard only:** incidents never notify. Phase B alerts keep notifying per finding and link to their incident.
+
+Go types: `internal/incidents/types.go`. Model additions: `internal/model/incidents.go`, plus `Workload.Labels`/`Revision`, `ReplicaSet.Revision`/`Images`, and `Inventory.ServiceAccounts`/`TargetGroupBindings`. TypeScript: `Incident*` in `web/src/types.ts`.
+
+### Signals
+| Type | Role | Default rule |
+|---|---|---|
+| `request-spike` | trigger | rate over the last 5m against a 1h baseline (offset 5m): ×2 warning, ×4 critical, at least 1 req/s |
+| `error-rate` | trigger | 5xx share: 5% warning, 20% critical |
+| `memory-spike` | trigger | 85% / 95% of the limit; with no limit, a jump of ×1.5 and at least 128 MiB |
+| `oom-kill`, `crashloop` | trigger | critical |
+| `restart` | trigger | `-restart-warn` / `-restart-crit` within the quiet window |
+| `eviction` | trigger | warning |
+| `k8s-event` | trigger or context | trigger: BackOff, Unhealthy, FailedScheduling, FailedMount, Failed and FailedCreatePodSandBox at least `-incident-event-min-count` (3) times in 5m; OOMKilling and Evicted at once. Context otherwise |
+| `alert` | trigger | phase B finding episodes (`key@firstSeen`), with the finding's own severity |
+| `deploy`, `scale` | context | `Workload.Revision` change with the image diff; a `Desired` change |
+| `audit-change` | context | writes by humans in the audit store |
+| `cloudtrail-change` | context | non-read-only CloudTrail events matched to related resources: instance IDs, target groups (TargetGroupBinding), ALB names, IRSA role, security groups, EKS cluster/nodegroup/add-on |
+| `log-errors` | context | error-line rate against the rate before the incident; open incidents only; no lines stored |
+
+**App and service tags:**
+- Keys: `app.kubernetes.io/{name,instance,part-of,component}`, `app`, `k8s-app`, plus `-incident-app-label`.
+- Taken from the workload's labels, or the most common value across its pods.
+- Also `service` (EndpointSlices) and `ingress`.
+- Incidents sharing `part-of`/`instance`/the custom tag/a service with overlapping windows are "related" when read; they are never merged.
+
+### Routes
+| Route | Notes |
+|---|---|
+| `GET /api/v1/incidents` | `?window=1h..24h` or `from&to` (span at most 24h, inside retention), `severity`, `type` (repeatable), `state`, `namespace`, `owner`, `app`, `service`, `tag=k=v`, `limit`/`continue` (keyset on start and id). `counts` cover the range before the severity/type/state filters. Namespaced incidents need `ViewNamespace`; node and cluster subjects need `ViewNodes`. |
+| `GET /api/v1/incidents/{id}` | `IncidentDetail`. 404 before any authorization review when the ID is unknown or out of scope. Signals are gated per source: audit needs `ViewAudit`, CloudTrail needs `ViewCloudTrail`. Series step = window/240, clamped to 15s–5m; at most 12 series per metric plus `others`. Counts against the per-identity cap on expensive routes. |
+| `GET /api/v1/incidents/{id}/logs` | `?from&to&pod&container&level&q&source=auto\|kubernetes\|cloudwatch&limit`. Needs `ViewPodLogs` (`get pods/log`) in the incident's namespace (403 otherwise). Caps: 2,000 lines, 1 MiB, `truncated`. Redacted. `Cache-Control: no-store`. |
+| `GET /api/v1/incidents/{id}/bundle` | Agent-ready. JSON, or `?format=ndjson`: an `IncidentBundleHeader` record, then `{"kind":"signal"\|"metric"\|"event"\|"log"\|"audit"\|"cloudtrail", …}` records. Schema `kubesentry.io/incident-bundle/v1`. Caps: logs 2k lines / 1 MiB, events 2k, audit 1k, CloudTrail 500, total 4 MiB, each with `truncated`. Redacted. Sections the caller can't see go in `omitted`, with `complete:false`; `?require=all` makes that a 403. |
+
+**Elsewhere:**
+- `/info`: `incidents{enabled, leader, sources, maxRangeHours, logLeadSeconds, logLagSeconds}`, and `capabilities.podLogs` / `cloudtrail`.
+- Overview: open incidents fold into "Needs attention" (`href` `#/incidents/<id>`), plus `badges.incidents` and `incidents.open{critical,warning}`.
+- Pod diagnostics: `incidents[]`.
+
+**New capabilities:**
+- `ViewPodLogs` = `get pods/log`, namespaced. `auth.Capability` gains `Subresource`, threaded through the Reviewer, the SAR, the cache keys and `RBACIndex`.
+- `ViewCloudTrail` = `list kubesentry.io/cloudtrail`, cluster-wide. The chart ships viewer ClusterRoles.
+
+### Storage (`0004_incidents.sql`)
+- **Tables:**
+  - `incidents`: subject columns, severity and peak severity, state, owner, production, `tags jsonb`, `services`/`pods`/`nodes`/`signal_types text[]`, `started_at`, `last_signal_at`, `resolved_at`, `capped`, `previous`.
+  - `incident_signals`: PK `(incident_id, signal_id)`, cascading deletes.
+  - `k8s_events`: partitioned by day on `first_seen`, PK `(uid, first_seen)`.
+- **Writes:** only the lease holder (`TryLead("incidents")`) writes, on the lease's connection; followers refresh from the store every 15s.
+- **Maintenance:** `Maintain` partitions both `audit_events` and `k8s_events`.
+- **Retention:** incidents `-incident-retention` (7d); events `-incident-events-retention` (48h).
+- **Parity:** the memory store behaves the same (parity tests).
+
+### Flags (Helm `incidents{…}`)
+- **Main:**
+  - `-incidents` (needs `-cache`; more than one replica needs the Postgres store)
+  - `-incident-interval` 1m
+  - `-incident-max-range` 24h (refused above)
+  - `-incident-retention` 7d, `-incident-events-retention` 48h
+  - `-incident-quiet` 15m, `-incident-lookbehind` 30m
+  - `-incident-log-lead` 5m, `-incident-log-lag` 10m
+  - `-incident-namespaces`, `-incident-include-system`
+  - `-incident-app-label` (custom tag key), `-incident-app-labels`
+- **Thresholds:**
+  - `-incident-request-ratio` 2 / `-incident-request-crit-ratio` 4, `-incident-request-min-rps` 1
+  - `-incident-error-ratio` 0.05 / `-incident-error-crit-ratio` 0.2
+  - `-incident-memory-limit-pct` 85 / `-incident-memory-crit-pct` 95, `-incident-memory-jump-ratio` 1.5, `-incident-memory-jump-min` 128MiB
+  - `-incident-spike-recent` 5m, `-incident-spike-baseline` 1h, `-incident-event-min-count` 3
+- **Sources:**
+  - `-incident-request-sources` (`nginx,app`; built-in profiles), `-incident-request-profiles-file`, `-incident-alb`
+  - `-incident-event-normal-reasons` (`SuccessfulRescale`)
+  - `-incident-logs` (`auto|kubernetes|cloudwatch|off`), `-incident-logs-group` (default `/aws/containerinsights/<cluster>/application`), `-incident-logs-stream-prefix`, `-incident-logs-max-lines` 2000, `-incident-logs-max-bytes` 1MiB, `-incident-redact-patterns`
+- **CloudTrail:** `-cloudtrail` (`off|lookup|logs`), `-cloudtrail-log-group`, `-cloudtrail-region`, `-cloudtrail-qps` 1, `-cloudtrail-start` 1h
+
+**Request profiles:** `{name, metric, namespaceLabel, serviceLabel|podLabel, statusLabel, errorRegex}`. Queries are always built through the prom package's selector, so `-prometheus-selector` applies. ALB uses CloudWatch `GetMetricData` with `SEARCH` over `AWS/ApplicationELB` (RequestCount, HTTPCode_Target_5XX_Count), keyed by the TargetGroupBinding's target group. CloudTrail `LookupEvents` and `GetMetricData` use SigV4-signed HTTP calls (`internal/aws/**`), so no new modules are needed.
+
+### Chart RBAC and IAM
+- **RBAC** (read-only additions): `events` list/watch, `pods/log` get, `serviceaccounts` list/watch, `elbv2.k8s.aws/targetgroupbindings` list/watch.
+- **IAM:** `logs:FilterLogEvents` on the application and trail log groups, `cloudtrail:LookupEvents`, `cloudwatch:GetMetricData` and `cloudwatch:ListMetrics`.
+
+### Metrics
+- `kubesentry_incidents{severity}`
+- `kubesentry_incident_signals_total{type}`
+- `kubesentry_k8s_events_total{result}`
+- `kubesentry_cloudtrail_events_total{result}`
+- `kubesentry_incident_log_fetches_total{source,result}`
+- `kubesentry_dependency_up{dependency="cloudtrail"}`
+- Route labels: `incidents`, `incident`, `incident_logs`, `incident_bundle`.

@@ -56,6 +56,7 @@ describe('notes', () => {
     expect(missingCapabilities(base)).toEqual([])
     const caps = { nodes: true, pvs: true, storageClasses: true, clusterRBAC: false, clusterIssuers: true, processes: true, audit: true, clusterAudit: false, agents: true }
     expect(missingCapabilities({ capabilities: caps })).toEqual(['clusterRBAC', 'clusterAudit'])
+    expect(missingCapabilities({ capabilities: { ...caps, podLogs: false } })).toEqual(['clusterRBAC', 'clusterAudit', 'podLogs'])
   })
 })
 

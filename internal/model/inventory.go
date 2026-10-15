@@ -38,6 +38,13 @@ type Workload struct {
 	Created   time.Time
 	Selector  *LabelSelector // nil for CronJob
 	Images    []string       // from the pod template, containers then init containers
+	// Labels keeps only the app/service tag keys incidents correlate on
+	// (app.kubernetes.io/*, app, k8s-app and the configured custom key).
+	Labels map[string]string
+	// Revision changes on every rollout: the deployment.kubernetes.io/revision
+	// annotation for Deployments, status.updateRevision for StatefulSets and
+	// DaemonSets. Empty for Jobs and CronJobs.
+	Revision string
 	// Desired is spec.replicas (Deployment, StatefulSet), desiredNumberScheduled
 	// (DaemonSet) or spec.completions (Job; 1 when unset).
 	Desired    int32
@@ -283,6 +290,8 @@ type ReplicaSet struct {
 	Desired   int32
 	Ready     int32
 	Created   time.Time
+	Revision  string   // deployment.kubernetes.io/revision
+	Images    []string // pod template images, containers then init containers
 }
 
 // EndpointSlice is a discovery.k8s.io/v1 EndpointSlice, the ground truth for
@@ -345,10 +354,15 @@ type Inventory struct {
 	Ingresses      []Ingress
 	Nodes          []Node
 	Namespaces     []Namespace
-	RBAC           RBAC
-	Certs          CertManager
-	AWSAuth        *AWSAuth // nil when not read
-	Cluster        ClusterInfo
-	Unavailable    map[string]string // source name → reason
-	ReadAt         time.Time
+	// ServiceAccounts keeps only accounts with an IRSA role annotation.
+	ServiceAccounts []ServiceAccount
+	// TargetGroupBindings are AWS Load Balancer Controller objects (nil when
+	// the CRD is absent).
+	TargetGroupBindings []TargetGroupBinding
+	RBAC                RBAC
+	Certs               CertManager
+	AWSAuth             *AWSAuth // nil when not read
+	Cluster             ClusterInfo
+	Unavailable         map[string]string // source name → reason
+	ReadAt              time.Time
 }

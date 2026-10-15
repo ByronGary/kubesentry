@@ -74,6 +74,7 @@ const BADGE_HREF: Record<BadgeKey, (s: AttentionSeverity) => string> = {
   memory: () => '#/memory',
   security: (s) => `#/security?severity=${s}`,
   certificates: () => '#/certificates?status=unhealthy',
+  incidents: () => '#/incidents?state=open',
 }
 
 const BADGE_NOUN: Record<BadgeKey, [string, string]> = {
@@ -83,6 +84,7 @@ const BADGE_NOUN: Record<BadgeKey, [string, string]> = {
   memory: ['memory finding', 'memory findings'],
   security: ['security finding', 'security findings'],
   certificates: ['certificate needs attention', 'certificates need attention'],
+  incidents: ['open incident', 'open incidents'],
 }
 
 const SEVERITY_WORD: Record<AttentionSeverity, string> = { crit: 'critical', warn: 'warning' }

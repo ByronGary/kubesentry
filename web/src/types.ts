@@ -38,9 +38,20 @@ export interface Info {
     /** Why the latest delivery failed, while it still fails ("alertmanager 1 of 2: HTTP 503 ..."). */
     lastError?: string
   }
+  /** Incidents (-incidents); absent when off or on older servers. */
+  incidents?: {
+    enabled: boolean
+    /** This replica holds the incidents lease. */
+    leader?: boolean
+    /** Signal sources and their state: "ok", "absent" or "error: …" (e.g. requests:nginx, requests:alb, logs:cloudwatch, cloudtrail). */
+    sources: Record<string, string>
+    maxRangeHours: number
+    logLeadSeconds: number
+    logLagSeconds: number
+  }
 }
 
-export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'clusterIssuers' | 'processes' | 'audit' | 'clusterAudit' | 'agents'
+export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'clusterIssuers' | 'processes' | 'audit' | 'clusterAudit' | 'agents' | 'podLogs' | 'cloudtrail'
 
 /** Optional paging on list responses: pass `continue` back to get the next page. */
 export interface Paged {
@@ -205,6 +216,8 @@ export interface PodDiagnostics {
   containers: ContainerDiag[]
   volumes: VolumeState[]
   activity: AuditEvent[]
+  /** Incidents (open, or resolved within 24h) whose subject owns this pod. */
+  incidents?: IncidentRef[]
   /** Go duration of the activity lookback (e.g. "168h0m0s"). */
   activityWindow?: string
   warnings?: string[]
@@ -568,10 +581,12 @@ export interface OverviewResponse {
   /** Owners (namespace annotation kubesentry.io/owner) of the caller's visible namespaces, for the filter. */
   owners: string[]
   /** Sidebar badges, keyed by nav item; absent when zero. */
-  badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates', { count: number; severity: AttentionSeverity }>>
+  badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates' | 'incidents', { count: number; severity: AttentionSeverity }>>
   history: OverviewHistory
   /** Alert findings not resolved, in the caller's scope and filter (cluster-scoped ones only without a filter). Absent when alerting is off. */
   alerts?: { open: number; acknowledged: number; silenced: number; byOwner: Record<string, number> }
+  /** Open incidents in scope; absent when incidents are off. */
+  incidents?: { open: { critical: number; warning: number } }
 }
 
 export interface OverviewPool {
@@ -654,3 +669,139 @@ export interface AlertsResponse extends Paged {
   /** When the findings were last evaluated (the leader) or read from the store; absent before the first evaluation. */
   updatedAt?: string
 }
+
+// ---- Incidents (GET /api/v1/incidents…) ----
+// One incident per workload root; triggers open it and set severity, context
+// signals (what changed, logs) attach. See docs/contracts.md "Incidents".
+
+export type IncidentSeverity = 'critical' | 'warning'
+
+export type IncidentSignalType =
+  | 'request-spike' | 'error-rate' | 'memory-spike' | 'oom-kill' | 'restart' | 'crashloop' | 'eviction'
+  | 'k8s-event' | 'alert' | 'deploy' | 'scale' | 'audit-change' | 'cloudtrail-change' | 'log-errors'
+
+export interface IncidentSubject { kind: string; namespace?: string; name: string }
+
+export interface ObjectRef { kind: string; namespace?: string; name: string; uid?: string }
+
+export interface IncidentRef { id: string; severity: IncidentSeverity; state: 'open' | 'resolved'; title: string; start: string }
+
+export interface Incident {
+  id: string
+  subject: IncidentSubject
+  title: string
+  severity: IncidentSeverity
+  peakSeverity: IncidentSeverity
+  state: 'open' | 'resolved'
+  start: string
+  lastSignal: string
+  end?: string
+  capped?: boolean
+  previous?: string
+  owner?: string
+  production?: boolean
+  tags?: Record<string, string>
+  services?: string[]
+  pods?: string[]
+  nodes?: string[]
+  types: IncidentSignalType[]
+  counts: Partial<Record<IncidentSignalType, number>>
+}
+
+export interface IncidentSignal {
+  id: string
+  type: IncidentSignalType
+  source: 'view' | 'metrics' | 'events' | 'alerts' | 'audit' | 'cloudtrail' | 'logs'
+  role: 'trigger' | 'context'
+  severity?: IncidentSeverity
+  start: string
+  end?: string
+  subject: IncidentSubject
+  object: ObjectRef
+  title: string
+  value?: number
+  baseline?: number
+  threshold?: number
+  count?: number
+  tags?: Record<string, string>
+  attrs?: Record<string, string>
+}
+
+export interface IncidentsResponse extends Paged {
+  /** Counts in range before the severity/type/state filters. */
+  counts: { open: number; resolved: number; critical: number; warning: number; byType: Partial<Record<IncidentSignalType, number>> }
+  items: Incident[]
+}
+
+/** A metric series on the incident's shared time axis: [unixMs, value][]. */
+export interface IncidentSeries {
+  metric: 'memory' | 'requests' | 'errors'
+  /** e.g. pod/container, service, or "others" for the folded remainder. */
+  label: string
+  unit: 'bytes' | 'rps' | 'ratio'
+  source?: string
+  points: [number, number][]
+}
+
+export interface IncidentKubeEvent {
+  uid: string
+  namespace?: string
+  type: 'Warning' | 'Normal'
+  reason: string
+  message: string
+  count: number
+  firstSeen: string
+  lastSeen: string
+  regarding: ObjectRef
+  source?: string
+}
+
+export interface IncidentDetail {
+  incident: Incident
+  /** The padded window logs and events are read in. */
+  window: { from: string; to: string }
+  signals: IncidentSignal[]
+  events: IncidentKubeEvent[]
+  /** Audit events in the window (with the audit capability). */
+  audit?: AuditEvent[]
+  series: IncidentSeries[]
+  thresholds?: { metric: IncidentSeries['metric']; label: string; value: number }[]
+  /** Other incidents sharing app/service tags whose windows overlap. */
+  related: IncidentRef[]
+  /** State of each source for this incident ("ok", "absent", "error: …", "forbidden"). */
+  sources: Record<string, string>
+  warnings?: string[]
+}
+
+export interface IncidentLogLine {
+  time: string
+  pod: string
+  container: string
+  /** "error", "warn", "info", "debug" or "" when unknown. */
+  level: string
+  text: string
+  source: 'kubernetes' | 'cloudwatch'
+}
+
+export interface IncidentLogsResponse {
+  from: string
+  to: string
+  source: 'kubernetes' | 'cloudwatch'
+  lines: IncidentLogLine[]
+  truncated: boolean
+  warnings?: string[]
+}
+
+/** First record of /incidents/{id}/bundle?format=ndjson, and the top of the JSON form. */
+export interface IncidentBundleHeader {
+  schema: 'kubesentry.io/incident-bundle/v1'
+  generatedAt: string
+  cluster?: string
+  incident: Incident
+  window: { from: string; to: string }
+  complete: boolean
+  /** Sections left out, with the reason (e.g. {"cloudtrail": "forbidden"}). */
+  omitted?: Record<string, string>
+  truncated?: Record<string, boolean>
+}
+
