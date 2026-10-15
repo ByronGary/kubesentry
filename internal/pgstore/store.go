@@ -30,16 +30,16 @@ import (
 
 // Options configures a Store. Zero values take the defaults shown.
 type Options struct {
-	Schema    string        // "kubesentry"; one schema per cluster
-	Retention time.Duration // 30 days; negative keeps partitions forever
+	Schema        string        // "kubesentry"; one schema per cluster
+	Retention     time.Duration // 30 days; negative keeps partitions forever
+	QueueSize     int           // 50,000 events waiting to be written before Add returns ErrBackpressure
+	BatchSize     int           // 5,000 events per COPY
+	FlushInterval time.Duration // 250ms: a partial batch is written after this long
 	// EventsRetention keeps Kubernetes events (k8s_events) by last seen, and
 	// IncidentRetention resolved incidents by end; 48h and 7 days, negative
 	// keeps them forever.
 	EventsRetention   time.Duration
 	IncidentRetention time.Duration
-	QueueSize         int           // 50,000 events waiting to be written before Add returns ErrBackpressure
-	BatchSize         int           // 5,000 events per COPY
-	FlushInterval     time.Duration // 250ms: a partial batch is written after this long
 	// CacheTTL is how long a Summarize or Coverage result counts as fresh
 	// (30s). Older results are still served while one refresh per result
 	// runs in the background (see cache.go). Negative disables caching.
