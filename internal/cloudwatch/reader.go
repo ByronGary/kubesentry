@@ -8,8 +8,12 @@
 // collapse in the store's (auditID, time) upsert, so no duplicates. Each
 // window re-reads Overlap before its start to catch late-delivered events.
 //
-// This package and internal/awsauth are the only users of the AWS SDK; the
-// fake in cwfake is stdlib-only.
+// For incidents, LogLookup reads container logs on demand (lookup.go) and
+// RawReader reads raw messages, such as a CloudTrail trail's (raw.go). All
+// readers wait out throttling through a Pacer, which they can share.
+//
+// The AWS SDK is used only here, in internal/awsauth and in internal/aws;
+// the fake in cwfake is stdlib-only.
 package cloudwatch
 
 import (
@@ -19,14 +23,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
-	"github.com/aws/smithy-go"
 
 	"github.com/ByronGary/kubesentry/internal/audit"
 )
@@ -104,12 +106,15 @@ type Reader struct {
 	// it doubles while throttling persists (to 30s) and the reader then paces
 	// its calls, relaxing as calls succeed.
 	ThrottleBackoff time.Duration
-	Now             func() time.Time
-	Logger          *slog.Logger
+	// Pacer, when set, is shared with other readers of the same account
+	// (ThrottleBackoff is then the Pacer's); nil makes one from
+	// ThrottleBackoff.
+	Pacer  *Pacer
+	Now    func() time.Time
+	Logger *slog.Logger
 
 	mu     sync.Mutex
 	status Status
-	pace   time.Duration
 	seen   map[string]int64 // eventId → timestamp (ms) of events committed in the overlap region
 }
 
@@ -356,63 +361,46 @@ func (r *Reader) checkpoint(ctx context.Context, now time.Time) (time.Time, erro
 	return now.Add(-r.Start).Truncate(time.Millisecond), nil
 }
 
-// filter calls FilterLogEvents, waiting out throttling with adaptive pacing.
+// filter calls FilterLogEvents, waiting out throttling with the pacer.
 func (r *Reader) filter(ctx context.Context, in *cloudwatchlogs.FilterLogEventsInput) (*cloudwatchlogs.FilterLogEventsOutput, error) {
-	backoff := r.ThrottleBackoff
-	for {
+	var out *cloudwatchlogs.FilterLogEventsOutput
+	err := r.pacer().Do(ctx, func() error {
 		r.mu.Lock()
-		pace := r.pace
 		r.status.Calls++
 		r.mu.Unlock()
-		if pace > 0 && !sleep(ctx, pace) {
-			return nil, ctx.Err()
-		}
-		out, err := r.API.FilterLogEvents(ctx, in)
-		if err == nil {
-			r.mu.Lock()
-			r.pace /= 2
-			if r.pace < r.ThrottleBackoff/8 {
-				r.pace = 0
-			}
-			r.mu.Unlock()
-			return out, nil
-		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		code := ""
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			code = apiErr.ErrorCode()
-		}
-		switch {
-		case code == "ResourceNotFoundException":
-			return nil, fmt.Errorf("%w: %s (is the EKS control plane audit log enabled? check -cloudwatch-log-group): %v", ErrLogGroupNotFound, r.LogGroup, err)
-		case code == "AccessDeniedException" || code == "UnrecognizedClientException" || code == "ExpiredTokenException":
-			return nil, fmt.Errorf("%w: logs:FilterLogEvents on %s: %v", ErrAccessDenied, r.LogGroup, err)
-		case isThrottle(code, err):
-			r.mu.Lock()
-			r.status.Throttled++
-			r.pace = min(max(r.pace*2, r.ThrottleBackoff), 30*time.Second)
-			r.status.LastError, r.status.ErrorKind = err.Error(), "throttled"
-			r.mu.Unlock()
-			if !sleep(ctx, backoff) {
-				return nil, ctx.Err()
-			}
-			backoff = min(backoff*2, 30*time.Second)
-			continue
-		}
-		return nil, err
+		var err error
+		out, err = r.API.FilterLogEvents(ctx, in)
+		return err
+	}, isThrottled, func(err error) {
+		r.mu.Lock()
+		r.status.Throttled++
+		r.status.LastError, r.status.ErrorKind = err.Error(), "throttled"
+		r.mu.Unlock()
+	})
+	if err == nil {
+		return out, nil
 	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	switch code := errorCode(err); {
+	case code == "ResourceNotFoundException":
+		return nil, fmt.Errorf("%w: %s (is the EKS control plane audit log enabled? check -cloudwatch-log-group): %v", ErrLogGroupNotFound, r.LogGroup, err)
+	case isAccessDenied(code):
+		return nil, fmt.Errorf("%w: logs:FilterLogEvents on %s: %v", ErrAccessDenied, r.LogGroup, err)
+	}
+	return nil, err
 }
 
-func isThrottle(code string, err error) bool {
-	switch code {
-	case "ThrottlingException", "Throttling", "RequestLimitExceeded", "TooManyRequestsException", "LimitExceededException", "ServiceUnavailableException":
-		return true
+// pacer returns the Reader's Pacer, creating one from ThrottleBackoff when
+// none was given.
+func (r *Reader) pacer() *Pacer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.Pacer == nil {
+		r.Pacer = NewPacer(r.ThrottleBackoff)
 	}
-	// The SDK's own retry budget running dry is throttling by another name.
-	return strings.Contains(err.Error(), "retry quota exceeded")
+	return r.Pacer
 }
 
 func (r *Reader) noteErr(err error) {
