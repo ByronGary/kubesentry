@@ -42,8 +42,9 @@ type Workload struct {
 	// (app.kubernetes.io/*, app, k8s-app and the configured custom key).
 	Labels map[string]string
 	// Revision changes on every rollout: the deployment.kubernetes.io/revision
-	// annotation for Deployments, status.updateRevision for StatefulSets and
-	// DaemonSets. Empty for Jobs and CronJobs.
+	// annotation for Deployments, status.updateRevision for StatefulSets, and
+	// the deprecated.daemonset.template.generation annotation for DaemonSets
+	// (DaemonSetStatus has no updateRevision). Empty for Jobs and CronJobs.
 	Revision string
 	// Desired is spec.replicas (Deployment, StatefulSet), desiredNumberScheduled
 	// (DaemonSet) or spec.completions (Job; 1 when unset).
