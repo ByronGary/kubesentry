@@ -44,17 +44,17 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	case *networkingv1.Ingress:
 		return convertIngress(o)
 	case *appsv1.Deployment:
-		return convertDeployment(o)
+		return convertDeployment(o, f.appLabels)
 	case *appsv1.ReplicaSet:
 		return convertReplicaSet(o)
 	case *appsv1.StatefulSet:
-		return convertStatefulSet(o)
+		return convertStatefulSet(o, f.appLabels)
 	case *appsv1.DaemonSet:
-		return convertDaemonSet(o)
+		return convertDaemonSet(o, f.appLabels)
 	case *batchv1.Job:
-		return convertJob(o)
+		return convertJob(o, f.appLabels)
 	case *batchv1.CronJob:
-		return convertCronJob(o)
+		return convertCronJob(o, f.appLabels)
 	case *rbacv1.Role:
 		return convertRole(o)
 	case *rbacv1.ClusterRole:
@@ -66,8 +66,12 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	case *corev1.ConfigMap:
 		a, _ := ParseAWSAuth(o.Data)
 		return a
+	case *corev1.ServiceAccount:
+		return convertServiceAccount(o)
 	case *unstructured.Unstructured:
 		switch o.GetKind() {
+		case "TargetGroupBinding":
+			return convertTargetGroupBinding(o)
 		case "Certificate":
 			return convertCertificate(o)
 		case "Issuer", "ClusterIssuer":
@@ -80,7 +84,9 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	return nil
 }
 
-func allFixtures() []runtime.Object { return append(fixtureObjects(), certObjects()...) }
+func allFixtures() []runtime.Object {
+	return append(append(fixtureObjects(), certObjects()...), tgbObjects()...)
+}
 
 func transformed(obj runtime.Object, f filters) runtime.Object {
 	c := obj.DeepCopyObject()
@@ -100,7 +106,11 @@ func describe(obj runtime.Object) string {
 }
 
 func TestTransformPreservesConvert(t *testing.T) {
-	for _, labels := range []filters{newFilters(nil, nil), newFilters([]string{"example.com/*"}, []string{"example.com/owner"})} {
+	for _, labels := range []filters{
+		newFilters(nil, nil, nil),
+		newFilters([]string{"example.com/*"}, []string{"example.com/owner"}, []string{"team"}),
+		newFilters(nil, nil, []string{"te*"}),
+	} {
 		for _, obj := range allFixtures() {
 			want := convertAny(t, obj, labels)
 			got := convertAny(t, transformed(obj, labels), labels)
@@ -112,7 +122,7 @@ func TestTransformPreservesConvert(t *testing.T) {
 }
 
 func TestTransformIdempotent(t *testing.T) {
-	labels := newFilters([]string{"example.com/rack"}, []string{"example.com/owner"})
+	labels := newFilters([]string{"example.com/rack"}, []string{"example.com/owner"}, []string{"team"})
 	for _, obj := range allFixtures() {
 		once := transformed(obj, labels)
 		twice := transformed(once, labels)
@@ -140,7 +150,7 @@ func jsonSize(t *testing.T, v any) int {
 // TestTransformStrips checks the transform drops what it promises to, and
 // logs how much smaller the stored objects get.
 func TestTransformStrips(t *testing.T) {
-	labels := newFilters(nil, nil)
+	labels := newFilters(nil, nil, nil)
 	pod := fixturePods()[0]
 	before := jsonSize(t, pod)
 	p := transformed(pod, labels).(*corev1.Pod)
@@ -190,11 +200,26 @@ func TestTransformStrips(t *testing.T) {
 			if !reflect.DeepEqual(o.Spec.Template.Spec.Containers, want) || o.Spec.Template.Labels != nil || len(o.Spec.Template.Spec.Volumes) != 0 {
 				t.Errorf("deployment template: %+v", o.Spec.Template)
 			}
-			if o.Annotations != nil || len(o.Status.Conditions[0].Message) > maxMessage {
+			if !reflect.DeepEqual(o.Annotations, map[string]string{revisionAnnotation: "7"}) || len(o.Status.Conditions[0].Message) > maxMessage {
 				t.Errorf("deployment: %+v", o.ObjectMeta)
 			}
+			if !reflect.DeepEqual(o.Labels, map[string]string{"app": "web", "app.kubernetes.io/name": "web", "app.kubernetes.io/part-of": "shop"}) {
+				t.Errorf("deployment labels: %v", o.Labels)
+			}
+		case *appsv1.ReplicaSet:
+			if o.Name == "web-5d8f" && !reflect.DeepEqual(o.Annotations, map[string]string{revisionAnnotation: "7"}) {
+				t.Errorf("replicaset annotations: %v", o.Annotations)
+			}
+		case *appsv1.DaemonSet:
+			if !reflect.DeepEqual(o.Annotations, map[string]string{daemonSetGenerationAnnotation: "4"}) || o.Labels["team"] != "" {
+				t.Errorf("daemonset: %+v", o.ObjectMeta)
+			}
+		case *networkingv1.Ingress:
+			if len(o.Annotations) != 7 || o.Annotations["alb.ingress.kubernetes.io/healthcheck-path"] != "" {
+				t.Errorf("ingress annotations: %v", o.Annotations)
+			}
 		case *corev1.Service:
-			if o.Name == "web" && (len(o.Annotations) != 3 || o.Status.Conditions != nil) {
+			if o.Name == "web" && (len(o.Annotations) != 4 || o.Status.Conditions != nil) {
 				t.Errorf("service: %+v", o)
 			}
 		case *discoveryv1.EndpointSlice:
@@ -209,6 +234,32 @@ func TestTransformStrips(t *testing.T) {
 			if o.Spec.NodeAffinity != nil || (o.Spec.CSI != nil && o.Spec.CSI.VolumeAttributes != nil) {
 				t.Errorf("pv: %+v", o.Spec)
 			}
+		}
+	}
+	for _, obj := range fixtureObjects() {
+		sa, ok := transformed(obj, labels).(*corev1.ServiceAccount)
+		if !ok {
+			continue
+		}
+		if sa.Labels != nil || sa.Secrets != nil || sa.ImagePullSecrets != nil || sa.AutomountServiceAccountToken != nil || sa.ManagedFields != nil {
+			t.Errorf("serviceaccount %s not stripped: %+v", sa.Name, sa)
+		}
+		if a := sa.Annotations; len(a) > 1 || (sa.Name == "web" && a[irsaRoleAnnotation] == "") {
+			t.Errorf("serviceaccount %s annotations: %v", sa.Name, a)
+		}
+	}
+	for _, obj := range tgbObjects() {
+		u := transformed(obj, labels).(*unstructured.Unstructured)
+		want := map[string]any{
+			"apiVersion": "elbv2.k8s.aws/v1beta1", "kind": "TargetGroupBinding",
+			"metadata": map[string]any{"namespace": u.GetNamespace(), "name": u.GetName(), "uid": string(u.GetUID()), "resourceVersion": "1"},
+			"spec": map[string]any{
+				"targetGroupARN": str(u, "spec", "targetGroupARN"),
+				"serviceRef":     obj.(*unstructured.Unstructured).Object["spec"].(map[string]any)["serviceRef"],
+			},
+		}
+		if !reflect.DeepEqual(u.Object, want) {
+			t.Errorf("targetgroupbinding %s:\n got %v\nwant %v", u.GetName(), u.Object, want)
 		}
 	}
 	for _, obj := range certObjects() {

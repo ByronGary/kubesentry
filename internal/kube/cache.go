@@ -10,7 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	authorizationv1 "k8s.io/api/authorization/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,7 +20,6 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -30,7 +31,8 @@ import (
 var ErrNotSynced = errors.New("kube: informer cache has not synced yet")
 
 // DefaultCertManagerRecheck is how often the Cache looks for a cert-manager
-// that was installed (or removed) after it started.
+// (or an AWS Load Balancer Controller) that was installed or removed after it
+// started.
 const DefaultCertManagerRecheck = 5 * time.Minute
 
 // CacheOptions configures a Cache.
@@ -43,8 +45,12 @@ type CacheOptions struct {
 	// NamespaceAnnotationKeysAdd are namespace annotations kept besides
 	// kubesentry.io/* (the owner annotation, when configured elsewhere).
 	NamespaceAnnotationKeysAdd []string
-	// CertManagerRecheck is how often discovery is re-run for cert-manager
-	// (and the server version); default 5m.
+	// AppLabelKeys are workload labels kept besides DefaultAppLabelKeys
+	// (the custom app tag, -incident-app-label; "prefix*" matches by prefix).
+	AppLabelKeys []string
+	// CertManagerRecheck is how often discovery is re-run for the custom
+	// resource APIs (cert-manager, the AWS Load Balancer Controller's
+	// TargetGroupBindings) and the server version; default 5m.
 	CertManagerRecheck time.Duration
 	ClusterName        string
 	Now                func() time.Time // defaults to time.Now
@@ -60,7 +66,7 @@ type CacheOptions struct {
 // informers.
 type Cache struct {
 	cs        kubernetes.Interface
-	dyn       dynamic.Interface // nil disables cert-manager
+	dyn       dynamic.Interface // nil disables the custom resources (cert-manager, TargetGroupBindings)
 	disc      discovery.DiscoveryInterface
 	opts      CacheOptions
 	filters   filters
@@ -71,9 +77,9 @@ type Cache struct {
 	res                      map[string]*informerState // built-in resources; fixed once started
 	awsAuth                  *informerState            // nil unless AWSAuth
 
-	mu      sync.Mutex // guards version and cm
+	mu      sync.Mutex // guards version and crds
 	version string
-	cm      *certManagerState // nil while cert-manager is not served
+	crds    map[*crdAPI]*crdState // an API is absent while it is not served
 
 	m           memos
 	awsAuthMemo struct {
@@ -102,6 +108,8 @@ type memos struct {
 	certificates                          memo[model.Certificate]
 	issuers, clusterissuers               memo[model.Issuer]
 	requests                              memo[model.CertificateRequest]
+	serviceaccounts                       memo[model.ServiceAccount]
+	targetgroupbindings                   memo[model.TargetGroupBinding]
 }
 
 // informerState is one watched resource.
@@ -147,20 +155,18 @@ func (s *informerState) settled() bool {
 	return s.inf == nil || s.inf.HasSynced() || s.getFailure() != ""
 }
 
-type certManagerState struct {
-	cancel context.CancelFunc
-	res    map[string]*informerState
-}
-
 // access is what a permission probe checks.
 type access struct {
-	group, resource, namespace, name string
+	group, resource, subresource, namespace, name string
 }
 
 func (a access) String() string {
 	s := a.resource
 	if a.group != "" {
 		s += "." + a.group
+	}
+	if a.subresource != "" {
+		s += "/" + a.subresource
 	}
 	if a.name != "" {
 		s += " " + a.name
@@ -193,6 +199,9 @@ var builtinResources = []struct {
 	}},
 	{"namespaces", "", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 		return f.Core().V1().Namespaces().Informer()
+	}},
+	{"serviceaccounts", "", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
+		return f.Core().V1().ServiceAccounts().Informer()
 	}},
 	{"services", "", func(f informers.SharedInformerFactory) cache.SharedIndexInformer {
 		return f.Core().V1().Services().Informer()
@@ -244,7 +253,7 @@ func NewCache(c *Clients, o CacheOptions) *Cache {
 	if disc == nil && c.CS != nil {
 		disc = c.CS.Discovery()
 	}
-	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd)
+	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd, o.AppLabelKeys)
 	return &Cache{
 		cs: c.CS, dyn: c.Dyn, disc: disc, opts: o,
 		filters:   f,
@@ -313,7 +322,7 @@ func (c *Cache) Start(ctx context.Context) error {
 		}
 	}
 	c.refreshVersion()
-	c.syncCertManager(ctx)
+	c.syncCRDs(ctx)
 
 	factory.Start(ctx.Done())
 	if awsFactory != nil {
@@ -344,14 +353,21 @@ func (c *Cache) probe(ctx context.Context, checks []access) ([]bool, []string) {
 }
 
 func (c *Cache) permitted(ctx context.Context, a access) (bool, string) {
-	for _, verb := range []string{"list", "watch"} {
-		r, err := c.cs.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
+	return permitted(ctx, c.cs, a, "list", "watch")
+}
+
+// permitted asks with SelfSubjectAccessReviews whether kubesentry may do
+// every verb on a. A review that cannot be made counts as allowed: the
+// reader then finds out for itself.
+func permitted(ctx context.Context, cs kubernetes.Interface, a access, verbs ...string) (bool, string) {
+	for _, verb := range verbs {
+		r, err := cs.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, &authorizationv1.SelfSubjectAccessReview{
 			Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &authorizationv1.ResourceAttributes{
-				Namespace: a.namespace, Verb: verb, Group: a.group, Resource: a.resource, Name: a.name,
+				Namespace: a.namespace, Verb: verb, Group: a.group, Resource: a.resource, Subresource: a.subresource, Name: a.name,
 			}},
 		}, metav1.CreateOptions{})
 		if err != nil {
-			slog.Warn("permission probe failed; starting the informer anyway", "resource", a.String(), "err", err)
+			slog.Warn("permission probe failed; trying anyway", "resource", a.String(), "err", err)
 			return true, ""
 		}
 		if !r.Status.Allowed || r.Status.Denied {
@@ -422,72 +438,6 @@ func (c *Cache) refreshVersion() {
 	}
 }
 
-// syncCertManager starts the cert-manager informers when the
-// cert-manager.io/v1 API appears, and stops them when it goes away.
-func (c *Cache) syncCertManager(ctx context.Context) {
-	if c.dyn == nil || c.disc == nil {
-		return
-	}
-	_, err := c.disc.ServerResourcesForGroupVersion(certManagerGroupVersion)
-	if err != nil && !apierrors.IsNotFound(err) {
-		slog.Warn("discover cert-manager; keeping the current state", "err", err)
-		return
-	}
-	served := err == nil
-	c.mu.Lock()
-	cur := c.cm
-	c.mu.Unlock()
-	switch {
-	case served && cur == nil:
-		c.startCertManager(ctx)
-	case !served && cur != nil:
-		cur.cancel()
-		c.mu.Lock()
-		c.cm = nil
-		c.mu.Unlock()
-		c.m.certificates.reset()
-		c.m.issuers.reset()
-		c.m.clusterissuers.reset()
-		c.m.requests.reset()
-		slog.Info("cert-manager API no longer served; stopped its informers")
-		c.notify()
-	}
-}
-
-func (c *Cache) startCertManager(ctx context.Context) {
-	checks := make([]access, len(certManagerResources))
-	for i, r := range certManagerResources {
-		checks[i] = access{group: "cert-manager.io", resource: r}
-	}
-	allowed, reasons := c.probe(ctx, checks)
-	cmCtx, cancel := context.WithCancel(ctx)
-	f := dynamicinformer.NewDynamicSharedInformerFactory(c.dyn, 0)
-	st := &certManagerState{cancel: cancel, res: map[string]*informerState{}}
-	for i, r := range certManagerResources {
-		is := &informerState{name: r}
-		if allowed[i] {
-			is.inf = f.ForResource(certGVR(r)).Informer()
-			_ = is.inf.SetTransform(c.transform)
-			c.watch(is)
-		} else {
-			is.reason = reasons[i]
-		}
-		st.res[r] = is
-	}
-	f.Start(cmCtx.Done())
-	go func() {
-		<-cmCtx.Done()
-		f.Shutdown()
-	}()
-	c.mu.Lock()
-	c.cm = st
-	c.mu.Unlock()
-	if c.started.Load() {
-		slog.Info("cert-manager API found; started its informers")
-		c.notify()
-	}
-}
-
 func (c *Cache) recheck(ctx context.Context) {
 	t := time.NewTicker(c.opts.CertManagerRecheck)
 	defer t.Stop()
@@ -497,14 +447,15 @@ func (c *Cache) recheck(ctx context.Context) {
 			return
 		case <-t.C:
 			c.refreshVersion()
-			c.syncCertManager(ctx)
+			c.syncCRDs(ctx)
 		}
 	}
 }
 
-// states lists every informer started or skipped, cert-manager included.
+// states lists every informer started or skipped, the custom resources
+// included.
 func (c *Cache) states() []*informerState {
-	out := make([]*informerState, 0, len(c.res)+5)
+	out := make([]*informerState, 0, len(c.res)+6)
 	for _, b := range builtinResources {
 		out = append(out, c.res[b.name])
 	}
@@ -512,9 +463,11 @@ func (c *Cache) states() []*informerState {
 		out = append(out, c.awsAuth)
 	}
 	c.mu.Lock()
-	if c.cm != nil {
-		for _, r := range certManagerResources {
-			out = append(out, c.cm.res[r])
+	for _, a := range crdAPIs {
+		if st := c.crds[a]; st != nil {
+			for _, r := range a.resources {
+				out = append(out, st.res[r])
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -539,8 +492,8 @@ func (c *Cache) WaitSynced(ctx context.Context) error {
 }
 
 // Ready reports whether the informers have synced. Once true it stays true;
-// a cert-manager installed later is reported unavailable until its own
-// informers sync.
+// a custom resource API (cert-manager) installed later is reported
+// unavailable until its own informers sync.
 func (c *Cache) Ready() bool {
 	if c.ready.Load() {
 		return true
@@ -607,6 +560,26 @@ func inventoryItems[O metav1.Object, T any](st *informerState, m *memo[T], conv 
 	return convertAll(m, sortedObjects[O](st.inf.GetStore()), conv)
 }
 
+// inventoryItemsWhere is inventoryItems for the objects keep accepts; the
+// others are neither converted nor remembered.
+func inventoryItemsWhere[O metav1.Object, T any](st *informerState, m *memo[T], keep func(O) bool, conv func(O) T, unavailable map[string]string) []T {
+	if st == nil {
+		return nil
+	}
+	if ok, reason := st.state(); !ok {
+		unavailable[st.name] = reason
+		return nil
+	}
+	objs := sortedObjects[O](st.inf.GetStore())
+	kept := objs[:0]
+	for _, o := range objs {
+		if keep(o) {
+			kept = append(kept, o)
+		}
+	}
+	return convertAll(m, kept, conv)
+}
+
 // listCached converts one resource for the per-resource methods; an
 // unreadable resource is an error.
 func listCached[O metav1.Object, T any](c *Cache, st *informerState, m *memo[T], conv func(O) T) ([]T, error) {
@@ -653,6 +626,8 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 	inv.Ingresses = inventoryItems(c.st("ingresses"), &m.ingresses, convertIngress, u)
 	inv.Nodes = inventoryItems(c.st("nodes"), &m.nodes, c.convertNode, u)
 	inv.Namespaces = inventoryItems(c.st("namespaces"), &m.namespaces, c.convertNamespace, u)
+	inv.ServiceAccounts = inventoryItemsWhere(c.st("serviceaccounts"), &m.serviceaccounts, hasIRSARole, convertServiceAccount, u)
+	inv.TargetGroupBindings = c.targetGroupBindings(u)
 	inv.RBAC = c.rbac(u)
 	inv.Certs = c.certs(u)
 	if c.opts.AWSAuth {
@@ -676,11 +651,12 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 func (c *Cache) workloads(unavailable map[string]string) []model.Workload {
 	m := &c.m
 	var out []model.Workload
-	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, convertDeployment, unavailable)...)
-	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, convertStatefulSet, unavailable)...)
-	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, convertDaemonSet, unavailable)...)
-	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, convertJob, unavailable)...)
-	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, convertCronJob, unavailable)...)
+	apps := c.filters.appLabels
+	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, func(o *batchv1.Job) model.Workload { return convertJob(o, apps) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps) }, unavailable)...)
 	return out
 }
 
@@ -699,9 +675,7 @@ func (c *Cache) rbac(unavailable map[string]string) model.RBAC {
 // certs converts the cert-manager objects; Installed is false while the
 // cert-manager.io/v1 API is not served.
 func (c *Cache) certs(unavailable map[string]string) model.CertManager {
-	c.mu.Lock()
-	cm := c.cm
-	c.mu.Unlock()
+	cm := c.crd(certManagerAPI)
 	if cm == nil {
 		return model.CertManager{}
 	}
@@ -712,6 +686,16 @@ func (c *Cache) certs(unavailable map[string]string) model.CertManager {
 	out.Issuers = append(out.Issuers, inventoryItems(cm.res["clusterissuers"], &m.clusterissuers, issuerConv("ClusterIssuer"), unavailable)...)
 	out.Requests = inventoryItems(cm.res["certificaterequests"], &m.requests, convertCertificateRequest, unavailable)
 	return out
+}
+
+// targetGroupBindings converts the AWS Load Balancer Controller's
+// TargetGroupBindings; nil while the elbv2.k8s.aws API is not served.
+func (c *Cache) targetGroupBindings(unavailable map[string]string) []model.TargetGroupBinding {
+	st := c.crd(targetGroupBindingAPI)
+	if st == nil {
+		return nil
+	}
+	return inventoryItems(st.res[targetGroupBindingResource], &c.m.targetgroupbindings, convertTargetGroupBinding, unavailable)
 }
 
 // readAWSAuth parses the cached aws-auth ConfigMap, once per resourceVersion.

@@ -34,8 +34,11 @@ type SourceOptions struct {
 	// NamespaceAnnotationKeysAdd are namespace annotations kept besides
 	// kubesentry.io/* (the owner annotation, when configured elsewhere).
 	NamespaceAnnotationKeysAdd []string
-	ClusterName                string
-	Now                        func() time.Time
+	// AppLabelKeys are workload labels kept besides DefaultAppLabelKeys
+	// (the custom app tag, -incident-app-label).
+	AppLabelKeys []string
+	ClusterName  string
+	Now          func() time.Time
 }
 
 // NewSource wraps a clientset and an optional dynamic client.
@@ -53,6 +56,8 @@ func (s *Source) nodeLabels() labelFilter { return newNodeLabelFilter(s.opts.Nod
 func (s *Source) namespaceAnnotations() labelFilter {
 	return newNamespaceAnnotationFilter(s.opts.NamespaceAnnotationKeysAdd)
 }
+
+func (s *Source) appLabels() labelFilter { return newAppLabelFilter(s.opts.AppLabelKeys) }
 
 // collect pages through a list and converts each item.
 func collect[O, T any](what string, list func(metav1.ListOptions) ([]O, string, error), conv func(*O) T) ([]T, error) {

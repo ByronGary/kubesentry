@@ -15,9 +15,18 @@ import (
 
 const certManagerGroupVersion = "cert-manager.io/v1"
 
-func certGVR(resource string) schema.GroupVersionResource {
-	return schema.GroupVersionResource{Group: "cert-manager.io", Version: "v1", Resource: resource}
+// certManagerAPI is cert-manager.io/v1, watched while it is served.
+var certManagerAPI = &crdAPI{
+	name: "cert-manager", group: "cert-manager.io", version: "v1", resources: certManagerResources,
+	reset: func(m *memos) {
+		m.certificates.reset()
+		m.issuers.reset()
+		m.clusterissuers.reset()
+		m.requests.reset()
+	},
 }
+
+func certGVR(resource string) schema.GroupVersionResource { return certManagerAPI.gvr(resource) }
 
 // issuerTypes are the spec keys that select an issuer's backend.
 var issuerTypes = []string{"acme", "ca", "vault", "selfSigned", "venafi"}
@@ -57,7 +66,7 @@ func (s *Source) certManager(ctx context.Context, unavailable map[string]string)
 		}},
 		{"certificaterequests", func(u *unstructured.Unstructured) { out.Requests = append(out.Requests, convertCertificateRequest(u)) }},
 	} {
-		err := s.listDynamic(ctx, r.resource, r.each)
+		err := s.listDynamic(ctx, certGVR(r.resource), r.each)
 		if err != nil && unavailable != nil && apierrors.IsForbidden(err) {
 			unavailable[r.resource] = forbiddenReason(err)
 			continue
@@ -69,9 +78,9 @@ func (s *Source) certManager(ctx context.Context, unavailable map[string]string)
 	return out, nil
 }
 
-func (s *Source) listDynamic(ctx context.Context, resource string, each func(*unstructured.Unstructured)) error {
-	return paginate(resource, func(o metav1.ListOptions) (string, error) {
-		l, err := s.dyn.Resource(certGVR(resource)).Namespace(metav1.NamespaceAll).List(ctx, o)
+func (s *Source) listDynamic(ctx context.Context, gvr schema.GroupVersionResource, each func(*unstructured.Unstructured)) error {
+	return paginate(gvr.Resource, func(o metav1.ListOptions) (string, error) {
+		l, err := s.dyn.Resource(gvr).Namespace(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return "", err
 		}

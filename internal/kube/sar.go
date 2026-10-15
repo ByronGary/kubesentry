@@ -41,14 +41,15 @@ func NewReviewer(c *Clients, qps float32, burst int) (*Reviewer, error) {
 }
 
 // Review creates one authorization.k8s.io/v1 SubjectAccessReview. verb,
-// group, resource and namespace are ResourceAttributes ("" namespace means
-// all namespaces). It fails closed: only an explicit Allowed is true.
-func (r *Reviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, namespace string) (bool, error) {
+// group, resource, subresource and namespace are ResourceAttributes (""
+// subresource means the resource itself, "" namespace all namespaces). It
+// fails closed: only an explicit Allowed is true.
+func (r *Reviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, subresource, namespace string) (bool, error) {
 	sar := &authorizationv1.SubjectAccessReview{Spec: authorizationv1.SubjectAccessReviewSpec{
 		User:   user,
 		Groups: groups,
 		ResourceAttributes: &authorizationv1.ResourceAttributes{
-			Namespace: namespace, Verb: verb, Group: group, Resource: resource,
+			Namespace: namespace, Verb: verb, Group: group, Resource: resource, Subresource: subresource,
 		},
 	}}
 	out, err := r.client.Create(ctx, sar, metav1.CreateOptions{})

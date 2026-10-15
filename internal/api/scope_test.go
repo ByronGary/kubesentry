@@ -20,15 +20,23 @@ import (
 )
 
 // grantReviewer answers SubjectAccessReviews from a fixed table of
-// "user|verb|group|resource|namespace" grants; everything else is denied.
+// "user|verb|group|resource|namespace" grants; everything else is denied. A
+// subresource is part of the resource, as "pods/log".
 type grantReviewer map[string]bool
 
-func (g grantReviewer) Review(_ context.Context, user string, _ []string, verb, group, resource, ns string) (bool, error) {
+func (g grantReviewer) Review(_ context.Context, user string, _ []string, verb, group, resource, subresource, ns string) (bool, error) {
+	if subresource != "" {
+		resource += "/" + subresource
+	}
 	return g[user+"|"+verb+"|"+group+"|"+resource+"|"+ns], nil
 }
 
 func grant(user string, c auth.Capability, ns string) string {
-	return user + "|" + c.Verb + "|" + c.Group + "|" + c.Resource + "|" + ns
+	resource := c.Resource
+	if c.Subresource != "" {
+		resource += "/" + c.Subresource
+	}
+	return user + "|" + c.Verb + "|" + c.Group + "|" + resource + "|" + ns
 }
 
 // currentView is a ViewProvider that also reports its view, as

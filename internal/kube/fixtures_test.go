@@ -300,6 +300,7 @@ func fixtureObjects() []runtime.Object {
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-scheme"] = "internal"
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-type"] = "external"
 	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-nlb-target-type"] = "ip"
+	svc.Annotations["service.beta.kubernetes.io/aws-load-balancer-security-groups"] = "sg-0aaa,sg-0bbb"
 	headless := &corev1.Service{ObjectMeta: meta("app", "web-headless", "svc-headless"), Spec: corev1.ServiceSpec{
 		Type: corev1.ServiceTypeClusterIP, ClusterIP: corev1.ClusterIPNone, Selector: map[string]string{"app": "web"},
 	}}
@@ -337,6 +338,10 @@ func fixtureObjects() []runtime.Object {
 	ing.Annotations["alb.ingress.kubernetes.io/certificate-arn"] = "arn:aws:acm:us-east-1:123:certificate/abc"
 	ing.Annotations["alb.ingress.kubernetes.io/listen-ports"] = `[{"HTTPS":443}]`
 	ing.Annotations["kubernetes.io/ingress.class"] = "alb"
+	ing.Annotations["alb.ingress.kubernetes.io/group.name"] = "shop"
+	ing.Annotations["alb.ingress.kubernetes.io/load-balancer-name"] = "shop-alb"
+	ing.Annotations["alb.ingress.kubernetes.io/security-groups"] = "sg-0ccc"
+	ing.Annotations["alb.ingress.kubernetes.io/healthcheck-path"] = "/healthz"
 
 	dep := &appsv1.Deployment{ObjectMeta: meta("app", "web", "dep-web"), Spec: appsv1.DeploymentSpec{
 		Replicas: ptr(int32(3)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"},
@@ -345,20 +350,26 @@ func fixtureObjects() []runtime.Object {
 	}, Status: appsv1.DeploymentStatus{ReadyReplicas: 2, UpdatedReplicas: 3, AvailableReplicas: 2, Replicas: 3,
 		Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "NewReplicaSetAvailable", Message: longMsg, LastTransitionTime: t1, LastUpdateTime: t1}}}}
 	dep.Annotations["deployment.kubernetes.io/revision"] = "7"
+	dep.Labels["app.kubernetes.io/name"] = "web"
+	dep.Labels["app.kubernetes.io/part-of"] = "shop"
 	rs := &appsv1.ReplicaSet{ObjectMeta: meta("app", "web-5d8f", "rs-web"), Spec: appsv1.ReplicaSetSpec{
 		Replicas: ptr(int32(3)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web", "pod-template-hash": "5d8f"}}, Template: fixtureTemplate(),
 	}, Status: appsv1.ReplicaSetStatus{Replicas: 3, ReadyReplicas: 2,
 		Conditions: []appsv1.ReplicaSetCondition{{Type: appsv1.ReplicaSetReplicaFailure, Status: corev1.ConditionTrue, Message: longMsg}}}}
 	rs.OwnerReferences = []metav1.OwnerReference{owner("Deployment", "web", "dep-web", true)}
+	rs.Annotations["deployment.kubernetes.io/revision"] = "7"
+	rs.Annotations["deployment.kubernetes.io/desired-replicas"] = "3"
 	orphanRS := &appsv1.ReplicaSet{ObjectMeta: meta("app", "orphan-1", "rs-orphan"), Spec: appsv1.ReplicaSetSpec{Template: fixtureTemplate()}}
 	sts := &appsv1.StatefulSet{ObjectMeta: meta("app", "crash", "sts-crash"), Spec: appsv1.StatefulSetSpec{
 		Replicas: ptr(int32(1)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "crash"}}, Template: fixtureTemplate(),
 		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}},
-	}, Status: appsv1.StatefulSetStatus{ReadyReplicas: 0, UpdatedReplicas: 1,
+	}, Status: appsv1.StatefulSetStatus{ReadyReplicas: 0, UpdatedReplicas: 1, CurrentRevision: "crash-5c3e", UpdateRevision: "crash-6d4f",
 		Conditions: []appsv1.StatefulSetCondition{{Type: "Odd", Status: corev1.ConditionFalse, Message: longMsg}}}}
 	ds := &appsv1.DaemonSet{ObjectMeta: meta("kube-system", "agent", "ds-agent"), Spec: appsv1.DaemonSetSpec{
 		Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "agent"}}, Template: fixtureTemplate(),
 	}, Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, NumberReady: 3, UpdatedNumberScheduled: 3, NumberAvailable: 3}}
+	ds.Annotations[appsv1.DeprecatedTemplateGeneration] = "4"
+	ds.Labels["k8s-app"] = "agent"
 	job := &batchv1.Job{ObjectMeta: meta("app", "backup-29000", "job-backup"), Spec: batchv1.JobSpec{
 		Completions: ptr(int32(2)), Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"batch.kubernetes.io/controller-uid": "job-backup"}},
 		Template: fixtureTemplate(),
@@ -398,7 +409,16 @@ func fixtureObjects() []runtime.Object {
 	}}
 	otherCM := &corev1.ConfigMap{ObjectMeta: meta(awsAuthNamespace, "coredns", "cm-coredns"), Data: map[string]string{"Corefile": ".:53 {}"}}
 
-	return append(objs, nsApp, nsSys, data, scratch, pvCSI, pvInTree, pvHost, gp3, efs, svc, headless, slice, ing,
+	// Service accounts: only the one with an IRSA role is kept.
+	saWeb := &corev1.ServiceAccount{ObjectMeta: meta("app", "web", "sa-web"),
+		Secrets:          []corev1.ObjectReference{{Name: "web-token-abcde"}},
+		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}}, AutomountServiceAccountToken: ptr(false)}
+	saWeb.Annotations[irsaRoleAnnotation] = "arn:aws:iam::123456789012:role/web"
+	saDefault := &corev1.ServiceAccount{ObjectMeta: meta("app", "default", "sa-default")}
+	saBlank := &corev1.ServiceAccount{ObjectMeta: meta("app", "blank", "sa-blank")}
+	saBlank.Annotations[irsaRoleAnnotation] = " "
+
+	return append(objs, saWeb, saDefault, saBlank, nsApp, nsSys, data, scratch, pvCSI, pvInTree, pvHost, gp3, efs, svc, headless, slice, ing,
 		dep, rs, orphanRS, sts, ds, job, cj, role, crole, empty, rb, crb, awsAuth, otherCM)
 }
 
@@ -454,10 +474,44 @@ func certObjects() []runtime.Object {
 	return []runtime.Object{cert, issuer, clusterIssuer, request}
 }
 
-// certListKinds registers the cert-manager list kinds with the dynamic fake.
+// tgbObjects are AWS Load Balancer Controller TargetGroupBindings: one by
+// port number, one by port name, with the fields kubesentry does not read.
+func tgbObjects() []runtime.Object {
+	tgb := func(ns, name, uid, arn string, port any) *unstructured.Unstructured {
+		return &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "elbv2.k8s.aws/v1beta1", "kind": "TargetGroupBinding",
+			"metadata": map[string]any{
+				"namespace": ns, "name": name, "uid": uid, "resourceVersion": "1", "generation": int64(2),
+				"creationTimestamp": t0.UTC().Format(time.RFC3339),
+				"labels":            map[string]any{"ingress.k8s.aws/stack": "shop"},
+				"annotations":       map[string]any{"kubectl.kubernetes.io/last-applied-configuration": "{}"},
+				"finalizers":        []any{"elbv2.k8s.aws/resources"},
+				"managedFields":     []any{map[string]any{"manager": "controller", "operation": "Update"}},
+			},
+			"spec": map[string]any{
+				"targetGroupARN": arn, "targetType": "ip", "ipAddressType": "ipv4",
+				"serviceRef": map[string]any{"name": name, "port": port},
+				"networking": map[string]any{"ingress": []any{map[string]any{
+					"from":  []any{map[string]any{"securityGroup": map[string]any{"groupID": "sg-0ccc"}}},
+					"ports": []any{map[string]any{"protocol": "TCP", "port": int64(8080)}},
+				}}},
+				"nodeSelector": map[string]any{"matchLabels": map[string]any{"pool": "web"}},
+			},
+			"status": map[string]any{"observedGeneration": int64(2)},
+		}}
+	}
+	return []runtime.Object{
+		tgb("app", "web", "tgb-web", "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-web-1a2b/0123456789abcdef", int64(80)),
+		tgb("app", "api", "tgb-api", "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/k8s-app-api-3c4d/fedcba9876543210", "http"),
+	}
+}
+
+// certListKinds registers the cert-manager and TargetGroupBinding list
+// kinds with the dynamic fake.
 var certListKinds = map[schema.GroupVersionResource]string{
-	certGVR("certificates"):        "CertificateList",
-	certGVR("issuers"):             "IssuerList",
-	certGVR("clusterissuers"):      "ClusterIssuerList",
-	certGVR("certificaterequests"): "CertificateRequestList",
+	certGVR("certificates"):                               "CertificateList",
+	certGVR("issuers"):                                    "IssuerList",
+	certGVR("clusterissuers"):                             "ClusterIssuerList",
+	certGVR("certificaterequests"):                        "CertificateRequestList",
+	targetGroupBindingAPI.gvr(targetGroupBindingResource): "TargetGroupBindingList",
 }

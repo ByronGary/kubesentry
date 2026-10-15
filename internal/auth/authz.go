@@ -173,9 +173,6 @@ func (a *SARAuthorizer) subject(id Identity) string {
 	return string(h.Sum(nil)[:16])
 }
 
-// capKey names the whole capability, Namespaced included: ViewAudit and
-// ViewClusterAudit share verb, group and resource, and a namespaced scope
-// must never answer for the cluster-wide capability (or the other way).
 // hasUserBindings reports whether any binding names the user as a subject,
 // so that ShareByGroups must not share their answers with their groups.
 // Candidates that cannot tell (no UserBindings) count as no: ShareByGroups
@@ -197,12 +194,16 @@ func (a *SARAuthorizer) candidatesReady() bool {
 	return true
 }
 
+// capKey names the whole capability, Subresource and Namespaced included:
+// ViewAudit and ViewClusterAudit share verb, group and resource, and a
+// namespaced scope must never answer for the cluster-wide capability (or the
+// other way); likewise get pods never answers for get pods/log.
 func capKey(c Capability) string {
 	ns := "cluster"
 	if c.Namespaced {
 		ns = "namespaced"
 	}
-	return c.Verb + "/" + c.Group + "/" + c.Resource + "/" + ns
+	return c.Verb + "/" + c.Group + "/" + c.Resource + "/" + c.Subresource + "/" + ns
 }
 
 func decisionKey(subj string, c Capability, ns string) string {
@@ -446,7 +447,7 @@ func (a *SARAuthorizer) review(ctx context.Context, id Identity, c Capability, n
 		return false, ctx.Err()
 	}
 	defer func() { <-a.sem }()
-	ok, err := a.Reviewer.Review(ctx, id.User, id.Groups, c.Verb, c.Group, c.Resource, ns)
+	ok, err := a.Reviewer.Review(ctx, id.User, id.Groups, c.Verb, c.Group, c.Resource, c.Subresource, ns)
 	switch {
 	case err != nil:
 		a.observeReview("error")
@@ -478,6 +479,8 @@ var uiCapabilities = []struct {
 	{"clusterAudit", ViewClusterAudit},
 	{"processes", ViewProcesses},
 	{"audit", ViewAudit},
+	{"podLogs", ViewPodLogs},
+	{"cloudtrail", ViewCloudTrail},
 }
 
 // Capabilities asks a for every capability the UI gates on and returns the

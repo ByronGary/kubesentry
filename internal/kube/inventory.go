@@ -37,53 +37,58 @@ func paginate(what string, list func(opts metav1.ListOptions) (string, error)) e
 }
 
 func (s *Source) listDeployments(ctx context.Context) ([]model.Workload, error) {
+	apps := s.appLabels()
 	return collect("deployments", func(o metav1.ListOptions) ([]appsv1.Deployment, string, error) {
 		l, err := s.cs.AppsV1().Deployments(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertDeployment)
+	}, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps) })
 }
 
 func (s *Source) listStatefulSets(ctx context.Context) ([]model.Workload, error) {
+	apps := s.appLabels()
 	return collect("statefulsets", func(o metav1.ListOptions) ([]appsv1.StatefulSet, string, error) {
 		l, err := s.cs.AppsV1().StatefulSets(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertStatefulSet)
+	}, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps) })
 }
 
 func (s *Source) listDaemonSets(ctx context.Context) ([]model.Workload, error) {
+	apps := s.appLabels()
 	return collect("daemonsets", func(o metav1.ListOptions) ([]appsv1.DaemonSet, string, error) {
 		l, err := s.cs.AppsV1().DaemonSets(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertDaemonSet)
+	}, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps) })
 }
 
 func (s *Source) listJobs(ctx context.Context) ([]model.Workload, error) {
+	apps := s.appLabels()
 	return collect("jobs", func(o metav1.ListOptions) ([]batchv1.Job, string, error) {
 		l, err := s.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertJob)
+	}, func(o *batchv1.Job) model.Workload { return convertJob(o, apps) })
 }
 
 func (s *Source) listCronJobs(ctx context.Context) ([]model.Workload, error) {
+	apps := s.appLabels()
 	return collect("cronjobs", func(o metav1.ListOptions) ([]batchv1.CronJob, string, error) {
 		l, err := s.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertCronJob)
+	}, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps) })
 }
 
 // ListWorkloads lists Deployments, StatefulSets, DaemonSets, Jobs and CronJobs.
@@ -123,10 +128,12 @@ func (s *Source) ListEndpointSlices(ctx context.Context) ([]model.EndpointSlice,
 	}, convertEndpointSlice)
 }
 
-func baseWorkload(kind string, m metav1.ObjectMeta, sel *metav1.LabelSelector, tpl *corev1.PodTemplateSpec) model.Workload {
+// baseWorkload reads what every workload kind has; apps picks the labels
+// kept (the app tags).
+func baseWorkload(kind string, m metav1.ObjectMeta, sel *metav1.LabelSelector, tpl *corev1.PodTemplateSpec, apps labelFilter) model.Workload {
 	w := model.Workload{
 		Kind: kind, Namespace: m.Namespace, Name: m.Name, UID: string(m.UID), Owners: convertOwners(m.OwnerReferences),
-		Created: m.CreationTimestamp.Time, Selector: convertSelector(sel),
+		Created: m.CreationTimestamp.Time, Selector: convertSelector(sel), Labels: apps.filter(m.Labels),
 	}
 	if tpl != nil {
 		w.Images = templateImages(tpl.Spec)
@@ -169,8 +176,9 @@ func replicas(p *int32) int32 {
 	return *p
 }
 
-func convertDeployment(d *appsv1.Deployment) model.Workload {
-	w := baseWorkload("Deployment", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template)
+func convertDeployment(d *appsv1.Deployment, apps labelFilter) model.Workload {
+	w := baseWorkload("Deployment", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps)
+	w.Revision = d.Annotations[revisionAnnotation]
 	w.Desired = replicas(d.Spec.Replicas)
 	w.Ready, w.Updated, w.Available = d.Status.ReadyReplicas, d.Status.UpdatedReplicas, d.Status.AvailableReplicas
 	w.Paused = d.Spec.Paused
@@ -180,8 +188,9 @@ func convertDeployment(d *appsv1.Deployment) model.Workload {
 	return w
 }
 
-func convertStatefulSet(s *appsv1.StatefulSet) model.Workload {
-	w := baseWorkload("StatefulSet", s.ObjectMeta, s.Spec.Selector, &s.Spec.Template)
+func convertStatefulSet(s *appsv1.StatefulSet, apps labelFilter) model.Workload {
+	w := baseWorkload("StatefulSet", s.ObjectMeta, s.Spec.Selector, &s.Spec.Template, apps)
+	w.Revision = s.Status.UpdateRevision
 	w.Desired = replicas(s.Spec.Replicas)
 	w.Ready, w.Updated, w.Available = s.Status.ReadyReplicas, s.Status.UpdatedReplicas, s.Status.AvailableReplicas
 	for _, c := range s.Status.Conditions {
@@ -190,8 +199,12 @@ func convertStatefulSet(s *appsv1.StatefulSet) model.Workload {
 	return w
 }
 
-func convertDaemonSet(d *appsv1.DaemonSet) model.Workload {
-	w := baseWorkload("DaemonSet", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template)
+// convertDaemonSet takes Revision from the template generation annotation:
+// DaemonSetStatus has no updateRevision, and the generation the API server
+// keeps there changes exactly when the pod template does.
+func convertDaemonSet(d *appsv1.DaemonSet, apps labelFilter) model.Workload {
+	w := baseWorkload("DaemonSet", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps)
+	w.Revision = d.Annotations[daemonSetGenerationAnnotation]
 	w.Desired, w.Ready = d.Status.DesiredNumberScheduled, d.Status.NumberReady
 	w.Updated, w.Available = d.Status.UpdatedNumberScheduled, d.Status.NumberAvailable
 	for _, c := range d.Status.Conditions {
@@ -200,8 +213,8 @@ func convertDaemonSet(d *appsv1.DaemonSet) model.Workload {
 	return w
 }
 
-func convertJob(j *batchv1.Job) model.Workload {
-	w := baseWorkload("Job", j.ObjectMeta, j.Spec.Selector, &j.Spec.Template)
+func convertJob(j *batchv1.Job, apps labelFilter) model.Workload {
+	w := baseWorkload("Job", j.ObjectMeta, j.Spec.Selector, &j.Spec.Template, apps)
 	w.Desired = replicas(j.Spec.Completions)
 	w.Succeeded, w.Failed, w.Active = j.Status.Succeeded, j.Status.Failed, j.Status.Active
 	if j.Status.Ready != nil {
@@ -213,8 +226,8 @@ func convertJob(j *batchv1.Job) model.Workload {
 	return w
 }
 
-func convertCronJob(c *batchv1.CronJob) model.Workload {
-	w := baseWorkload("CronJob", c.ObjectMeta, nil, &c.Spec.JobTemplate.Spec.Template)
+func convertCronJob(c *batchv1.CronJob, apps labelFilter) model.Workload {
+	w := baseWorkload("CronJob", c.ObjectMeta, nil, &c.Spec.JobTemplate.Spec.Template, apps)
 	w.Schedule = c.Spec.Schedule
 	w.Suspended = c.Spec.Suspend != nil && *c.Spec.Suspend
 	w.Active = int32(len(c.Status.Active))
@@ -231,6 +244,7 @@ func convertReplicaSet(r *appsv1.ReplicaSet) model.ReplicaSet {
 	return model.ReplicaSet{
 		Namespace: r.Namespace, Name: r.Name, UID: string(r.UID), Owners: convertOwners(r.OwnerReferences),
 		Desired: replicas(r.Spec.Replicas), Ready: r.Status.ReadyReplicas, Created: r.CreationTimestamp.Time,
+		Revision: r.Annotations[revisionAnnotation], Images: templateImages(r.Spec.Template.Spec),
 	}
 }
 
@@ -670,6 +684,10 @@ func (s *Source) Inventory(ctx context.Context) (model.Inventory, error) {
 	read("nodes", err)
 	inv.Namespaces, err = s.ListNamespaces(ctx)
 	read("namespaces", err)
+	inv.ServiceAccounts, err = s.listServiceAccounts(ctx)
+	read("serviceaccounts", err)
+	inv.TargetGroupBindings, err = s.targetGroupBindings(ctx, inv.Unavailable)
+	read(targetGroupBindingResource, err)
 	for _, r := range []struct {
 		name string
 		list func(context.Context) ([]model.Role, error)
