@@ -171,9 +171,6 @@ func (w *EventWatcher) Run(ctx context.Context, sink func([]model.KubeEvent)) er
 		case <-ctx.Done():
 			return nil
 		case ev := <-ch:
-			if buf == nil {
-				buf = make([]model.KubeEvent, 0, w.opts.BatchSize)
-			}
 			buf = append(buf, ev)
 			if len(buf) >= w.opts.BatchSize {
 				flush()
