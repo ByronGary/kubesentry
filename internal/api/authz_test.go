@@ -12,7 +12,8 @@ import (
 )
 
 // azFake answers from fixed tables: scopes[user][resource] and
-// cluster[user][resource].
+// cluster[user][resource]; a subresource is part of the resource
+// ("pods/log").
 type azFake struct {
 	scopes  map[string]map[string]auth.Scope
 	cluster map[string]map[string]bool
@@ -25,7 +26,14 @@ func (f *azFake) Scope(_ context.Context, id auth.Identity, c auth.Capability) (
 	if f.err != nil {
 		return auth.Scope{}, f.err
 	}
-	return f.scopes[id.User][c.Resource], nil
+	return f.scopes[id.User][azResource(c)], nil
+}
+
+func azResource(c auth.Capability) string {
+	if c.Subresource != "" {
+		return c.Resource + "/" + c.Subresource
+	}
+	return c.Resource
 }
 
 func (f *azFake) Allowed(_ context.Context, id auth.Identity, c auth.Capability, ns string) (bool, error) {
@@ -34,9 +42,9 @@ func (f *azFake) Allowed(_ context.Context, id auth.Identity, c auth.Capability,
 		return false, f.err
 	}
 	if ns == "" {
-		return f.cluster[id.User][c.Resource], nil
+		return f.cluster[id.User][azResource(c)], nil
 	}
-	return f.scopes[id.User][c.Resource].Has(ns), nil
+	return f.scopes[id.User][azResource(c)].Has(ns), nil
 }
 
 func azCtx(user string, unrestricted bool) context.Context {
@@ -54,7 +62,7 @@ func azScope(ns ...string) auth.Scope {
 func newAzFake() *azFake {
 	return &azFake{
 		scopes: map[string]map[string]auth.Scope{
-			"alice": {"pods": azScope("a", "b"), "processes": azScope("a")},
+			"alice": {"pods": azScope("a", "b"), "processes": azScope("a"), "pods/log": azScope("a", "b")},
 			"bob":   {"pods": azScope("b", "a")},
 			"carol": {"pods": azScope("c")},
 		},
@@ -149,6 +157,16 @@ func TestScopeKey(t *testing.T) {
 	}
 	if key("alice", auth.ViewNamespace, auth.ViewProcesses) == key("bob", auth.ViewNamespace, auth.ViewProcesses) {
 		t.Fatal("second namespaced capability ignored")
+	}
+	// get pods and get pods/log held in the same namespaces are still
+	// different capabilities: a response keyed on one must not serve the other.
+	getPods := auth.Capability{Verb: "get", Resource: "pods", Namespaced: true}
+	f.scopes["alice"]["pods"] = azScope("a", "b")
+	if key("alice", getPods) == key("alice", auth.ViewPodLogs) {
+		t.Fatal("subresource ignored")
+	}
+	if key("alice", auth.ViewNamespace, auth.ViewPodLogs) == key("bob", auth.ViewNamespace, auth.ViewPodLogs) {
+		t.Fatal("pod logs scope ignored")
 	}
 	if k, err := ScopeKey(azCtx("root", true), nil); k != "all" || err != nil {
 		t.Fatalf("unrestricted %q %v", k, err)

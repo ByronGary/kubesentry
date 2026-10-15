@@ -38,13 +38,16 @@ func (id Identity) Key() string {
 	return k
 }
 
-// Capability is one thing a page needs: a verb on a resource. Namespaced
-// capabilities are checked per namespace, others cluster-wide.
+// Capability is one thing a page needs: a verb on a resource, or on one of
+// its subresources (get pods/log). Namespaced capabilities are checked per
+// namespace, others cluster-wide.
 type Capability struct {
-	Verb       string
-	Group      string // API group; "" for core
-	Resource   string
-	Namespaced bool
+	Verb     string
+	Group    string // API group; "" for core
+	Resource string
+	// Subresource is "" for the resource itself, e.g. "log" for pods/log.
+	Subresource string
+	Namespaced  bool
 }
 
 // The capabilities kubesentry checks. The kubesentry.io resources are virtual:
@@ -62,6 +65,10 @@ var (
 	ViewRBAC          = Capability{Verb: "list", Group: "rbac.authorization.k8s.io", Resource: "rolebindings", Namespaced: true}
 	ViewClusterIssuer = Capability{Verb: "list", Group: "cert-manager.io", Resource: "clusterissuers"}
 	ViewAgents        = Capability{Verb: "list", Group: "kubesentry.io", Resource: "agents"}
+	// ViewPodLogs is what kubectl logs needs; the built-in view role grants it.
+	ViewPodLogs = Capability{Verb: "get", Resource: "pods", Subresource: "log", Namespaced: true}
+	// ViewCloudTrail gates AWS CloudTrail events (cluster-wide).
+	ViewCloudTrail = Capability{Verb: "list", Group: "kubesentry.io", Resource: "cloudtrail"}
 )
 
 // Scope is the set of namespaces a capability is granted in.
@@ -89,10 +96,11 @@ type Authorizer interface {
 }
 
 // Reviewer performs one SubjectAccessReview. internal/kube implements it;
-// verb, group, resource and namespace are as in authorization.k8s.io/v1
-// ResourceAttributes ("" namespace means cluster-wide).
+// verb, group, resource, subresource and namespace are as in
+// authorization.k8s.io/v1 ResourceAttributes ("" subresource means the
+// resource itself, "" namespace means cluster-wide).
 type Reviewer interface {
-	Review(ctx context.Context, user string, groups []string, verb, group, resource, namespace string) (bool, error)
+	Review(ctx context.Context, user string, groups []string, verb, group, resource, subresource, namespace string) (bool, error)
 }
 
 // Candidates proposes the namespaces worth checking for an identity, from an

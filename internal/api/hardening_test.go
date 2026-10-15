@@ -413,9 +413,9 @@ type countingReviewer struct {
 	n atomic.Int64
 }
 
-func (c *countingReviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, ns string) (bool, error) {
+func (c *countingReviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, subresource, ns string) (bool, error) {
 	c.n.Add(1)
-	return c.grantReviewer.Review(ctx, user, groups, verb, group, resource, ns)
+	return c.grantReviewer.Review(ctx, user, groups, verb, group, resource, subresource, ns)
 }
 
 // Every distinct namespace name in a pod path once cost a

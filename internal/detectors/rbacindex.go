@@ -16,6 +16,7 @@ import (
 //
 // Only rules that grant on whole resources count: a rule restricted by
 // resourceNames does not let anyone list, and nonResourceURLs are ignored.
+// Subresources match as the API server's RBAC authorizer matches them.
 // Aggregated ClusterRoles are read as the API server stores them, with the
 // aggregated rules filled in.
 type RBACIndex struct {
@@ -172,7 +173,26 @@ func (x *RBACIndex) grants(role string, c auth.Capability) bool {
 }
 
 func ruleAllows(r model.PolicyRule, c auth.Capability) bool {
-	return matchesOrStar(r.Verbs, c.Verb) && matchesOrStar(r.APIGroups, c.Group) && matchesOrStar(r.Resources, c.Resource)
+	return matchesOrStar(r.Verbs, c.Verb) && matchesOrStar(r.APIGroups, c.Group) && resourceMatches(r.Resources, c.Resource, c.Subresource)
+}
+
+// resourceMatches is Kubernetes' RBAC ResourceMatches: "*" matches
+// everything, "pods" only the pods themselves, "pods/log" only their logs,
+// and "*/log" the log subresource of any resource.
+func resourceMatches(rules []string, resource, subresource string) bool {
+	combined := resource
+	if subresource != "" {
+		combined += "/" + subresource
+	}
+	for _, r := range rules {
+		if r == "*" || r == combined {
+			return true
+		}
+		if subresource != "" && r == "*/"+subresource {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesOrStar(list []string, v string) bool {

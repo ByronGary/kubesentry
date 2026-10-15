@@ -14,7 +14,8 @@ import (
 )
 
 // fakeReviewer grants "resource@namespace" to users and groups; a grant in
-// namespace "" is cluster-wide and covers every namespace.
+// namespace "" is cluster-wide and covers every namespace. A subresource is
+// granted as "resource/subresource" (pods/log).
 type fakeReviewer struct {
 	mu     sync.Mutex
 	grants map[string]map[string]bool // subject -> resource@ns
@@ -43,7 +44,10 @@ func (f *fakeReviewer) grant(subject, resource, ns string) {
 	f.grants[subject][resource+"@"+ns] = true
 }
 
-func (f *fakeReviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, ns string) (bool, error) {
+func (f *fakeReviewer) Review(ctx context.Context, user string, groups []string, verb, group, resource, subresource, ns string) (bool, error) {
+	if subresource != "" {
+		resource += "/" + subresource
+	}
 	n := f.inflight.Add(1)
 	defer f.inflight.Add(-1)
 	for {
@@ -110,7 +114,7 @@ func (f fakeCandidates) Namespaces(user string, _ []string, _ Capability) []stri
 type podCandidates map[string][]string
 
 func (f podCandidates) Namespaces(user string, _ []string, c Capability) []string {
-	if c.Resource != "pods" {
+	if c.Resource != "pods" || c.Subresource != "" {
 		return nil
 	}
 	return f[user]
@@ -275,7 +279,7 @@ func TestUnrestrictedSkipsReviews(t *testing.T) {
 		t.Fatal("not allowed")
 	}
 	caps := a.Capabilities(ctx, id)
-	if len(caps) != 9 {
+	if len(caps) != len(uiCapabilities) || len(caps) != 11 {
 		t.Fatalf("caps %v", caps)
 	}
 	for k, v := range caps {
@@ -513,11 +517,13 @@ func TestCapabilities(t *testing.T) {
 	rv.grant("viewers", "nodes", "")
 	rv.grant("alice", "processes", "a")
 	rv.grant("alice", "auditevents", "b") // not a candidate: the UI flag needs a candidate
+	rv.grant("alice", "pods/log", "a")
+	rv.grant("viewers", "cloudtrail", "")
 	a, _ := newAuthz(rv, fakeCandidates{"alice": {"a"}})
 	got := a.Capabilities(ctx, user("alice", "viewers"))
 	want := map[string]bool{
 		"nodes": true, "pvs": false, "storageClasses": false, "clusterRBAC": false, "clusterIssuers": false,
-		"agents": false, "clusterAudit": false, "processes": true, "audit": false,
+		"agents": false, "clusterAudit": false, "processes": true, "audit": false, "podLogs": true, "cloudtrail": true,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)
@@ -700,7 +706,7 @@ func TestCacheIsBounded(t *testing.T) {
 // list pods in 1-10 namespaces through bindings the RBAC index proposes,
 // plus up to 3 candidates whose bound role does not grant it. Each
 // iteration is one page view: Scope(ViewNamespace), Allowed on one of the
-// user's namespaces, and the nine UI capability flags.
+// user's namespaces, and the eleven UI capability flags.
 //
 // Reported: reviews/identity-cold is the cost of a user's first page view;
 // hit-rate is the share of cache lookups answered without a review once
@@ -823,6 +829,45 @@ func TestScopeKeyIncludesNamespaced(t *testing.T) {
 	}
 	if capKey(ViewAudit) == capKey(ViewClusterAudit) {
 		t.Error("capKey does not tell ViewAudit and ViewClusterAudit apart")
+	}
+}
+
+// get pods and get pods/log share verb, group and resource; a cached answer
+// for the pod must never answer for its logs (or the other way).
+func TestCacheKeysIncludeSubresource(t *testing.T) {
+	getPods := Capability{Verb: "get", Resource: "pods", Namespaced: true}
+	if capKey(getPods) == capKey(ViewPodLogs) {
+		t.Fatal("capKey does not tell get pods and get pods/log apart")
+	}
+	if decisionKey("s", getPods, "a") == decisionKey("s", ViewPodLogs, "a") || scopeKey("s", getPods) == scopeKey("s", ViewPodLogs) {
+		t.Fatal("cache keys do not include the subresource")
+	}
+
+	rv := newFakeReviewer()
+	rv.grant("alice", "pods", "a") // get pods, not their logs
+	rv.grant("bob", "pods/log", "a")
+	a, _ := newAuthz(rv, fakeCandidates{"alice": {"a"}, "bob": {"a"}})
+	alice, bob := user("alice"), user("bob")
+	if s, err := a.Scope(ctx, alice, getPods); err != nil || !s.Has("a") {
+		t.Fatalf("alice get pods scope = %+v, %v", s, err)
+	}
+	if ok, _ := a.Allowed(ctx, alice, getPods, "a"); !ok {
+		t.Fatal("alice get pods denied")
+	}
+	if s, err := a.Scope(ctx, alice, ViewPodLogs); err != nil || s.All || len(s.Namespaces) != 0 {
+		t.Errorf("alice pod logs scope = %+v, %v; want nothing", s, err)
+	}
+	if ok, _ := a.Allowed(ctx, alice, ViewPodLogs, "a"); ok {
+		t.Error("alice reads logs from her get pods grant")
+	}
+	if rv.count("alice", "pods/log", "a") != 1 {
+		t.Errorf("pods/log in a reviewed %d times, want 1 (then cached)", rv.count("alice", "pods/log", "a"))
+	}
+	if ok, _ := a.Allowed(ctx, bob, ViewPodLogs, "a"); !ok {
+		t.Error("bob's pods/log grant denied")
+	}
+	if ok, _ := a.Allowed(ctx, bob, getPods, "a"); ok {
+		t.Error("bob gets pods from his pods/log grant")
 	}
 }
 

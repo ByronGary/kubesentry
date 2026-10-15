@@ -210,7 +210,7 @@ func ScopeKey(ctx context.Context, a auth.Authorizer, caps ...auth.Capability) (
 	h := sha256.New()
 	var names []string
 	for _, c := range caps {
-		h.Write([]byte(c.Verb + "/" + c.Group + "/" + c.Resource + "/" + strconv.FormatBool(c.Namespaced) + "="))
+		h.Write([]byte(c.Verb + "/" + c.Group + "/" + c.Resource + "/" + c.Subresource + "/" + strconv.FormatBool(c.Namespaced) + "="))
 		if !c.Namespaced {
 			ok, err := allowedErr(ctx, a, c, "")
 			if err != nil {

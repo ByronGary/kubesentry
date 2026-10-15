@@ -23,7 +23,8 @@ func TestReviewer(t *testing.T) {
 			return true, nil, errors.New("apiserver unavailable")
 		}
 		ra := r.Spec.ResourceAttributes
-		r.Status.Allowed = r.Spec.User == "erin" && ra.Verb == "list" && ra.Resource == "pods" && ra.Namespace == "app"
+		r.Status.Allowed = r.Spec.User == "erin" && ra.Resource == "pods" && ra.Namespace == "app" &&
+			((ra.Verb == "list" && ra.Subresource == "") || (ra.Verb == "get" && ra.Subresource == "log"))
 		r.Status.Denied = r.Spec.User == "mallory"
 		if r.Spec.User == "mallory" {
 			r.Status.Allowed = true // a conflicting answer still fails closed
@@ -36,7 +37,7 @@ func TestReviewer(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	ok, err := rv.Review(ctx, "erin", []string{"devs", "system:authenticated"}, "list", "", "pods", "app")
+	ok, err := rv.Review(ctx, "erin", []string{"devs", "system:authenticated"}, "list", "", "pods", "", "app")
 	if err != nil || !ok {
 		t.Fatalf("erin in app: %v, %v", ok, err)
 	}
@@ -45,13 +46,25 @@ func TestReviewer(t *testing.T) {
 	if !reflect.DeepEqual(seen[0], want) {
 		t.Errorf("review spec: %+v", seen[0])
 	}
-	if ok, err := rv.Review(ctx, "erin", nil, "list", "", "pods", "other"); err != nil || ok {
+	if ok, err := rv.Review(ctx, "erin", nil, "list", "", "pods", "", "other"); err != nil || ok {
 		t.Errorf("erin in other: %v, %v", ok, err)
 	}
-	if ok, err := rv.Review(ctx, "mallory", nil, "list", "", "pods", "app"); err != nil || ok {
+	// A subresource travels in ResourceAttributes.Subresource, not folded
+	// into Resource.
+	if ok, err := rv.Review(ctx, "erin", nil, "get", "", "pods", "log", "app"); err != nil || !ok {
+		t.Errorf("erin pods/log in app: %v, %v", ok, err)
+	}
+	wantLog := authorizationv1.ResourceAttributes{Verb: "get", Resource: "pods", Subresource: "log", Namespace: "app"}
+	if got := seen[len(seen)-1].ResourceAttributes; got == nil || *got != wantLog {
+		t.Errorf("subresource attributes: %+v", got)
+	}
+	if ok, err := rv.Review(ctx, "erin", nil, "get", "", "pods", "", "app"); err != nil || ok {
+		t.Errorf("erin get pods (no subresource) in app: %v, %v", ok, err)
+	}
+	if ok, err := rv.Review(ctx, "mallory", nil, "list", "", "pods", "", "app"); err != nil || ok {
 		t.Errorf("denied: %v, %v", ok, err)
 	}
-	if ok, err := rv.Review(ctx, "boom", nil, "get", "kubesentry.io", "processes", "app"); err == nil || ok {
+	if ok, err := rv.Review(ctx, "boom", nil, "get", "kubesentry.io", "processes", "", "app"); err == nil || ok {
 		t.Errorf("failed review: %v, %v", ok, err)
 	}
 	if got := seen[len(seen)-1].ResourceAttributes; got.Group != "kubesentry.io" || got.Resource != "processes" || got.Verb != "get" {
