@@ -39,7 +39,7 @@ const (
 //   - load balancer names (Ingress group.name and load-balancer-name, the
 //     Service load-balancer-name annotation) to the roots behind the
 //     Services they route to;
-//   - IRSA role ARNs and names (ServiceAccounts) to the roots of the pods
+//   - IRSA role ARNs and role/<name> (ServiceAccounts) to the roots of the pods
 //     running as the account;
 //   - security group IDs (ALB and NLB annotations) to the roots behind the
 //     Ingress or Service;
@@ -148,7 +148,7 @@ func buildRelated(v *snapshot.View, cluster string) *RelatedIndex {
 		}
 		add(sa.RoleARN, RelatedRole, subjects...)
 		if i := strings.LastIndexByte(sa.RoleARN, '/'); i >= 0 {
-			add(sa.RoleARN[i+1:], RelatedRole, subjects...)
+			add("role/"+sa.RoleARN[i+1:], RelatedRole, subjects...) // the short form CloudTrail sources give
 		}
 	}
 	for _, r := range x.ids {
@@ -201,6 +201,10 @@ func instanceID(providerID string) string {
 // Match returns the subjects a CloudTrail event concerns, with the
 // identifiers that matched ("instance:i-0abc"). cluster is true for a
 // change to the EKS cluster itself, its node groups or add-ons.
+//
+// Resources come as full ARNs, bare instance and security group IDs,
+// targetgroup/<name>/<id>, role/<roleName>, and for EKS cluster/<name>,
+// nodegroup/<cluster>/<name> and addon/<cluster>/<name>.
 func (x *RelatedIndex) Match(e *CloudTrailEvent) (subjects []Subject, matched []string, cluster bool) {
 	seenID := map[string]bool{}
 	for _, r := range e.Resources {
@@ -217,9 +221,9 @@ func (x *RelatedIndex) Match(e *CloudTrailEvent) (subjects []Subject, matched []
 					}
 				}
 			}
-			if x.cluster != "" && e.Source == "eks.amazonaws.com" && id == x.cluster {
-				cluster = true
-			}
+		}
+		if x.cluster != "" && e.Source == "eks.amazonaws.com" && eksCluster(r) == x.cluster {
+			cluster = true
 		}
 	}
 	if cluster {
@@ -230,41 +234,66 @@ func (x *RelatedIndex) Match(e *CloudTrailEvent) (subjects []Subject, matched []
 	return subjects, matched, cluster
 }
 
-// candidates are the identifiers one resource string may stand for: itself,
-// and for an ARN its resource part and the names within it
-// (loadbalancer/app/<name>/<id>, targetgroup/<name>/<id>, role/<path>/<name>,
-// cluster/<name>, nodegroup/<cluster>/..., addon/<cluster>/...).
+// resourcePart is an ARN's resource (after the fifth colon), or r itself.
+func resourcePart(r string) string {
+	if !strings.HasPrefix(r, "arn:") {
+		return r
+	}
+	parts := strings.SplitN(r, ":", 6)
+	if len(parts) < 6 {
+		return r
+	}
+	return parts[5]
+}
+
+// candidates are the index keys one resource string may stand for: itself,
+// an ARN's resource part, and the IDs and names within it
+// (instance/<id>, security-group/<id>, loadbalancer/app/<name>/<id>,
+// role/<path>/<name> as role/<name>).
 func candidates(r string) []string {
 	r = strings.TrimSpace(r)
 	if r == "" {
 		return nil
 	}
 	out := []string{r}
-	if !strings.HasPrefix(r, "arn:") {
-		return out
+	res := resourcePart(r)
+	if res != r {
+		out = append(out, res)
 	}
-	parts := strings.SplitN(r, ":", 6)
-	if len(parts) < 6 {
-		return out
-	}
-	res := parts[5]
-	out = append(out, res)
 	segs := strings.Split(res, "/")
 	switch segs[0] {
 	case "loadbalancer":
 		if len(segs) >= 3 {
 			out = append(out, segs[2]) // loadbalancer/app/<name>/<id>
 		}
-	case "cluster", "nodegroup", "addon", "fargateprofile", "identityproviderconfig", "podidentityassociation", "access-entry":
+	case "instance", "security-group":
 		if len(segs) >= 2 {
-			out = append(out, segs[1]) // the cluster's name
+			out = append(out, segs[len(segs)-1])
+		}
+	case "role":
+		if len(segs) >= 2 {
+			out = append(out, "role/"+segs[len(segs)-1])
 		}
 	}
-	if last := segs[len(segs)-1]; last != res {
-		out = append(out, last)
-	}
-	if i := strings.LastIndexByte(res, ':'); i >= 0 {
-		out = append(out, res[i+1:])
-	}
 	return out
+}
+
+// eksCluster is the cluster an EKS resource names: cluster/<name>,
+// nodegroup/<cluster>/..., addon/<cluster>/... (bare or in an ARN), or a
+// bare name.
+func eksCluster(r string) string {
+	r = strings.TrimSpace(r)
+	res := resourcePart(r)
+	segs := strings.Split(res, "/")
+	if len(segs) >= 2 {
+		switch segs[0] {
+		case "cluster", "nodegroup", "addon", "fargateprofile", "identityproviderconfig", "podidentityassociation", "access-entry":
+			return segs[1]
+		}
+		return ""
+	}
+	if res != r {
+		return ""
+	}
+	return r
 }
