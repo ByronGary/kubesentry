@@ -11,7 +11,8 @@ package demo
 //     balancer's security group, and error logs kept coming after the
 //     request spike ended.
 //   - recommendations (prod), open and critical: release 4.0.0 was OOM
-//     killed on its first start and has crash-looped since.
+//     killed on its first start and has crash-looped since; the alert on
+//     its crash loop (alerts.go, acknowledged by dave) joined it.
 //   - catalog-api (prod), resolved: 8% of its requests failed for twelve
 //     minutes six hours ago; its error logs ran on past the end, inside
 //     the padded window.
@@ -151,7 +152,7 @@ func (s *story) signals() []incidents.Signal {
 		`"userIdentity":{"type":"AssumedRole","arn":"arn:aws:sts::111122223333:assumed-role/NetworkAdmin/jordan"},` +
 		`"requestParameters":{"groupId":"` + albSG + `","ipPermissions":{"items":[{"ipProtocol":"tcp","fromPort":8443,"toPort":8443,` +
 		`"ipRanges":{"items":[{"cidrIp":"0.0.0.0/0","description":"temp debug"}]}}]}}}`
-	return []incidents.Signal{
+	return append([]incidents.Signal{
 		// checkout-web.
 		{ID: "view:deploy:Deployment/prod/checkout-web@14", Type: incidents.TypeDeploy, Source: incidents.SourceView, Role: incidents.Context,
 			Start: s.ago(webDeployAgo), Subject: web, Object: model.ObjectRef{Kind: "Deployment", Namespace: "prod", Name: "checkout-web"},
@@ -234,7 +235,7 @@ func (s *story) signals() []incidents.Signal {
 			Role: incidents.Context, Start: s.ago(catErrAgo), End: tp(s.ago(catLogsEnd)), Subject: cat, Object: s.pod(catalogPod),
 			Value: fp(9), Baseline: fp(0.2), Count: 96, Title: "96 error log lines, up to 9 a minute (0.2 before the incident)",
 			Attrs: map[string]string{"incident": catID, "source": "kubernetes"}},
-	}
+	}, alertSignals(s.t0)...)
 }
 
 // runTimeline feeds the signals to an engine minute by minute, on a clock

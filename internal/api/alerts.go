@@ -283,6 +283,9 @@ type infoAlerts struct {
 	// they are off).
 	LastDigestAt *time.Time `json:"lastDigestAt,omitempty"`
 	NextDigestAt *time.Time `json:"nextDigestAt,omitempty"`
+	// MaxSilenceSeconds is the longest silence an action may ask for
+	// (-alerts-max-silence), so the UI can check a duration before sending.
+	MaxSilenceSeconds int64 `json:"maxSilenceSeconds,omitempty"`
 }
 
 func (s *Server) infoAlerts() *infoAlerts {
@@ -290,7 +293,8 @@ func (s *Server) infoAlerts() *infoAlerts {
 		return &infoAlerts{Sink: "none"}
 	}
 	st := s.Alerts.Status()
-	out := &infoAlerts{Enabled: true, Sink: st.Sink, Leader: st.Leader, LastError: st.LastError}
+	out := &infoAlerts{Enabled: true, Sink: st.Sink, Leader: st.Leader, LastError: st.LastError,
+		MaxSilenceSeconds: int64(s.Alerts.MaxSilence() / time.Second)}
 	if out.Sink == "" {
 		out.Sink = "none"
 	}
@@ -316,6 +320,19 @@ type overviewAlerts struct {
 	Acknowledged int            `json:"acknowledged"`
 	Silenced     int            `json:"silenced"`
 	ByOwner      map[string]int `json:"byOwner"`
+
+	// For the sidebar badge (badges.alerts): open findings that notify on
+	// their own (not quiet), and whether one of them is critical.
+	loud     int
+	critical bool
+}
+
+// badge is the sidebar's alerts badge; ok is false when nothing is open.
+func (a *overviewAlerts) badge() (badge, bool) {
+	if a == nil || a.loud == 0 {
+		return badge{}, false
+	}
+	return badge{Count: a.loud, Severity: worse(a.critical)}, true
 }
 
 // overviewAlerts counts the board's unresolved findings the caller may see
@@ -349,6 +366,10 @@ func (s *Server) overviewAlerts(r *http.Request, sel *ovSel) *overviewAlerts {
 		switch f.State {
 		case alerts.StateOpen:
 			out.Open++
+			if !f.Quiet {
+				out.loud++
+				out.critical = out.critical || f.Severity == alerts.SeverityCritical
+			}
 		case alerts.StateAcknowledged:
 			out.Acknowledged++
 		case alerts.StateSilenced:

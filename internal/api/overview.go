@@ -736,6 +736,9 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.History, resp.Security.NewSince24h = s.overviewHistory(now, sel, base.security)
 	resp.Alerts = s.overviewAlerts(r, sel)
+	if b, ok := resp.Alerts.badge(); ok {
+		resp.Badges["alerts"] = b
+	}
 	if resp.Incidents = incCounts; incCounts != nil {
 		if n := incCounts.Open.Critical + incCounts.Open.Warning; n > 0 {
 			resp.Badges["incidents"] = badge{Count: n, Severity: worse(incCounts.Open.Critical > 0)}

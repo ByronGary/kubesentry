@@ -220,10 +220,16 @@ func TestAlertsRouteScopeFiltersAndPaging(t *testing.T) {
 	if ov.Alerts == nil || ov.Alerts.Open != 2 || ov.Alerts.ByOwner["platform"] != 1 || ov.Alerts.ByOwner["team-beta"] != 1 {
 		t.Errorf("bob's overview alerts = %+v", ov.Alerts)
 	}
+	if ov.Badges["alerts"] != (badge{Count: 2, Severity: "crit"}) {
+		t.Errorf("bob's alerts badge = %+v", ov.Badges["alerts"])
+	}
 	ov = overviewResponse{}
 	getAs(t, h, "bob", "/api/v1/overview?namespace=team-b", &ov)
 	if ov.Alerts == nil || ov.Alerts.Open != 1 || ov.Alerts.ByOwner["platform"] != 0 {
 		t.Errorf("bob's filtered overview alerts (cluster findings left out) = %+v", ov.Alerts)
+	}
+	if ov.Badges["alerts"] != (badge{Count: 1, Severity: "crit"}) {
+		t.Errorf("bob's filtered alerts badge = %+v", ov.Badges["alerts"])
 	}
 }
 
@@ -255,7 +261,8 @@ func TestInfoAlerts(t *testing.T) {
 	s.Alerts.(*staticAlerts).status = alerts.Status{Sink: "alertmanager", LastSentAt: sent, LastError: "alertmanager 2 of 2: HTTP 503 Service Unavailable", Leader: true}
 	getAs(t, s.Handler(), "", "/api/v1/info", &info)
 	if a := info.Alerts; a == nil || !a.Enabled || a.Sink != "alertmanager" || a.LastSentAt == nil || !a.LastSentAt.Equal(sent) || !a.Leader ||
-		a.LastError != "alertmanager 2 of 2: HTTP 503 Service Unavailable" || a.LastDigestAt != nil || a.NextDigestAt != nil {
+		a.LastError != "alertmanager 2 of 2: HTTP 503 Service Unavailable" || a.LastDigestAt != nil || a.NextDigestAt != nil ||
+		a.MaxSilenceSeconds != int64(alerts.DefaultMaxSilence/time.Second) {
 		t.Errorf("info.alerts = %+v", info.Alerts)
 	}
 	// Standing digests: when the last went out and the next is due.
@@ -270,7 +277,7 @@ func TestInfoAlerts(t *testing.T) {
 	s.Alerts = nil
 	info = infoResponse{}
 	getAs(t, s.Handler(), "", "/api/v1/info", &info)
-	if a := info.Alerts; a == nil || a.Enabled || a.Sink != "none" {
+	if a := info.Alerts; a == nil || a.Enabled || a.Sink != "none" || a.MaxSilenceSeconds != 0 {
 		t.Errorf("disabled info.alerts = %+v", info.Alerts)
 	}
 	if rec := getAs(t, s.Handler(), "", "/api/v1/alerts", nil); rec.Code != 404 {
@@ -278,7 +285,7 @@ func TestInfoAlerts(t *testing.T) {
 	}
 	var ov overviewResponse
 	getAs(t, s.Handler(), "", "/api/v1/overview", &ov)
-	if ov.Alerts != nil {
-		t.Errorf("overview alerts with alerting off = %+v", ov.Alerts)
+	if _, ok := ov.Badges["alerts"]; ov.Alerts != nil || ok {
+		t.Errorf("overview alerts with alerting off = %+v, badge %v", ov.Alerts, ok)
 	}
 }

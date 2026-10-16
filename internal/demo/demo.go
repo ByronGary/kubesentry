@@ -50,6 +50,11 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The incidents' clock: whole seconds, so the alert episodes they hold match.
+	al, err := NewAlerts(ctx, now.Truncate(time.Second))
+	if err != nil {
+		return nil, err
+	}
 
 	return &api.Server{
 		History:       hist,
@@ -62,6 +67,7 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 		Audit:         ing,
 		Incidents:     inc,
 		IncidentStore: incStore,
+		Alerts:        demoAlerts{al},
 		UI:            ui,
 		Demo:          true,
 		PVCOptions:    detectors.PVCOptions{MinAge: 24 * time.Hour},
