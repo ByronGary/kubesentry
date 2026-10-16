@@ -35,6 +35,8 @@ type infoResponse struct {
 	Namespaces  *int              `json:"namespaces,omitempty"`
 	Unavailable map[string]string `json:"unavailable,omitempty"`
 	Alerts      *infoAlerts       `json:"alerts"`
+	// Incidents is left out when incidents are off.
+	Incidents *infoIncidents `json:"incidents,omitempty"`
 }
 
 type infoIdentity struct {
@@ -157,6 +159,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp.Prometheus = s.prometheusInfo()
+	resp.Incidents = s.infoIncidents(resp.Capabilities)
 
 	var fromView map[string]string
 	if v != nil {
