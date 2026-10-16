@@ -106,6 +106,14 @@ func (f *Finding) Resolved() bool { return f.State == StateResolved }
 // cluster-scoped).
 func (f *Finding) RBAC() bool { return f.Alert == AlertRBACDrift }
 
+// incidentURL is the incident link f carries ("" for nil).
+func (f *Finding) incidentURL() string {
+	if f == nil {
+		return ""
+	}
+	return f.Annotations[AnnotationIncidentURL]
+}
+
 // Clone returns a deep copy.
 func (f Finding) Clone() Finding {
 	f.Labels = maps.Clone(f.Labels)

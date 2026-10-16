@@ -13,6 +13,7 @@ import (
 
 	"github.com/ByronGary/kubesentry/internal/alerts"
 	"github.com/ByronGary/kubesentry/internal/auth"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 )
 
 // AlertsSource is the alerting runner (alerts.Runner).
@@ -28,10 +29,17 @@ const alertsRoute = "GET /api/v1/alerts"
 // alertsCaps is every capability /alerts depends on.
 var alertsCaps = []auth.Capability{auth.ViewNamespace, auth.ViewRBAC, auth.ViewClusterRBAC}
 
+// alertItem mirrors web/src/types.ts AlertFinding: a finding, and the
+// incident its current episode joined.
+type alertItem struct {
+	alerts.Finding
+	IncidentID string `json:"incidentId,omitempty"`
+}
+
 // alertsResponse mirrors web/src/types.ts AlertsResponse.
 type alertsResponse struct {
-	Count int              `json:"count"`
-	Items []alerts.Finding `json:"items"`
+	Count int         `json:"count"`
+	Items []alertItem `json:"items"`
 	// Counts covers every finding the caller can see, before the filters.
 	Counts    map[string]int `json:"counts"`
 	UpdatedAt *time.Time     `json:"updatedAt,omitempty"`
@@ -89,7 +97,7 @@ func (s *Server) alertsList(w http.ResponseWriter, r *http.Request) {
 	}
 	s.prepareAuthz(r)
 	as := s.alertScope(r)
-	resp := alertsResponse{Items: []alerts.Finding{}, Counts: map[string]int{
+	resp := alertsResponse{Items: []alertItem{}, Counts: map[string]int{
 		string(alerts.StateOpen): 0, string(alerts.StateAcknowledged): 0, string(alerts.StateSilenced): 0, string(alerts.StateResolved): 0,
 	}}
 	b := s.Alerts.Board()
@@ -125,23 +133,44 @@ func (s *Server) alertsList(w http.ResponseWriter, r *http.Request) {
 			resp.Continue = encodeToken("alerts", last)
 			break
 		}
-		resp.Items = append(resp.Items, *f)
+		resp.Items = append(resp.Items, alertItem{Finding: *f, IncidentID: s.incidentOfFinding(f)})
 		last = b.Keys[i]
 	}
 	resp.Count = len(resp.Items)
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// incidentOfFinding is the incident on this replica's board that the
+// finding's current episode joined, when it is in the finding's own
+// namespace: whoever may see the finding may then see the incident too
+// (both need ViewNamespace there), so the ID reveals nothing new.
+func (s *Server) incidentOfFinding(f *alerts.Finding) string {
+	if s.Incidents == nil || f.Namespace == "" {
+		return ""
+	}
+	b := s.Incidents.Board()
+	id, ok := b.IncidentOf(incidents.EpisodeID(f))
+	if !ok {
+		return ""
+	}
+	if in, ok := b.Get(id); !ok || in.Subject.Namespace != f.Namespace {
+		return ""
+	}
+	return id
+}
+
 // alertsCacheKey adds the board's version to /alerts' response cache key,
-// so a cached list never outlives the board it shows.
+// so a cached list never outlives the board it shows; and the incidents
+// board's version, since items name the incident their episode joined.
 func (s *Server) alertsCacheKey() string {
 	if s.Alerts == nil {
 		return ""
 	}
+	key := "a0"
 	if b := s.Alerts.Board(); b != nil {
-		return "a" + strconv.FormatUint(b.Version, 10)
+		key = "a" + strconv.FormatUint(b.Version, 10)
 	}
-	return "a0"
+	return key + s.incidentsCacheKey()
 }
 
 // infoAlerts is /info's alerts field (web/src/types.ts Info.alerts). The

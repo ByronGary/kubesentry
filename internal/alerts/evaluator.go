@@ -52,9 +52,19 @@ type Options struct {
 	// object exists; it then resolves and the object counts as standing
 	// state. Default 24h.
 	DriftHold time.Duration
+	// IncidentOf returns the ID of the incident the finding's current
+	// episode (its Key and FirstSeen) has joined, or "". With ExternalURL,
+	// the alert then links to it (the incident_url annotation). Nil links
+	// nothing; Runner.SetIncidentLookup sets it late.
+	IncidentOf func(f *Finding) string
 	// Now is the clock; default time.Now.
 	Now func() time.Time
 }
+
+// AnnotationIncidentURL is the annotation linking an alert to the incident
+// its episode joined. It is an annotation, never a label: a label change
+// would retire the alert in Alertmanager.
+const AnnotationIncidentURL = "incident_url"
 
 func (o *Options) defaults() {
 	if o.Resend <= 0 {
@@ -279,7 +289,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 			}
 			since = s
 		}
-		firstSeen[k] = since
+		// As Postgres keeps it, so the episode (key@firstSeen) reads the same
+		// on every replica, whether from this memory or from the store.
+		firstSeen[k] = NormalTime(since)
 		active = append(active, c)
 	}
 	for k := range e.pending {
@@ -301,11 +313,16 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		f := e.state[k]
 		if f == nil || f.Resolved() {
 			nf.State, nf.FirstSeen, nf.LastSeen = StateOpen, firstSeen[k], now
+			e.linkIncident(&nf, nil)
 			e.state[k] = &nf
 			dirty[k] = true
 			opened = append(opened, &nf)
 			continue
 		}
+		// Before the comparison below, so a link that stays the same is no
+		// change.
+		nf.FirstSeen = f.FirstSeen
+		e.linkIncident(&nf, f)
 		if f.State == StateSilenced && f.SilencedUntil != nil && !now.Before(*f.SilencedUntil) {
 			f.State, f.SilencedUntil = StateOpen, nil
 			dirty[k], fireNow[k] = true, true
@@ -524,6 +541,26 @@ func (e *Evaluator) build(c Candidate, nss map[string]nsInfo) Finding {
 	}
 	f.Labels, f.Annotations = l, a
 	return f
+}
+
+// linkIncident sets nf's incident_url annotation when there is an external
+// URL and its episode has joined an incident. A link once made stays while
+// the lookup knows no incident (the incident left the board, or a replica
+// is still reading it), so it does not come and go; prev is the episode's
+// finding so far (nil for a new episode).
+func (e *Evaluator) linkIncident(nf, prev *Finding) {
+	if e.o.ExternalURL == "" {
+		return
+	}
+	id := ""
+	if e.o.IncidentOf != nil {
+		id = e.o.IncidentOf(nf)
+	}
+	if id != "" {
+		nf.Annotations[AnnotationIncidentURL] = uilink.Absolute(e.o.ExternalURL, uilink.Incident(id))
+	} else if u := prev.incidentURL(); u != "" {
+		nf.Annotations[AnnotationIncidentURL] = u
+	}
 }
 
 // alertOf is f as Alertmanager takes it, ending at ends.

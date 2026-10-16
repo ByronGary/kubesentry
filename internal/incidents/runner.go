@@ -104,7 +104,25 @@ type Runner struct {
 
 	mu      sync.Mutex
 	sources map[string]string
+	initial map[string]string // as initSources set them
+	probed  map[string]string // each probed source's last probe
+	// eventsFailing is set while this replica's own event watch fails: Run
+	// returned an error, and has neither delivered a batch nor stayed up
+	// eventsUp since. A successful permission probe does not clear it.
+	eventsFailing bool
+
+	// The event watch counts as working once Run has stayed up eventsUp.
+	// After a failure it is tried again in eventsRetry, doubling after each
+	// quick failure up to eventsMaxRetry. Tests shorten them.
+	eventsUp, eventsRetry, eventsMaxRetry time.Duration
 }
+
+// Event watch timing (Runner.eventsUp, eventsRetry, eventsMaxRetry).
+const (
+	eventsUpAfter       = 30 * time.Second
+	eventsRetryAfter    = 10 * time.Second
+	eventsMaxRetryAfter = 5 * time.Minute
+)
 
 // ErrNotFound means no incident has the ID.
 var ErrNotFound = errors.New("incidents: no such incident")
@@ -135,7 +153,8 @@ func NewRunner(c Config) (*Runner, error) {
 		c.Logger = slog.Default()
 	}
 	r := &Runner{c: c, o: o, red: red, board: NewBoard(o.BoardWindow), log: c.Logger.With("component", "incidents"),
-		logSem: make(chan struct{}, 4), sources: map[string]string{}}
+		logSem: make(chan struct{}, 4), sources: map[string]string{}, initial: map[string]string{}, probed: map[string]string{},
+		eventsUp: eventsUpAfter, eventsRetry: eventsRetryAfter, eventsMaxRetry: eventsMaxRetryAfter}
 	r.initSources()
 	return r, nil
 }
@@ -155,9 +174,20 @@ func (r *Runner) Leader() bool { return r.leading.Load() }
 // Signals returns the signals of an incident on the board.
 func (r *Runner) Signals(id string) ([]Signal, bool) { return r.board.Signals(id) }
 
+// IncidentOfSignal returns the ID of the incident on the board holding the
+// signal (MemBoard.IncidentOf): with EpisodeID, an alert finding's incident.
+func (r *Runner) IncidentOfSignal(id string) (string, bool) { return r.board.IncidentOf(id) }
+
 // Sources reports each source's state for /info: "ok", "absent" or
-// "error: …". Keys: requests:<name>, memory, series, events, logs:<name>,
-// cloudtrail, audit, alerts.
+// "error: …". Keys: requests:<name>, memory, series, events, logs:<name>
+// (or logs, absent, without a log source), cloudtrail, audit, alerts. The
+// key set is fixed when the runner is made.
+//
+// Every replica probes the request, event, log and CloudTrail sources every
+// ProbeEvery. The leader also updates memory and the request sources from
+// its scans, audit from its polls, events from its watch and cloudtrail
+// from its polls; when leadership ends those go back to what the last probe
+// found, or to their initial state.
 func (r *Runner) Sources() map[string]string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -168,10 +198,65 @@ func (r *Runner) Sources() map[string]string {
 	return out
 }
 
+// Source reports one source's state, as Sources does ("" for an unknown
+// key).
+func (r *Runner) Source(k string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sources[k]
+}
+
 func (r *Runner) setSource(k, v string) {
 	r.mu.Lock()
 	r.sources[k] = v
 	r.mu.Unlock()
+}
+
+// setProbed records a probe's answer. A successful probe of the event
+// permission does not clear the error of a watch that fails on this
+// replica: the watch, retried, says when it works again.
+func (r *Runner) setProbed(k, v string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.probed[k] = v
+	if k == "events" && v == "ok" && r.eventsFailing {
+		return
+	}
+	r.sources[k] = v
+}
+
+// eventsWorking records that the event watch works: it delivered a batch,
+// or has stayed up eventsUp.
+func (r *Runner) eventsWorking() {
+	r.mu.Lock()
+	r.eventsFailing = false
+	r.sources["events"] = "ok"
+	r.mu.Unlock()
+}
+
+// eventsFailed records that the event watch stopped with err.
+func (r *Runner) eventsFailed(err error) {
+	r.mu.Lock()
+	r.eventsFailing = true
+	r.sources["events"] = "error: " + err.Error()
+	r.mu.Unlock()
+}
+
+// resetLeaderSources runs when leadership ends: what only the leader
+// updates (memory, audit, alerts, and the scans', polls' and watch's
+// findings about the others) goes back to the last probe's answer, or to
+// the initial state, so a follower does not keep reporting a leader's
+// failure it no longer sees.
+func (r *Runner) resetLeaderSources() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, v := range r.initial {
+		r.sources[k] = v
+	}
+	for k, v := range r.probed {
+		r.sources[k] = v
+	}
+	r.eventsFailing = false
 }
 
 func (r *Runner) initSources() {
@@ -197,20 +282,49 @@ func (r *Runner) initSources() {
 	if len(r.c.Logs) == 0 {
 		r.sources["logs"] = "absent"
 	}
+	for k, v := range r.sources {
+		r.initial[k] = v
+	}
 }
 
-// probe asks the sources that can tell whether they have data.
+// probe asks the sources that can tell whether they work: the request
+// sources, the event source, each log source and CloudTrail.
 func (r *Runner) probe(ctx context.Context) {
-	for _, s := range r.c.Rates {
+	run := func(k string, p Prober) {
 		pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		r.setSource("requests:"+s.Name(), s.Probe(pctx))
+		v := probeState(p.Probe(pctx))
 		cancel()
+		if ctx.Err() == nil {
+			r.setProbed(k, v)
+		}
+	}
+	for _, s := range r.c.Rates {
+		run("requests:"+s.Name(), s)
+	}
+	if p, ok := r.c.EventSource.(Prober); ok {
+		run("events", p)
+	}
+	for _, l := range r.c.Logs {
+		if p, ok := l.(Prober); ok {
+			run("logs:"+l.Name(), p)
+		}
 	}
 	if r.c.CloudTrail != nil {
-		pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		r.setSource("cloudtrail", r.c.CloudTrail.Probe(pctx))
-		cancel()
+		run("cloudtrail", r.c.CloudTrail)
 	}
+}
+
+// probeState reads a probe's answer as a source state: "ok", "absent" or
+// "error: …" (a bare reason such as "forbidden: cannot watch events" is an
+// error).
+func probeState(s string) string {
+	switch {
+	case s == "ok", s == "absent", isError(s):
+		return s
+	case s == "":
+		return "error: the probe gave no answer"
+	}
+	return "error: " + s
 }
 
 // Run leads (runs the engine and producers) or follows (refreshes the
@@ -362,7 +476,12 @@ func (r *Runner) lead(ctx context.Context, l Lease) {
 		}
 	}
 	r.setLeading(true)
-	defer r.setLeading(false)
+	defer func() {
+		// After the producers stopped (wg.Wait runs first), so none of them
+		// writes a source back.
+		r.resetLeaderSources()
+		r.setLeading(false)
+	}()
 	r.log.Info("incidents: this replica runs the engine", "open", len(eng.Open()))
 	// The producers map what they see through the view: until there is one,
 	// a poller would move its checkpoint past changes it could not place.
@@ -513,7 +632,7 @@ func (r *Runner) startProducers(ctx context.Context, wg *sync.WaitGroup, eng *En
 		every(ctx, wg, r.o.Interval, func() {
 			sigs := m.Scan(ctx, r.c.View(), r.o.Now())
 			for k, v := range m.Status() {
-				if v != "ok" || r.Sources()[k] == "" || isError(r.Sources()[k]) {
+				if cur := r.Source(k); v != "ok" || cur == "" || isError(cur) {
 					r.setSource(k, v)
 				}
 			}
@@ -567,6 +686,7 @@ func (r *Runner) startProducers(ctx context.Context, wg *sync.WaitGroup, eng *En
 				}
 				return
 			}
+			r.setSource("cloudtrail", "ok")
 			send(batch{sigs: sigs, cpKey: CheckpointCloudTrail, cp: cp})
 		})
 	}
@@ -592,6 +712,7 @@ func (r *Runner) startProducers(ctx context.Context, wg *sync.WaitGroup, eng *En
 		ing := NewEventsIngest(r.o, r.red)
 		var mu sync.Mutex
 		sink := func(evs []model.KubeEvent) {
+			r.eventsWorking()
 			mu.Lock()
 			stored, sigs := ing.Handle(r.c.View(), evs, r.o.Now())
 			mu.Unlock()
@@ -613,23 +734,51 @@ func (r *Runner) startProducers(ctx context.Context, wg *sync.WaitGroup, eng *En
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			wait := r.eventsRetry
 			for ctx.Err() == nil {
-				err := r.c.EventSource.Run(ctx, sink)
+				lasted, err := r.watchEvents(ctx, sink)
 				if ctx.Err() != nil {
 					return
 				}
+				if lasted {
+					wait = r.eventsRetry
+				}
 				if err != nil {
-					r.setSource("events", "error: "+err.Error())
-					r.log.Warn("incidents: the event watch stopped; restarting", "err", err)
+					r.eventsFailed(err)
+					r.log.Warn("incidents: the event watch stopped; restarting", "err", err, "retryIn", wait)
 				}
 				select {
 				case <-ctx.Done():
 					return
-				case <-time.After(10 * time.Second):
+				case <-time.After(wait):
+				}
+				if !lasted {
+					wait = min(2*wait, r.eventsMaxRetry)
 				}
 			}
 		}()
 	}
+}
+
+// watchEvents runs the event source once. Once it has stayed up eventsUp
+// the watch counts as working; the bool reports whether it got that far.
+func (r *Runner) watchEvents(ctx context.Context, sink func([]model.KubeEvent)) (bool, error) {
+	var mu sync.Mutex
+	ended, up := false, false
+	t := time.AfterFunc(r.eventsUp, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !ended && ctx.Err() == nil {
+			up = true
+			r.eventsWorking()
+		}
+	})
+	err := r.c.EventSource.Run(ctx, sink)
+	t.Stop()
+	mu.Lock()
+	defer mu.Unlock()
+	ended = true // a timer firing now changes nothing
+	return up, err
 }
 
 func isError(s string) bool { return len(s) >= 6 && s[:6] == "error:" }

@@ -252,7 +252,7 @@ func (v *CounterVec) With(values ...string) *Counter { return v.f.with(values) }
 // Gauge goes up and down, or reports a function's value at scrape time.
 type Gauge struct {
 	v  atomicFloat
-	fn atomic.Pointer[func() float64]
+	fn atomic.Pointer[func() (float64, bool)]
 }
 
 // Set sets the value.
@@ -274,15 +274,36 @@ func (g *Gauge) SetFunc(fn func() float64) {
 		g.fn.Store(nil)
 		return
 	}
+	g.SetOptionalFunc(func() (float64, bool) { return fn(), true })
+}
+
+// SetOptionalFunc is SetFunc for a series that may not apply right now:
+// while fn reports false the gauge writes no sample at all (Value reports
+// 0). nil reverts to the stored value.
+func (g *Gauge) SetOptionalFunc(fn func() (float64, bool)) {
+	if fn == nil {
+		g.fn.Store(nil)
+		return
+	}
 	g.fn.Store(&fn)
 }
 
 // Value returns the current value.
 func (g *Gauge) Value() float64 {
+	v, _ := g.current()
+	return v
+}
+
+// current is the value to write, and whether to write one.
+func (g *Gauge) current() (float64, bool) {
 	if fn := g.fn.Load(); fn != nil {
-		return (*fn)()
+		v, ok := (*fn)()
+		if !ok {
+			return 0, false
+		}
+		return v, true
 	}
-	return g.v.load()
+	return g.v.load(), true
 }
 
 // GaugeVec is a gauge with labels.
@@ -294,7 +315,9 @@ func (r *Registry) NewGaugeVec(name, help string, labels ...string) *GaugeVec {
 	r.register(v.f)
 	v.f.writeFn = func(w *bufio.Writer) {
 		for _, c := range v.f.sorted() {
-			sample(w, name, v.f.labels, c.values, "", "", c.m.Value())
+			if val, ok := c.m.current(); ok {
+				sample(w, name, v.f.labels, c.values, "", "", val)
+			}
 		}
 	}
 	return v

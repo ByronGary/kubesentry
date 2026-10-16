@@ -301,7 +301,7 @@ var cacheWindows = map[string]time.Duration{
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
 // over the route's capabilities and the view version (and for /alerts the
-// board's version). Other requests, and
+// alerts and incidents boards' versions). Other requests, and
 // every request while the provider cannot name its current view (before the
 // first view exists, too), are not cached; /incidents adds the incidents
 // board's version. The scope is looked up through

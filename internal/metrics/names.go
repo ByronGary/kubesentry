@@ -99,6 +99,14 @@ var (
 	// IncidentLogFetches counts container log reads for incidents. Labels:
 	// source ("kubernetes", "cloudwatch"), result ("ok", "truncated", "error").
 	IncidentLogFetches = NewCounterVec("kubesentry_incident_log_fetches_total", "Container log reads for incidents by source and result.", "source", "result")
+	// IncidentSourceUp is 1 while an incidents source works and 0 while it
+	// fails, as /info's incidents.sources reports it; a source that is
+	// absent (not configured, or without data) has no sample. Label: source
+	// (the keys of incidents.sources: "events", "memory", "logs:kubernetes",
+	// "requests:nginx", ...). Set it with SetOptionalFunc.
+	IncidentSourceUp = NewGaugeVec("kubesentry_incident_source_up", "Whether an incidents source works (1) or fails (0); absent sources have no sample.", "source")
+	// IncidentsLeader is 1 on the replica that runs the incidents engine.
+	IncidentsLeader = NewGauge("kubesentry_incidents_leader", "1 on the replica that runs the incidents engine.")
 )
 
 func init() { Default.RegisterRuntime() }

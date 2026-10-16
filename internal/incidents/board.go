@@ -18,10 +18,14 @@ type MemBoard struct {
 	list    []Incident          // newest first
 	byID    map[string]int      // index into list
 	signals map[string][]Signal // sorted by start, then ID
-	version uint64
-	at      time.Time
-	leader  bool
-	ready   bool
+	// bySignal maps a signal ID to the incident holding it: the open one
+	// when several do (a capped incident and its continuation share the
+	// conditions carried over), else the newest.
+	bySignal map[string]string
+	version  uint64
+	at       time.Time
+	leader   bool
+	ready    bool
 }
 
 var _ Board = (*MemBoard)(nil)
@@ -32,7 +36,7 @@ func NewBoard(window time.Duration) *MemBoard {
 	if window <= 0 {
 		window = DefaultBoardWindow
 	}
-	return &MemBoard{window: window, byID: map[string]int{}, signals: map[string][]Signal{}}
+	return &MemBoard{window: window, byID: map[string]int{}, signals: map[string][]Signal{}, bySignal: map[string]string{}}
 }
 
 // Snapshot implements Board.
@@ -61,6 +65,16 @@ func (b *MemBoard) Get(id string) (Incident, bool) {
 		return Incident{}, false
 	}
 	return b.list[i], true
+}
+
+// IncidentOf returns the ID of the incident on the board that holds the
+// signal: the open one when several do, else the newest. An alert
+// finding's episode (EpisodeID) finds its incident this way.
+func (b *MemBoard) IncidentOf(signalID string) (string, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	id, ok := b.bySignal[signalID]
+	return id, ok
 }
 
 // Status reports when the board was last published, whether by the leader,
@@ -159,10 +173,22 @@ func (b *MemBoard) rebuild(keep map[string]Incident, sigs map[string][]Signal, n
 	}
 	SortNewest(list)
 	byID := make(map[string]int, len(list))
+	n := 0
 	for i := range list {
 		byID[list[i].ID] = i
+		n += len(sigs[list[i].ID])
 	}
-	b.list, b.byID, b.signals = list, byID, sigs
+	bySignal := make(map[string]string, n)
+	for i := range list { // newest first: the first holder found is the newest
+		in := &list[i]
+		for _, s := range sigs[in.ID] {
+			if cur, ok := bySignal[s.ID]; ok && (in.State != Open || list[byID[cur]].State == Open) {
+				continue
+			}
+			bySignal[s.ID] = in.ID
+		}
+	}
+	b.list, b.byID, b.signals, b.bySignal = list, byID, sigs, bySignal
 	b.version++
 	b.at, b.leader, b.ready = now, leader, true
 }

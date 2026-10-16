@@ -76,6 +76,49 @@ app_requests_total{route="we\"ird\\path\n",code="200"} 1
 	}
 }
 
+// An optional gauge func writes no sample while it reports false, and the
+// series comes back when it reports true again.
+func TestOptionalGaugeFunc(t *testing.T) {
+	r := NewRegistry()
+	f := r.NewGaugeVec("app_source_up", "Sources.", "source")
+	state := map[string]string{"events": "ok", "memory": "error: down", "logs": "absent"}
+	for _, k := range []string{"events", "memory", "logs"} {
+		f.With(k).SetOptionalFunc(func() (float64, bool) {
+			switch state[k] {
+			case "ok":
+				return 1, true
+			case "absent":
+				return 0, false
+			}
+			return 0, true
+		})
+	}
+	text := func() string {
+		var b strings.Builder
+		if err := r.WriteText(&b); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	want := "# HELP app_source_up Sources.\n# TYPE app_source_up gauge\napp_source_up{source=\"events\"} 1\napp_source_up{source=\"memory\"} 0\n"
+	if got := text(); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	state["logs"], state["events"] = "ok", "absent"
+	want = "# HELP app_source_up Sources.\n# TYPE app_source_up gauge\napp_source_up{source=\"logs\"} 1\napp_source_up{source=\"memory\"} 0\n"
+	if got := text(); got != want {
+		t.Errorf("after a change got:\n%s\nwant:\n%s", got, want)
+	}
+	if v := f.With("events").Value(); v != 0 {
+		t.Errorf("an absent series' value = %v", v)
+	}
+	f.With("events").SetOptionalFunc(nil)
+	f.With("events").Set(3)
+	if v := f.With("events").Value(); v != 3 {
+		t.Errorf("after reverting: %v", v)
+	}
+}
+
 func TestRegistrationPanics(t *testing.T) {
 	for name, fn := range map[string]func(r *Registry){
 		"duplicate":    func(r *Registry) { r.NewGauge("a", ""); r.NewCounter("a", "") },
@@ -178,6 +221,8 @@ func TestDefaultRegistry(t *testing.T) {
 		"kubesentry_http_rejected_total", "kubesentry_dependency_up", "kubesentry_leak_scan_runs_total",
 		"kubesentry_snapshot_last_change_timestamp_seconds", "kubesentry_findings", "kubesentry_alerts_sent_total",
 		"kubesentry_alerts_queue_depth", "kubesentry_alerts_evaluation_seconds", "kubesentry_alerts_leader",
+		"kubesentry_incidents", "kubesentry_incident_signals_total", "kubesentry_k8s_events_total", "kubesentry_cloudtrail_events_total",
+		"kubesentry_incident_log_fetches_total", "kubesentry_incident_source_up", "kubesentry_incidents_leader",
 	} {
 		Default.mu.Lock()
 		_, ok := Default.metrics[name]

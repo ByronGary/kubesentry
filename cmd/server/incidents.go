@@ -320,7 +320,9 @@ func (s incidentsSetup) start(ctx context.Context, srv *api.Server) (*incidents.
 		rc.Series = ss
 	}
 
-	rc.EventSource = patientEvents{kube.NewEventWatcher(s.clients, kube.EventWatcherOptions{NormalReasons: c.normalReasons()})}
+	// The watcher is also the events probe. A forbidden watch returns at
+	// once; the runner retries it, waiting up to 5 minutes between tries.
+	rc.EventSource = kube.NewEventWatcher(s.clients, kube.EventWatcherOptions{NormalReasons: c.normalReasons()})
 
 	if c.logs == "cloudwatch" || (c.logs == "auto" && c.logsGroup != "") {
 		logsAPI, err := s.cw.client(ctx, "")
@@ -383,6 +385,12 @@ func (s incidentsSetup) start(ctx context.Context, srv *api.Server) (*incidents.
 	if err != nil {
 		return nil, err
 	}
+	if s.alerts != nil {
+		// The alerts runner started first; its alerts link to their
+		// incidents (incident_url) from the next evaluation on.
+		s.alerts.SetIncidentLookup(incidentLookup(r))
+	}
+	incidentMetrics(r)
 	observeIncidentsLeader(false)
 	if rc.CloudTrail != nil {
 		dependencyUp("cloudtrail", func() error {
@@ -434,6 +442,42 @@ func incidentHooks() incidents.Hooks {
 		},
 		OnLogFetch: func(source, result string) { metrics.IncidentLogFetches.With(source, result).Inc() },
 	}
+}
+
+// incidentLookup finds the incident a finding's current episode joined, on
+// this replica's incidents board (every replica keeps one).
+func incidentLookup(r *incidents.Runner) func(*alerts.Finding) string {
+	return func(f *alerts.Finding) string {
+		id, _ := r.IncidentOfSignal(incidents.EpisodeID(f))
+		return id
+	}
+}
+
+// incidentMetrics exports kubesentry_incident_source_up for each source the
+// runner reports (the set is fixed when it is made), and
+// kubesentry_incidents_leader.
+func incidentMetrics(r *incidents.Runner) {
+	for k := range r.Sources() {
+		metrics.IncidentSourceUp.With(k).SetOptionalFunc(func() (float64, bool) { return sourceUp(r.Source(k)) })
+	}
+	metrics.IncidentsLeader.SetFunc(func() float64 {
+		if r.Leader() {
+			return 1
+		}
+		return 0
+	})
+}
+
+// sourceUp is a source state as kubesentry_incident_source_up: 1 while ok,
+// 0 while failing, no sample while absent.
+func sourceUp(state string) (float64, bool) {
+	switch state {
+	case "ok":
+		return 1, true
+	case "absent", "":
+		return 0, false
+	}
+	return 0, true
 }
 
 // observeIncidentsLeader zeroes kubesentry_incidents on a replica that does
@@ -573,25 +617,6 @@ func (s *seriesSource) SubjectSeries(ctx context.Context, q incidents.SeriesQuer
 		}
 	}
 	return out, errors.Join(errs...)
-}
-
-// patientEvents waits before reporting that events are forbidden, so the
-// runner, which restarts the watch every 10s, does not log it that often.
-type patientEvents struct{ w *kube.EventWatcher }
-
-// eventsForbiddenWait is how long a forbidden watch waits before it is
-// tried again.
-const eventsForbiddenWait = 5 * time.Minute
-
-func (p patientEvents) Run(ctx context.Context, sink func([]model.KubeEvent)) error {
-	err := p.w.Run(ctx, sink)
-	if errors.Is(err, kube.ErrEventsForbidden) {
-		select {
-		case <-ctx.Done():
-		case <-time.After(eventsForbiddenWait):
-		}
-	}
-	return err
 }
 
 // dnsLabel matches a namespace name (DNS-1123 label).

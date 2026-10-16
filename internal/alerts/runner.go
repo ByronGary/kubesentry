@@ -70,9 +70,36 @@ type Runner struct {
 	OnLeader   func(leading bool)
 	Logger     *slog.Logger
 
-	board   atomic.Pointer[Board]
-	leading atomic.Bool
-	version atomic.Uint64
+	board      atomic.Pointer[Board]
+	leading    atomic.Bool
+	version    atomic.Uint64
+	incidentOf atomic.Pointer[func(*Finding) string]
+}
+
+// SetIncidentLookup sets how a finding's incident is found (Options.
+// IncidentOf), at any time: the incidents runner starts after this one.
+// The next evaluation uses it; nil turns it off.
+func (r *Runner) SetIncidentLookup(fn func(*Finding) string) {
+	if fn == nil {
+		r.incidentOf.Store(nil)
+		return
+	}
+	r.incidentOf.Store(&fn)
+}
+
+// incidentLookup is Options.IncidentOf for the evaluator: the lookup set
+// last, else the one in Options.
+func (r *Runner) incidentLookup() func(*Finding) string {
+	base := r.Options.IncidentOf
+	return func(f *Finding) string {
+		if fn := r.incidentOf.Load(); fn != nil {
+			return (*fn)(f)
+		}
+		if base != nil {
+			return base(f)
+		}
+		return ""
+	}
 }
 
 func (r *Runner) defaults() {
@@ -187,7 +214,9 @@ func (r *Runner) lead(ctx context.Context, l Lease) {
 		}
 	}()
 
-	ev := NewEvaluator(store, r.Sink, r.Options)
+	o := r.Options
+	o.IncidentOf = r.incidentLookup()
+	ev := NewEvaluator(store, r.Sink, o)
 	var last, pruned time.Time
 	timer := time.NewTimer(0)
 	defer timer.Stop()

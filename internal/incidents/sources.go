@@ -54,9 +54,18 @@ type SeriesSource interface {
 }
 
 // EventSource streams Kubernetes events while the context lives. It is run
-// only by the lease holder; sink receives batches.
+// only by the lease holder; sink receives batches. Run returns at once when
+// it cannot watch (the runner retries it, waiting longer after each quick
+// failure). A source that is also a Prober is probed on every replica.
 type EventSource interface {
 	Run(ctx context.Context, sink func([]model.KubeEvent)) error
+}
+
+// Prober is a source that can tell whether it works: "ok", "absent" or
+// "error: …" (any other answer is read as an error). Event and log sources
+// may implement it; request and CloudTrail sources must.
+type Prober interface {
+	Probe(ctx context.Context) string
 }
 
 // LogQuery reads container logs in a window.
@@ -91,7 +100,8 @@ type LogResult struct {
 	Warnings  []string
 }
 
-// LogSource reads logs (Kubernetes pods/log, CloudWatch Logs).
+// LogSource reads logs (Kubernetes pods/log, CloudWatch Logs). A source
+// that is also a Prober is probed on every replica as logs:<name>.
 type LogSource interface {
 	Name() string // "kubernetes" or "cloudwatch"
 	Logs(ctx context.Context, q LogQuery) (LogResult, error)

@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/auth"
@@ -183,8 +184,28 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	if err := s.prometheusDown(); err != nil {
 		prom = map[string]string{"prometheus": err.Error()}
 	}
-	resp.Unavailable = mergeUnavailable(fromView, live, prom)
+	resp.Unavailable = mergeUnavailable(fromView, live, prom, incidentsUnavailable(resp.Incidents))
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// incidentsUnavailable lists the incidents sources in error as
+// incidents:<source>, with the reason /info's incidents.sources shows this
+// caller (CloudTrail's reads just "error" without the cloudtrail
+// capability).
+func incidentsUnavailable(in *infoIncidents) map[string]string {
+	if in == nil {
+		return nil
+	}
+	var out map[string]string
+	for k, v := range in.Sources {
+		if strings.HasPrefix(v, "error") {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out["incidents:"+k] = v
+		}
+	}
+	return out
 }
 
 // mergeCluster is what the view knows about the cluster, with the
