@@ -171,6 +171,26 @@ alerts:
 # Alerts link to their finding here.
 externalURL: https://kubesentry.prod.example.com
 
+# Incidents (docs/incidents.md): metrics, events, changes and logs of a
+# workload in trouble on one time axis. The replica holding the incidents lock
+# in Postgres runs the engine. The IAM role above also needs
+# logs:FilterLogEvents on the Container Insights group, cloudwatch:GetMetricData
+# and cloudwatch:ListMetrics, and cloudtrail:LookupEvents (docs/deploy-eks.md).
+incidents:
+  enabled: true
+  # ALB request counts and 5xx per target group (TargetGroupBindings), next to
+  # ingress-nginx and http_requests_total from AMP.
+  alb: true
+  # Container Insights (the amazon-cloudwatch-observability add-on) ships
+  # container logs to /aws/containerinsights/prod-eks/application, where a
+  # deleted pod's lines stay readable.
+  logs:
+    mode: cloudwatch
+  # Security group, target group, node group and IRSA role changes from the
+  # CloudTrail event history (LookupEvents, 1 call/s of the account's 2).
+  cloudtrail:
+    mode: lookup
+
 systemNamespaces:
   add:
     - cert-manager

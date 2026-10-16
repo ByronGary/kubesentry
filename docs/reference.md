@@ -88,6 +88,7 @@ Each pod page then shows a Processes table: name, container, CPU, memory, thread
 - **Map** draws a namespace as Ingress → Service → workload → Pod → Node, with each pod's volumes. A toggle switches to the node view: nodes with requested vs allocatable CPU and memory, pressure, taints and their pods.
 - **Workloads**, **Storage** (claims, unused claims with cost, volumes, classes), **Security** (findings grouped by check, Pod Security labels per namespace) and **Certificates** (cert-manager) each give a status per object.
 - **Memory** and **Activity** are the full tables, with URL-driven filters.
+- **Incidents** (with `-incidents`) lists the workloads in trouble over the last 1 to 24 hours; an incident's page lines up its metrics, events, changes and logs on one time axis (`docs/incidents.md`).
 
 Access has three modes (`-auth-mode`):
 
@@ -129,6 +130,7 @@ The most used; `docs/contracts.md` lists every flag, and `kubesentry -h` describ
 | `-cloudwatch` | `false` | Read EKS audit logs from CloudWatch Logs |
 | `-agent-token` | | Bearer token node agents send; setting it enables process monitoring (env `KUBESENTRY_AGENT_TOKEN`) |
 | `-alerts` | `false` | Turn findings into alerts for Alertmanager or the AMP alert manager (`-alertmanager-url`, token from `ALERTMANAGER_TOKEN`; `-external-url` links each alert to its page). Notify only, never writes to the cluster; with Postgres one replica notifies. See `docs/alerts.md` |
+| `-incidents` | `false` | Group critical and warning signals per workload into incidents, with metrics, events, changes and logs on one time axis; dashboard only. Sources: `-incident-request-sources`, `-incident-alb`, `-incident-logs`, `-cloudtrail off\|lookup\|logs`. More than one replica needs `-audit-store=postgres`. See `docs/incidents.md` |
 
 ## API
 
@@ -138,6 +140,7 @@ Every list shows only what the caller may see (proxy mode). Lists page with `?li
 - `GET /api/v1/pvcs/unused[?minAge=48h]` returns PVCs no live pod mounts, most expensive first, plus a total estimated monthly cost.
 - `GET /api/v1/info` reports the enabled features, who is calling and what they may see, the cluster, the age of the view being served and how far back audit history goes.
 - `GET /api/v1/alerts[?namespace=&owner=&state=]` (with `-alerts`) lists the alert findings the caller may see: open, acknowledged, silenced, and resolved in the last day (`docs/alerts.md`).
+- `GET /api/v1/incidents[?window=6h&severity=&type=&state=&namespace=&owner=&app=&service=&tag=k=v]` (with `-incidents`) lists the incidents the caller may see; `/api/v1/incidents/{id}` one incident with its signals, events, series and related incidents; `/{id}/logs` its container logs (needs `get pods/log`); `/{id}/bundle[?format=ndjson]` the agent-ready bundle (`docs/incidents.md`).
 - `POST /api/v1/auth/recheck` re-reads the caller's access (at most once a minute).
 - `GET /api/v1/pods[?namespace=]` lists pods, OOMKilled first, with readiness, the worst waiting reason, node and owner.
 - `GET /api/v1/pods/{namespace}/{name}/diagnostics[?window=6h]` returns checks, per-container memory series with any leak finding, volumes and recent audit activity for one pod.
@@ -256,9 +259,21 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]   # IRSA role annotations, matched against CloudTrail changes
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
   - apiGroups: ["cert-manager.io"]   # optional; without it the Certificates page says so
     resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["elbv2.k8s.aws"]   # optional; AWS Load Balancer Controller target groups, for incidents
+    resources: ["targetgroupbindings"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]   # incidents only: Warning events
+    resources: ["events"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]   # incidents only, when logs come from the cluster (-incident-logs auto or kubernetes)
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: ["authorization.k8s.io"]   # per-user scope (proxy mode) and the startup permission probe
     resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
     verbs: ["create"]

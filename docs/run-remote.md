@@ -20,7 +20,8 @@ your browser ──> kubesentry (127.0.0.1:8080, -auth-mode none)
 4. [What is not available remotely](#4-what-is-not-available-remotely)
 5. [Several clusters](#5-several-clusters)
 6. [A team setup on EC2 or ECS](#6-a-team-setup-on-ec2-or-ecs)
-7. [Flags for remote mode](#7-flags-for-remote-mode)
+7. [Incidents](#7-incidents)
+8. [Flags for remote mode](#8-flags-for-remote-mode)
 
 ## 1. Install
 
@@ -136,7 +137,7 @@ hack/run-remote.sh -c prod-eks --region us-east-1 --cloudwatch --cluster-name pr
 
 ## 3. The permissions your identity needs
 
-kubesentry only reads. Its informers **list and watch cluster-wide** the resources in the chart's ClusterRole (`charts/kubesentry/templates/rbac.yaml`; the README's "Required RBAC" section has it as plain YAML): pods, persistentvolumeclaims, persistentvolumes, services, nodes, namespaces, endpointslices, deployments, replicasets, statefulsets, daemonsets, jobs, cronjobs, ingresses, storageclasses, the four RBAC kinds, and cert-manager's resources when installed. It also creates `selfsubjectaccessreviews` to check those permissions at startup. It never reads Secrets.
+kubesentry only reads. Its informers **list and watch cluster-wide** the resources in the chart's ClusterRole (`charts/kubesentry/templates/rbac.yaml`; the "Required RBAC" section of `docs/reference.md` has it as plain YAML): pods, persistentvolumeclaims, persistentvolumes, services, serviceaccounts, nodes, namespaces, endpointslices, deployments, replicasets, statefulsets, daemonsets, jobs, cronjobs, ingresses, storageclasses, the four RBAC kinds, cert-manager's resources and the AWS Load Balancer Controller's TargetGroupBindings when installed. With incidents it also watches events and reads `pods/log` (section 7). It creates `selfsubjectaccessreviews` to check those permissions at startup. It never reads Secrets.
 
 On top of that, for the in-cluster Prometheus:
 
@@ -155,14 +156,14 @@ rules:
 **Granting it on EKS.** Your IAM role (for example an IAM Identity Center permission set role) reaches Kubernetes through an access entry. Either:
 
 - Associate the `AmazonEKSAdminViewPolicy` access policy: `get`, `list` and `watch` on every resource, Secrets included. Access policies cannot be narrowed to resources, and since they only read, the services/proxy grant above still needs a RoleBinding.
-- Or, narrower: give the access entry a Kubernetes group, and bind the README's ClusterRole and the Role above to it.
+- Or, narrower: give the access entry a Kubernetes group, and bind the ClusterRole from `docs/reference.md` and the Role above to it.
 
   ```bash
   # An IAM Identity Center role goes in without its path (aws-reserved/sso.amazonaws.com/).
   aws eks create-access-entry --cluster-name prod-eks \
     --principal-arn arn:aws:iam::111122223333:role/AWSReservedSSO_PlatformEngineer_0123456789abcdef \
     --kubernetes-groups kubesentry-readers
-  kubectl apply -f kubesentry-reader.yaml     # the README's ClusterRole, renamed kubesentry-reader
+  kubectl apply -f kubesentry-reader.yaml     # the ClusterRole from docs/reference.md, renamed kubesentry-reader
   kubectl create clusterrolebinding kubesentry-readers --clusterrole=kubesentry-reader --group=kubesentry-readers
   kubectl -n monitoring create rolebinding kubesentry-prometheus-proxy --role=kubesentry-prometheus-proxy --group=kubesentry-readers
   ```
@@ -181,7 +182,7 @@ kubectl --context prod-eks auth can-i create services/proxy -n monitoring
 - **Process monitoring.** The node agents run in the cluster and push their reports to kubesentry (`POST /agent/report`); they cannot reach your laptop. If you run kubesentry somewhere the cluster can reach (section 6), deploy the agents in the cluster and point them at it.
 - **The audit webhook and audit log file.** Both are for self-managed API servers. On EKS use `-cloudwatch`.
 - **Per-user scoping.** Locally there is one user, you, and kubesentry shows what your identity can list. Per-user scoping by RBAC needs an SSO proxy (`-auth-mode proxy`), as in section 6 or the Helm chart.
-- **History across restarts.** The memory audit store starts empty, and is filled again from CloudWatch on each start. Findings and charts come from the cluster and Prometheus, so they are complete at once.
+- **History across restarts.** The memory audit store starts empty, and is filled again from CloudWatch on each start. Findings and charts come from the cluster and Prometheus, so they are complete at once. Incidents start empty too (section 7).
 
 ## 5. Several clusters
 
@@ -199,7 +200,7 @@ Each process holds its own informer cache, so memory grows with each cluster's o
 To share one kubesentry without installing it in the cluster, run the same image next to the cluster, inside the VPC:
 
 1. **An IAM role** for the instance profile (EC2) or task role (ECS), with the CloudWatch Logs and AMP permissions from `docs/deploy-eks.md` section 3, and `eks:DescribeCluster` on the cluster.
-2. **An access entry** mapping that role to a Kubernetes group bound to the read-only ClusterRole (section 3). For per-user scoping, the ClusterRole must also allow `create` on `subjectaccessreviews`, as the README's version does.
+2. **An access entry** mapping that role to a Kubernetes group bound to the read-only ClusterRole (section 3). For per-user scoping, the ClusterRole must also allow `create` on `subjectaccessreviews`, as the one in `docs/reference.md` does.
 
    ```bash
    aws eks create-access-entry --cluster-name prod-eks \
@@ -220,13 +221,63 @@ To share one kubesentry without installing it in the cluster, run the same image
 
 For one replica the memory audit store is enough; use Postgres (`docs/deploy-eks.md`, section 5) to keep history across restarts or to run two.
 
-## 7. Flags for remote mode
+## 7. Incidents
+
+Incidents (`docs/incidents.md`) work from a laptop too. With your identity, kubesentry watches Warning events, reads container logs through the API server (`kubectl logs`), and reads ALB metrics, CloudWatch Logs and CloudTrail with your AWS credentials. Nothing is installed in the cluster.
+
+```bash
+kubesentry -kube-context prod-eks -auth-mode none -aws-region us-east-1 -cluster-name prod-eks \
+  -prometheus-url https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012 \
+  -prometheus-selector 'cluster="prod-eks"' \
+  -incidents -incident-alb -incident-logs cloudwatch -cloudtrail lookup -cloudtrail-qps 0.5
+```
+
+`hack/run-remote.sh` passes flags after `--` through: `hack/run-remote.sh -c prod-eks ... -- -incidents -cloudtrail lookup`.
+
+**What changes on a laptop:**
+
+- **Incidents last as long as the process.** The memory store is used, and a restart starts empty. At startup the first cluster view only sets a baseline, so existing restarts are not reported again. The request baselines come from Prometheus history, so spikes are detected from the first scan. CloudTrail is read back `-cloudtrail-start` (1h), and the audit log the lookbehind (30m).
+- **The minimal start** is `-incidents` alone: Warning events, memory from your Prometheus, logs through `pods/log`, and no AWS calls besides those you already make. Add the AWS sources one at a time.
+- **CloudTrail's limit is shared.** `LookupEvents` allows about 2 calls per second per account and region, for everyone. Several people running kubesentry against one account add up, as does the console. Use `-cloudtrail-qps 0.5` or less on a laptop, and leave the history to the in-cluster install where there is one.
+- **Container logs** come from CloudWatch Logs with `-incident-logs cloudwatch` (Container Insights' group, from `-cluster-name`), or from the API server with `-incident-logs kubernetes`. `auto` (the default) uses CloudWatch when `-incident-logs-group` is set, then `pods/log`.
+
+**Your Kubernetes identity** needs, besides section 3:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: kubesentry-reader-incidents}
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+```
+
+Bind it to the same group as the reader role. `serviceaccounts` and `targetgroupbindings` are already in that role. `AmazonEKSAdminViewPolicy` covers all of these. Without `events`, `/api/v1/info` shows `incidents.sources.events` as `error: kube: events are forbidden: …` and incidents open from metrics, restarts and OOM kills only. Without `pods/log`, the log panel shows the API server's refusal when it reads from `kubernetes`.
+
+**Your AWS credentials** need the IAM actions of `docs/deploy-eks.md`, section 3, "Incidents": `logs:FilterLogEvents` on the container log group, `cloudwatch:GetMetricData` and `cloudwatch:ListMetrics` for `-incident-alb`, and `cloudtrail:LookupEvents`.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-incidents` | off | group critical and warning signals per workload into incidents. Needs `-cache` (the default) |
+| `-incident-alb` | off | ALB request counts and 5xx per TargetGroupBinding, from CloudWatch |
+| `-incident-logs` | `auto` | `auto`, `kubernetes`, `cloudwatch` or `off` |
+| `-incident-logs-group` | Container Insights' group with `cloudwatch` | the CloudWatch Logs group of container logs |
+| `-cloudtrail` | `off` | `lookup` (the event history) or `logs` (a trail in `-cloudtrail-log-group`) |
+| `-cloudtrail-region`, `-cloudtrail-qps`, `-cloudtrail-start` | `-aws-region`, 1, `1h` | which region, how many `LookupEvents` calls per second, how far back the first read goes |
+
+`docs/incidents.md`, section 9, lists the thresholds and the other settings.
+
+## 8. Flags for remote mode
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `-kube-context` | current context | kubeconfig context to use (`-kubeconfig`, else `KUBECONFIG` or `~/.kube/config`). Setting it skips the in-cluster configuration |
 | `-eks-cluster` | | EKS cluster to sign in to with kubesentry's own token, minted from AWS credentials (no AWS CLI needed). Without `-kubeconfig` or `-kube-context`, the endpoint and CA come from `eks:DescribeCluster`. Also the default `-cluster-name` |
-| `-aws-region` | from `AWS_REGION` or the profile | region for the EKS token, DescribeCluster, CloudWatch Logs and AMP signing |
+| `-aws-region` | from `AWS_REGION` or the profile | region for the EKS token, DescribeCluster, CloudWatch Logs and AMP signing, and with incidents for CloudWatch metrics and CloudTrail |
 | `-prometheus-via-apiserver` | `auto` | reach discovered Prometheus Services and `-prometheus-service` through the API server's service proxy: `auto` when running outside the cluster, `true`, `false` |
 | `-auth-mode none` | | the local mode: no sign-in, loopback only |
 

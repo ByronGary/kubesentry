@@ -262,6 +262,9 @@ Group such a route by `kubesentry_slack_channel` as well, so that every notifica
 | `KubesentryLeakScanFailing` | no background leak scan succeeded for about an hour while scans fail | |
 | `KubesentryAlertsNotEvaluated` | no replica holds the alerts lock for 10m (`alerts.enabled` only) | |
 | `KubesentryAlertmanagerFailing` | the replica that notifies fails or drops deliveries for 15m (with `alerts.alertmanager.urls`) | |
+| `KubesentryCloudTrailFailing` | a replica cannot read CloudTrail for 15m (`incidents.cloudtrail.mode` lookup or logs) | |
+| `KubesentryIncidentEventsFailing` | Kubernetes events fail to store, or the event watch is refused (403), for 15m (`incidents.enabled`) | |
+| `KubesentryIncidentLogsFailing` | every incident log read from one source failed over 30m, for 10m (`incidents.enabled`, logs not off) | |
 | `KubesentryAgentNodesDropped` | nodes reporting processes drop by a fraction within an hour, for 10m (agent only) | `agentDropRatio` (0.2) |
 | `KubesentryCrashLooping` | a server, oauth2-proxy or agent container in CrashLoopBackOff, or restarting, for 10m (kube-state-metrics) | `kubeStateMetrics.restarts` (3 in 30m) |
 | `KubesentryOOMKilled` | one of those containers restarted after an OOM kill in the last 30m (kube-state-metrics) | |
@@ -283,6 +286,7 @@ Group such a route by `kubesentry_slack_channel` as well, so that every notifica
 | Audit | ingest by source, write queue against its capacity, store errors, CloudWatch lag |
 | Agents and Prometheus | nodes with a fresh report, agent reports by status, Prometheus query latency p95 by kind |
 | Alerts and dependencies | dependencies up (`kubesentry_dependency_up`), requests rejected before routing, open alert findings by check, alerts posted to Alertmanager by result and queued, evaluation time and the leader, leak scans by result |
+| Incidents | open incidents by severity, signals per hour by type, Kubernetes events stored and CloudTrail events by result, incident log reads per hour by source and result |
 | Go runtime | heap, heap goal, memory from the OS and GOMEMLIMIT; container working set; goroutines; GC CPU |
 
 The "Cluster health (EKS)" dashboard in `examples/grafana` has these rows:
@@ -611,6 +615,34 @@ Requests without credentials (`unauthenticated`) are counted but not alerted on:
 `dropped` means the queue was full, because Alertmanager is too slow or down.
 **Fix:** fix the credentials, the network path or Alertmanager. Nothing is lost for long: every open alert is posted again each minute.
 
+### KubesentryCloudTrailFailing
+**Meaning:** a replica has failed to read CloudTrail for 15 minutes (`kubesentry_dependency_up{dependency="cloudtrail"}` is 0). AWS changes (security groups, target groups, node groups, IRSA roles) stop attaching to incidents. Incidents still open and close; they just lack that context. Every replica probes CloudTrail every 10 minutes, and the one running the incidents engine also polls it every 2 minutes.
+**Check:** `/api/v1/info`, `incidents.sources.cloudtrail` (as a CloudTrail viewer; others see just `error`), and the server log:
+- An access denial: the role lacks `cloudtrail:LookupEvents` (lookup) or `logs:FilterLogEvents` on the trail's group (logs). See `docs/deploy-eks.md`, section 3.
+- Throttling: `LookupEvents` allows about 2 calls per second per account and region, shared with every other tool. `kubesentry_cloudtrail_events_total{result="throttled"}` rises.
+- `log group not found` (logs mode): `incidents.cloudtrail.logGroup` names no group in `cloudtrail.region`.
+- A network error: egress on 443 to `cloudtrail.<region>.amazonaws.com` or `logs.<region>.amazonaws.com`, or their VPC endpoints.
+
+**Fix:** grant the action, lower `incidents.cloudtrail.qps` or find the other heavy caller, or read a trail from CloudWatch Logs instead (`cloudtrail.mode: logs`). After a fix the next poll resumes from its checkpoint, reading back at most 24 hours.
+
+### KubesentryIncidentEventsFailing
+**Meaning:** for 15 minutes the replica running the incidents engine has failed to store Kubernetes events (`kubesentry_k8s_events_total{result="error"}`), or the API server has refused its event list or watch (`kubesentry_kube_requests_total{resource="events",code="403"}`). Repeated `BackOff`, `Unhealthy` and `FailedScheduling` events no longer open incidents, and incident pages miss their events.
+**Check:**
+- A store error: `KubesentryPostgresErrors` and `kubesentry_dependency_up{dependency="postgres"}`; the log line `incidents: storing events failed`.
+- A 403: kubesentry's ClusterRole must allow `list` and `watch` on `events` (the chart adds it with `incidents.enabled`). `kubectl auth can-i watch events --all-namespaces --as=system:serviceaccount:kubesentry:kubesentry`.
+- When the startup permission check itself is denied, the watch is not attempted and nothing is counted: `/api/v1/info` shows `incidents.sources.events` as `error: kube: events are forbidden: …`, and the server retries every 5 minutes.
+
+**Fix:** restore Postgres, or the RBAC rule. Events missed meanwhile are not recovered once they expire (an hour by default): the next watch lists only the ones still there.
+
+### KubesentryIncidentLogsFailing
+**Meaning:** in the last 30 minutes every read of incident logs from one source (`kubernetes` or `cloudwatch`, the `source` label) failed, and none succeeded (`kubesentry_incident_log_fetches_total`). People opening incidents and downloading bundles see no logs. Reads happen only when someone views logs or downloads a bundle, so the alert can only fire then.
+**Check:** the warning in the incident page's log panel, or the server log:
+- `kubernetes`: `pod logs: … forbidden`: kubesentry lacks `get pods/log` (the chart adds it with `incidents.logs.mode` `auto` or `kubernetes`).
+- `cloudwatch`: `cloudwatch: access denied: logs:FilterLogEvents on <group>`, or `cloudwatch: log group not found: <group>`. With `logs.mode: cloudwatch` the group defaults to `/aws/containerinsights/<clusterName>/application`, which exists only with Container Insights.
+- Throttling shows as slow reads first; `KubesentryCloudWatchLag` may fire too, since the audit reader shares the pacer.
+
+**Fix:** grant the permission, point `incidents.logs.group` at the group your log shipper writes, or switch `incidents.logs.mode`. A user missing `get pods/log` gets 403 from the logs route, which is not counted here.
+
 ### KubesentryAgentNodesDropped
 **Meaning:** nodes reporting processes dropped by more than `agentDropRatio` within an hour.
 **Check:**
@@ -654,5 +686,6 @@ Some rules here could not be expressed with the metrics phase A had, or had to h
 | `kubesentry_snapshot_last_change_timestamp_seconds` (**shipped**: `KubesentrySnapshotStale` now needs a change waiting) and `kubesentry_snapshot_build_failures_total` | Tell a quiet cluster from a stuck view (bug 3), so `KubesentrySnapshotStale` stops firing falsely |
 | `kubesentry_cloudwatch_reader_leader` (1 on the lock holder) | The lag gauge may be stale on a replica that lost the lock; the lag rule would read only the leader |
 | `kubesentry_findings{check, severity}` (**shipped**, without `namespace` and `owner` to keep it small; reported by the replica that evaluates) | Finding counts for teams' own rules |
+| `kubesentry_k8s_events_total{result="forbidden"}`, or `kubesentry_dependency_up{dependency="events"}` | A denied event permission check is visible today only in `/info` and the log; `KubesentryIncidentEventsFailing` catches refused watches, not a refused check |
 
 One more phase B change concerned labels rather than metrics: kubesentry's pod alerts carry a `node` label when their pods all run on one node, so the profile's node-down inhibition mutes them (shipped).

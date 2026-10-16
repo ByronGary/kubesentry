@@ -6,6 +6,7 @@ This guide installs kubesentry on an EKS cluster with the Helm chart in `charts/
 - **Visibility:** each user sees what their Kubernetes RBAC allows. kubesentry asks the API server with SubjectAccessReviews.
 - **Metrics:** Amazon Managed Service for Prometheus (AMP), signed with SigV4.
 - **Audit:** the EKS control-plane audit log is read from CloudWatch Logs and stored in RDS for PostgreSQL.
+- **Incidents:** metrics, events, changes and container logs of a workload in trouble on one time axis, with ALB metrics, Container Insights logs and the CloudTrail event history (`docs/incidents.md`).
 - **Availability:** two replicas spread across zones, with a PodDisruptionBudget, NetworkPolicy and API Priority and Fairness.
 
 `charts/kubesentry/examples/values-eks.yaml` is the matching values file. Each section below explains one part of it.
@@ -78,10 +79,11 @@ Both images are distroless `static:nonroot`, run as uid 65532, and contain one s
 
 ## 3. IAM
 
-kubesentry calls three AWS APIs, all with the pod's own role:
+kubesentry calls these AWS APIs, all with the pod's own role:
 
-- CloudWatch Logs, for the audit log
+- CloudWatch Logs, for the audit log and, with incidents, container logs and a CloudTrail trail
 - AMP, for metrics
+- with incidents: CloudWatch metrics for the ALB, and CloudTrail's event history
 - RDS IAM authentication, which is optional and only applies when you use it
 
 The agent needs no AWS access.
@@ -117,6 +119,36 @@ Replace the region, account, cluster name and workspace ID.
 ```
 
 `DescribeLogGroups` only returns log group names and settings. AWS evaluates it against `log-group:*`, so you cannot reliably scope it to a single group.
+
+**Incidents** (`incidents.enabled`, `docs/incidents.md`) add these statements. Keep the ones for the sources you turn on:
+
+```json
+{
+  "Sid": "ReadContainerLogs",
+  "Effect": "Allow",
+  "Action": ["logs:FilterLogEvents"],
+  "Resource": [
+    "arn:aws:logs:us-east-1:111122223333:log-group:/aws/containerinsights/prod-eks/application:*",
+    "arn:aws:logs:us-east-1:111122223333:log-group:/aws/cloudtrail/org-trail:*"
+  ]
+},
+{
+  "Sid": "ReadAlbMetrics",
+  "Effect": "Allow",
+  "Action": ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"],
+  "Resource": "*"
+},
+{
+  "Sid": "ReadCloudTrailEventHistory",
+  "Effect": "Allow",
+  "Action": ["cloudtrail:LookupEvents"],
+  "Resource": "*"
+}
+```
+
+- **`logs:FilterLogEvents`** on the container log group (`incidents.logs`: Container Insights' `/aws/containerinsights/<cluster>/application` by default with `mode: cloudwatch`, or `logs.group`). Add the trail's group only with `incidents.cloudtrail.mode: logs`. If the trail is in another region (`cloudtrail.region`), use that region in its ARN.
+- **`cloudwatch:GetMetricData`** and **`cloudwatch:ListMetrics`** for `incidents.alb`. Both are evaluated against `*`. The query is a `SEARCH` expression over `AWS/ApplicationELB`, and whether `SEARCH` needs `ListMetrics` as well is not settled, so grant both.
+- **`cloudtrail:LookupEvents`** for `incidents.cloudtrail.mode: lookup`. It supports no resource scoping. It reads the event history of the role's account in one region (`cloudtrail.region`, default `eks.region`). **The limit of about 2 calls per second is shared per account and region** by every caller: the console, other tools, other kubesentry installs. kubesentry uses 1 by default (`cloudtrail.qps`) and backs off when throttled. With other heavy users of the history, lower it or read a trail from CloudWatch Logs instead.
 
 Add these statements only for the features that use them:
 
@@ -502,6 +534,8 @@ Some data has no Kubernetes API of its own. For that, kubesentry checks virtual 
 | `kubesentry-audit-viewer` | `list auditevents.kubesentry.io`: the audit trail | a RoleBinding for one namespace's events. A ClusterRoleBinding for all namespaces, plus events without a namespace (RBAC, nodes, cluster-scoped objects) |
 | `kubesentry-process-viewer` | `get processes.kubesentry.io`: the processes inside pods | a RoleBinding per namespace, or a ClusterRoleBinding |
 | `kubesentry-agents-viewer` | `list agents.kubesentry.io`: node agent health | a ClusterRoleBinding (it is cluster-scoped) |
+| `kubesentry-cloudtrail-viewer` | `list cloudtrail.kubesentry.io`: the AWS changes attached to incidents, on the page and in bundles | a ClusterRoleBinding (it is cluster-scoped) |
+| `kubesentry-logs-viewer` | `get pods/log`: an incident's container logs, per namespace. kubesentry checks the same permission as `kubectl logs`, whichever source the lines come from, so `view`, `edit` and `admin` already grant it | a RoleBinding per namespace, only for users with narrower roles |
 
 ```yaml
 # The payments team: its namespace's audit events and processes.
@@ -535,6 +569,7 @@ subjects: [{apiGroup: rbac.authorization.k8s.io, kind: Group, name: platform-adm
 
 - `view` reaches `edit` and `admin` too, since they include `view`.
 - A reasonable choice is `processViewer.aggregateTo: [edit]` and `auditViewer.aggregateTo: [admin]`. Command lines are redacted, but treat them as sensitive. The audit trail shows who did what in a namespace.
+- CloudTrail records name AWS principals and resources across the account, so bind `cloudtrailViewer` to the platform team rather than aggregating it into `view`. Aggregated into `admin`, it reaches only those bound to `admin` cluster-wide.
 
 **Cluster pages.** The built-in `view` role does not include nodes, persistent volumes or storage classes. Users without cluster-wide `list` on these still see the pages, degraded to names with status unknown. To show the cluster pages fully to a group, bind it a ClusterRole that grants `list` on `nodes`, `persistentvolumes`, `storage.k8s.io/storageclasses`, `rbac.authorization.k8s.io/clusterrolebindings` and `cert-manager.io/clusterissuers`.
 
@@ -558,7 +593,7 @@ Then turn on `networkPolicy`, which is off by default. Each listener is open onl
 With `egress.enabled`, the pods may reach only:
 
 - DNS (CoreDNS in kube-system)
-- 443 and 6443 to `https.toCIDRs`: the API server, STS, CloudWatch Logs, AMP and the IdP
+- 443 and 6443 to `https.toCIDRs`: the API server, STS, CloudWatch Logs, AMP and the IdP, and with incidents CloudWatch (`monitoring`) and CloudTrail
 - Postgres and Redis at their CIDRs
 - with Pod Identity, the node-local agent (`podIdentityAgent: true`)
 
@@ -566,7 +601,7 @@ With `egress.enabled`, the pods may reach only:
 
 - the VPC subnets that hold the cluster's API server endpoint ENIs
 - the cluster's service CIDR, since CNIs differ in whether they see the `kubernetes` Service's ClusterIP or the translated address
-- your VPC endpoints for STS, CloudWatch Logs and AMP
+- your VPC endpoints for STS, CloudWatch Logs and AMP, and with incidents CloudWatch (`com.amazonaws.<region>.monitoring`) and CloudTrail
 
 `kubectl port-forward` does not cross the pod network, so the break-glass path (token mode, port 8080) keeps working under any policy. With the sidecar there is no TCP port to forward to kubesentry itself: see the break-glass step in section 14.
 
@@ -623,6 +658,7 @@ The chart refuses some configurations with an explanation (`helm template` shows
 - **More than one replica with the memory audit store** and any audit source. Each replica would keep a partial history.
 - **`auth.mode=proxy` with neither the sidecar nor `auth.trustedProxyCIDRs`.**
 - **The CloudWatch source without `eks.clusterName` or `logGroup`.**
+- **Incidents** without the cache, or with more than one replica on the memory store; CloudTrail without incidents; a trail without its log group; CloudWatch container logs with neither a group nor a cluster name; and `incidents.maxRange` above 24 hours.
 - **Missing required values:** `audit.store=postgres` without a DSN Secret, and the oauth2-proxy sidecar without a client ID, issuer or Secret.
 
 **Generated tokens.** The API (break-glass), agent and audit webhook tokens are generated on first install and kept on upgrades: the chart looks up the existing Secrets. Argo CD and other tools that render with `helm template` cannot look Secrets up, and would generate new tokens on every sync. With them, create the Secrets yourself, for example with External Secrets, and set `tokens.<name>.existingSecret`.
@@ -651,6 +687,8 @@ These are starting points until the stress report in `test/stress` replaces them
 - **Memory:** the server sets GOMEMLIMIT to 90% of its memory limit, so the Go GC works harder near the limit instead of the pod being OOM-killed. Setting `GOMEMLIMIT` through `extraEnv` overrides it. Watch `kubesentry_snapshot_build_seconds` and container memory, then adjust.
 - **Users:** user count drives SubjectAccessReviews and CPU, not memory. Thousands of users sharing groups are cheap with `auth.shareByGroups`.
 - **Authorization cache and review rate:** each replica caches up to 100,000 access decisions (fixed; LRU), shared by all users. An active user needs about one entry per cluster-wide capability the UI checks (around 10), one scope per namespaced capability (pods, audit, processes, rolebindings), and one decision per namespace their RoleBindings propose for each of those: a user with 10 namespaces holds about 55 entries. Every entry is re-reviewed when it expires (`auth.authzCacheTTL`, default 5m), so the steady review rate is roughly *active users × entries per user ÷ TTL*: 1,000 such users need about 180 reviews/s, within the default `auth.authzQPS` of 200; 5,000 need about 900/s, and the cache (5,000 × 55 = 275,000 entries) no longer holds them, so evicted entries are reviewed again on the next request. At that scale use `auth.shareByGroups` (entries then scale with distinct group sets, not users), a longer `authzCacheTTL`, or a higher `authzQPS` if the API server has the headroom. Watch `kubesentry_authz_cache_total{result="miss"}` against `hit`, and `kubesentry_authz_reviews_total`.
+- **Postgres connections:** each replica pools `audit.postgres.maxConns` (10). The replica holding a lock (CloudWatch reader, alerts, incidents) keeps one more connection per lock, so size `max_connections` for replicas × `maxConns` + 3.
+- **Incidents** keep the last day's incidents in memory, at most 500 signals each, and Kubernetes events in Postgres for `incidents.eventsRetention` (48h): measure their rate with `kubesentry_k8s_events_total{result="stored"}` and size storage from it. Logs are never stored.
 - **Audit volume:** this depends on the cluster's write rate and controllers. Count roughly 1–2 KB per stored event, indexes included. Measure the first day (`kubesentry_audit_ingested_total`) and size storage from that.
 - **Agents:** nodes with many thousands of processes need a higher agent memory limit. `agent.maxProcesses` caps what is sent.
 - **API Priority and Fairness:** `apf.enabled` gives kubesentry its own priority level, so its initial LIST burst after a restart queues against its own share.
@@ -707,3 +745,4 @@ helm rollback kubesentry <revision> -n kubesentry
    - Through the ALB the UI still works.
 10. **Break-glass:** with the sidecar, kubesentry listens only on the Unix socket inside the pod, so neither the token nor forged identity headers reach it from outside: `kubectl -n kubesentry port-forward deploy/kubesentry 8080` fails to connect. When SSO is down, `helm upgrade --reuse-values --set oauth2Proxy.enabled=false` switches to token mode on port 8080; then that port-forward with the API token from `kubectl -n kubesentry get secret kubesentry-api -o jsonpath='{.data.token}' | base64 -d` reaches `/api/v1/info`. Store the token in your vault, or set `tokens.api.enabled: false` if you do not want one.
 11. **Pod Security:** `kubectl label --dry-run=server --overwrite namespace kubesentry pod-security.kubernetes.io/enforce=restricted` prints no warnings.
+12. **Incidents:** `GET /api/v1/info` shows `incidents.enabled`, and `incidents.sources` lists `ok` for `events`, `memory`, `logs:cloudwatch`, `cloudtrail` and the request sources in use (`absent` where there are no such metrics). With CloudTrail, an `error` names the missing IAM action. On the Incidents page, an incident's log panel shows lines, and a CloudTrail viewer sees the AWS changes lane.

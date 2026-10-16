@@ -69,6 +69,12 @@ kubesentry {{ include "kubesentry.imageTag" (dict "image" .Values.image "root" .
    CloudWatch log group: {{ default (printf "/aws/eks/%s/cluster" .Values.eks.clusterName) .Values.audit.sources.cloudwatch.logGroup }}
    (needs EKS control-plane audit logging and logs:FilterLogEvents for the pod's role)
 {{- end }}
+{{- if .Values.incidents.enabled }}
+{{- $inc := .Values.incidents }}
+   Incidents: on (dashboard only){{ if $inc.alb }}; ALB metrics{{ end }}; logs: {{ include "kubesentry.logsMode" . }}{{ with $inc.logs.group }} ({{ . }}){{ end }}; CloudTrail: {{ include "kubesentry.cloudtrailMode" . }}
+   Users read an incident's logs with get pods/log in its namespace, and its AWS changes with
+   the {{ $fullname }}-cloudtrail-viewer ClusterRole (docs/incidents.md, "Permissions").
+{{- end }}
 {{- if .Values.agent.enabled }}
 
 4. Node agent

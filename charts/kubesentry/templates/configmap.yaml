@@ -14,3 +14,20 @@ data:
   group-map.json: |
     {{- toPrettyJson .Values.auth.groupMap | nindent 4 }}
 {{- end }}
+{{- if and .Values.incidents.enabled .Values.incidents.requestProfiles }}
+---
+# Request profiles of your own, read by -incident-request-profiles-file.
+# kubesentry builds the PromQL from them (with -prometheus-selector); a
+# profile names labels, never a query.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubesentry.fullname" . }}-incidents
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+data:
+  request-profiles.json: |
+    {{- toPrettyJson .Values.incidents.requestProfiles | nindent 4 }}
+{{- end }}

@@ -5,6 +5,7 @@
 {{- $file := .Values.audit.sources.file -}}
 {{- $al := .Values.alerts -}}
 {{- $amCA := and $al.enabled (or $al.alertmanager.ca.configMap $al.alertmanager.ca.secret) -}}
+{{- $reqProfiles := and .Values.incidents.enabled .Values.incidents.requestProfiles -}}
 {{- $preStop := and (gt (int .Values.preStopSleepSeconds) 0) (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -38,6 +39,9 @@ spec:
         kubectl.kubernetes.io/default-container: server
         {{- if .Values.auth.groupMap }}
         checksum/group-map: {{ toJson .Values.auth.groupMap | sha256sum }}
+        {{- end }}
+        {{- if $reqProfiles }}
+        checksum/request-profiles: {{ toJson .Values.incidents.requestProfiles | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -213,6 +217,11 @@ spec:
               mountPath: /etc/kubesentry/tls
               readOnly: true
             {{- end }}
+            {{- if $reqProfiles }}
+            - name: incidents
+              mountPath: /etc/kubesentry/incidents
+              readOnly: true
+            {{- end }}
             {{- if and (eq .Values.audit.store "postgres") (or $pg.sslRootCert.configMap $pg.sslRootCert.secret) }}
             - name: pg-ca
               mountPath: /etc/kubesentry/pg-ca
@@ -377,6 +386,11 @@ spec:
         - name: tls
           secret:
             secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+        {{- if $reqProfiles }}
+        - name: incidents
+          configMap:
+            name: {{ $fullname }}-incidents
         {{- end }}
         {{- if eq .Values.audit.store "postgres" }}
         {{- if $pg.sslRootCert.configMap }}

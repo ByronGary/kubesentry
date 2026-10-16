@@ -124,6 +124,31 @@ token
 {{- join "," $s -}}
 {{- end -}}
 
+{{/* Effective incidents.cloudtrail.mode: off, lookup or logs. An unquoted off reads as false in YAML. */}}
+{{- define "kubesentry.cloudtrailMode" -}}
+{{- $m := .Values.incidents.cloudtrail.mode -}}
+{{- if or (kindIs "invalid" $m) (eq (toString $m) "false") (eq (toString $m) "") -}}
+off
+{{- else -}}
+{{- $m -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Effective incidents.logs.mode: auto (also when empty), kubernetes, cloudwatch or off (also an unquoted off, false). */}}
+{{- define "kubesentry.logsMode" -}}
+{{- $m := .Values.incidents.logs.mode -}}
+{{- if and (kindIs "bool" $m) (not $m) -}}
+off
+{{- else -}}
+{{- default "auto" $m -}}
+{{- end -}}
+{{- end -}}
+
+{{/* "true" when the server reads container logs through pods/log: incidents with logs.mode auto or kubernetes. */}}
+{{- define "kubesentry.podLogsWanted" -}}
+{{- if and .Values.incidents.enabled (has (include "kubesentry.logsMode" .) (list "auto" "kubernetes")) -}}true{{- end -}}
+{{- end -}}
+
 {{/* Token Secret names: the user's existingSecret, or the one the chart generates. */}}
 {{- define "kubesentry.apiTokenSecret" -}}
 {{- default (printf "%s-api" (include "kubesentry.fullname" .)) .Values.tokens.api.existingSecret -}}
@@ -203,6 +228,24 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if and $am.ca.configMap $am.ca.secret -}}
 {{- fail "kubesentry: set alerts.alertmanager.ca.configMap or alerts.alertmanager.ca.secret, not both." -}}
 {{- end -}}
+{{- end -}}
+{{- $inc := $v.incidents -}}
+{{- $ctMode := include "kubesentry.cloudtrailMode" . -}}
+{{- if $inc.enabled -}}
+{{- if and (kindIs "bool" $v.server.cache) (not $v.server.cache) -}}
+{{- fail "kubesentry: incidents.enabled follows the informer cache's views of the cluster: it needs server.cache (true, or null for the default)." -}}
+{{- end -}}
+{{- if and (gt (int $v.replicas) 1) (ne $v.audit.store "postgres") -}}
+{{- fail (printf "kubesentry: replicas=%d with incidents.enabled needs audit.store=postgres: the replica holding a Postgres advisory lock runs the incidents engine and the others read the store, and with the memory store every replica would keep incidents of its own. Set audit.store=postgres with audit.postgres.existingSecret, or replicas=1." (int $v.replicas)) -}}
+{{- end -}}
+{{- if and (eq (include "kubesentry.logsMode" .) "cloudwatch") (not $inc.logs.group) (not (include "kubesentry.clusterName" .)) -}}
+{{- fail "kubesentry: incidents.logs.mode=cloudwatch needs incidents.logs.group, or clusterName (or eks.clusterName) for Container Insights' /aws/containerinsights/<name>/application." -}}
+{{- end -}}
+{{- if and (eq $ctMode "logs") (not $inc.cloudtrail.logGroup) -}}
+{{- fail "kubesentry: incidents.cloudtrail.mode=logs needs incidents.cloudtrail.logGroup, the CloudWatch Logs group the trail delivers to." -}}
+{{- end -}}
+{{- else if ne $ctMode "off" -}}
+{{- fail (printf "kubesentry: incidents.cloudtrail.mode=%s attaches AWS changes to incidents: it needs incidents.enabled." $ctMode) -}}
 {{- end -}}
 {{- if and (gt (int $v.replicas) 1) (eq $v.audit.store "memory") $sources -}}
 {{- fail (printf "kubesentry: replicas=%d with audit.store=memory and audit sources enabled (%s): each replica would keep a different, partial audit history. Set audit.store=postgres with audit.postgres.existingSecret, or replicas=1." (int $v.replicas) $sources) -}}
@@ -337,6 +380,9 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if not (kindIs "invalid" $al.maxNew) }}{{ $a = append $a (printf "-alerts-max-new=%s" (include "kubesentry.scalar" $al.maxNew)) }}{{ end -}}
 {{- if not (kindIs "invalid" $al.leakCritHours) }}{{ $a = append $a (printf "-alerts-leak-crit-hours=%s" (include "kubesentry.scalar" $al.leakCritHours)) }}{{ end -}}
 {{- with $v.externalURL }}{{ $a = append $a (printf "-external-url=%s" .) }}{{ end -}}
+{{- else if $v.incidents.enabled -}}
+{{- /* Incidents in a namespace without an owner annotation belong to the alerts' default owner. */ -}}
+{{- with $al.defaultOwner }}{{ $a = append $a (printf "-alerts-default-owner=%s" .) }}{{ end -}}
 {{- end -}}
 {{- /* prometheus */ -}}
 {{- $p := $v.prometheus -}}
@@ -380,6 +426,46 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- with $cw.endpoint }}{{ $a = append $a (printf "-cloudwatch-endpoint=%s" .) }}{{ end -}}
 {{- end -}}
 {{- if $v.eks.awsAuth.read }}{{ $a = append $a "-aws-auth=true" }}{{ end -}}
+{{- /* incidents: null leaves a flag off, so the server's default applies */ -}}
+{{- $inc := $v.incidents -}}
+{{- if $inc.enabled -}}
+{{- $a = append $a "-incidents=true" -}}
+{{- range $flag, $val := dict "incident-interval" $inc.interval "incident-max-range" $inc.maxRange "incident-retention" $inc.retention "incident-events-retention" $inc.eventsRetention "incident-quiet" $inc.quiet "incident-lookbehind" $inc.lookbehind "incident-log-lead" $inc.logLead "incident-log-lag" $inc.logLag -}}
+{{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
+{{- end -}}
+{{- with $inc.namespaces }}{{ $a = append $a (printf "-incident-namespaces=%s" (join "," .)) }}{{ end -}}
+{{- if $inc.includeSystem }}{{ $a = append $a "-incident-include-system=true" }}{{ end -}}
+{{- with $inc.appLabel }}{{ $a = append $a (printf "-incident-app-label=%s" .) }}{{ end -}}
+{{- with $inc.appLabels }}{{ $a = append $a (printf "-incident-app-labels=%s" (join "," .)) }}{{ end -}}
+{{- $th := $inc.thresholds -}}
+{{- $thflags := dict "requestRatio" "incident-request-ratio" "requestCritRatio" "incident-request-crit-ratio" "requestMinRPS" "incident-request-min-rps" "errorRatio" "incident-error-ratio" "errorCritRatio" "incident-error-crit-ratio" "memoryLimitPct" "incident-memory-limit-pct" "memoryCritPct" "incident-memory-crit-pct" "memoryJumpRatio" "incident-memory-jump-ratio" "memoryJumpMin" "incident-memory-jump-min" "spikeRecent" "incident-spike-recent" "spikeBaseline" "incident-spike-baseline" "eventMinCount" "incident-event-min-count" -}}
+{{- range $key, $flag := $thflags -}}
+{{- $val := index $th $key -}}
+{{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
+{{- end -}}
+{{- /* [] is a value too: no built-in request profiles, Warnings only */ -}}
+{{- if not (kindIs "invalid" $inc.requestSources) }}{{ $a = append $a (printf "-incident-request-sources=%s" (join "," $inc.requestSources)) }}{{ end -}}
+{{- if $inc.requestProfiles }}{{ $a = append $a "-incident-request-profiles-file=/etc/kubesentry/incidents/request-profiles.json" }}{{ end -}}
+{{- if $inc.alb }}{{ $a = append $a "-incident-alb=true" }}{{ end -}}
+{{- if not (kindIs "invalid" $inc.eventNormalReasons) }}{{ $a = append $a (printf "-incident-event-normal-reasons=%s" (join "," $inc.eventNormalReasons)) }}{{ end -}}
+{{- $lg := $inc.logs -}}
+{{- $lgMode := include "kubesentry.logsMode" . -}}
+{{- if or (ne $lgMode "auto") $lg.mode }}{{ $a = append $a (printf "-incident-logs=%s" $lgMode) }}{{ end -}}
+{{- with $lg.group }}{{ $a = append $a (printf "-incident-logs-group=%s" .) }}{{ end -}}
+{{- with $lg.streamPrefix }}{{ $a = append $a (printf "-incident-logs-stream-prefix=%s" .) }}{{ end -}}
+{{- if not (kindIs "invalid" $lg.maxLines) }}{{ $a = append $a (printf "-incident-logs-max-lines=%s" (include "kubesentry.scalar" $lg.maxLines)) }}{{ end -}}
+{{- if not (kindIs "invalid" $lg.maxBytes) }}{{ $a = append $a (printf "-incident-logs-max-bytes=%s" (include "kubesentry.scalar" $lg.maxBytes)) }}{{ end -}}
+{{- range $inc.redactPatterns }}{{ $a = append $a (printf "-incident-redact-patterns=%s" .) }}{{ end -}}
+{{- $ct := $inc.cloudtrail -}}
+{{- $ctMode := include "kubesentry.cloudtrailMode" . -}}
+{{- if ne $ctMode "off" -}}
+{{- $a = append $a (printf "-cloudtrail=%s" $ctMode) -}}
+{{- if eq $ctMode "logs" }}{{ $a = append $a (printf "-cloudtrail-log-group=%s" $ct.logGroup) }}{{ end -}}
+{{- with $ct.region }}{{ $a = append $a (printf "-cloudtrail-region=%s" .) }}{{ end -}}
+{{- if not (kindIs "invalid" $ct.qps) }}{{ $a = append $a (printf "-cloudtrail-qps=%s" (include "kubesentry.scalar" $ct.qps)) }}{{ end -}}
+{{- with $ct.start }}{{ $a = append $a (printf "-cloudtrail-start=%s" .) }}{{ end -}}
+{{- end -}}
+{{- end -}}
 {{- range $v.extraArgs }}{{ $a = append $a . }}{{ end -}}
 {{- toYaml $a -}}
 {{- end -}}
