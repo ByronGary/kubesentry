@@ -16,7 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ByronGary/kubesentry/internal/alerts"
 	"github.com/ByronGary/kubesentry/internal/api"
+	"github.com/ByronGary/kubesentry/internal/audit"
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
 	"github.com/ByronGary/kubesentry/internal/kube"
@@ -95,12 +97,14 @@ func run(cfg *config) error {
 	var ready atomic.Bool
 	hist := snapshot.NewHistory(snapshot.DefaultHistoryStep, snapshot.DefaultHistoryBuckets)
 	srv.History = hist
-	// built tells the alerts a new view is ready (coalesced: one pending
-	// signal stands for many builds).
-	built := make(chan struct{}, 1)
+	// built tells the alerts and the incidents a new view is ready
+	// (coalesced: one pending signal stands for many builds).
+	var built fanout
+	var cache *kube.Cache
 	if cfg.cache {
-		cache := kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
-			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName})
+		cache = kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
+			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName,
+			AppLabelKeys: cfg.incidents.appLabelKeys()})
 		if err := cache.Start(ctx); err != nil {
 			return fmt.Errorf("start informer cache: %w", err)
 		}
@@ -109,10 +113,7 @@ func run(cfg *config) error {
 				onBuild(v, took, err)
 				if err == nil {
 					hist.Record(v)
-					select {
-					case built <- struct{}{}:
-					default:
-					}
+					built.notify()
 				}
 			}}
 		go func() {
@@ -139,7 +140,7 @@ func run(cfg *config) error {
 	} else {
 		src := kube.NewSourceWithOptions(clients.CS, clients.Dyn, kube.SourceOptions{
 			AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(),
-			ClusterName: cfg.clusterName})
+			ClusterName: cfg.clusterName, AppLabelKeys: cfg.incidents.appLabelKeys()})
 		views := &recordingViews{inner: snapshot.OnDemand{Source: src, Policy: policy}, history: hist}
 		srv.Cluster, srv.Inventory, srv.Certs = src, src, src
 		srv.Views = views
@@ -194,19 +195,36 @@ func run(cfg *config) error {
 		dependencyUp("prometheus", metricsSource.Health)
 	}
 
-	closers, pg, err := setupAudit(ctx, cfg, policy, srv)
+	cwl := newCWLogs(cfg.awsRegion, cfg.cloudwatchEndpoint)
+	closers, pg, err := setupAudit(ctx, cfg, policy, srv, cwl)
 	if err != nil {
 		return err
 	}
 	defer closers.close()
 
+	var alertsRunner *alerts.Runner
 	if cfg.alerts.enabled {
 		if cfg.auditStore != "postgres" {
 			slog.Warn("alerts with the memory store: run one replica; with more, each would notify on its own (use -audit-store=postgres)")
 		}
-		_, err := alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built}.start(ctx, srv)
+		alertsRunner, err = alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built.subscribe()}.start(ctx, srv)
 		if err != nil {
 			return fmt.Errorf("alerts: %w", err)
+		}
+	}
+
+	if cfg.incidents.enabled {
+		if cfg.auditStore != "postgres" {
+			slog.Warn("incidents with the memory store: run one replica; with more, each would keep incidents of its own (use -audit-store=postgres)")
+		}
+		var auditStore audit.Store
+		if ing, ok := srv.Audit.(*audit.Ingester); ok {
+			auditStore = ing.Active()
+		}
+		_, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
+			pg: pg, audit: auditStore, alerts: alertsRunner, cw: cwl}.start(ctx, srv)
+		if err != nil {
+			return fmt.Errorf("incidents: %w", err)
 		}
 	}
 
