@@ -18,7 +18,18 @@ export function isScoped(info: Pick<Info, 'capabilities'> | undefined): boolean 
   return info?.capabilities !== undefined
 }
 
-type Flag = 'inventory' | 'certs' | 'processes' | 'audit'
+export type Flag = 'inventory' | 'certs' | 'processes' | 'audit' | 'incidents'
+
+/**
+ * Whether the server offers a feature. Incidents count only when /info says
+ * they are enabled: older servers leave `incidents` out, and a server could
+ * send it switched off.
+ */
+export function hasFeature(info: Info | undefined, flag: Flag): boolean {
+  if (!info) return false
+  if (flag === 'incidents') return info.incidents?.enabled === true
+  return info[flag] === true
+}
 
 export interface NavItem {
   href: string
@@ -34,7 +45,7 @@ export interface NavItem {
 /** Nav items this server has and this user may use. `hidden` drops routes found missing at run time. */
 export function visibleNav<T extends NavItem>(items: T[], info: Info, hidden: ReadonlySet<string> = new Set()): T[] {
   return items.filter(
-    (n) => !hidden.has(n.href) && (!n.needs || info[n.needs]) && (!n.cap || can(info, n.cap)) && (!n.scopedOnly || isScoped(info)),
+    (n) => !hidden.has(n.href) && (!n.needs || hasFeature(info, n.needs)) && (!n.cap || can(info, n.cap)) && (!n.scopedOnly || isScoped(info)),
   )
 }
 

@@ -40,6 +40,7 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M8 2.5v3M12 2.5v3M8 14.5v3M12 14.5v3M2.5 8h3M2.5 12h3M14.5 8h3M14.5 12h3" />
     </>
   ),
+  incidents: <path d="M11.5 2.5 4.5 11h5l-1 6.5L15.5 9h-5Z" />,
   findings: <path d="M4.5 17.5V3M4.5 3.5h10l-2.2 3.5 2.2 3.5h-10" />,
   memory: (
     <>
