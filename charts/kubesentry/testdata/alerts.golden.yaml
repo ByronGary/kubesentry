@@ -635,6 +635,7 @@ spec:
             - -ingest-addr=:8081
             - -ops-addr=:9090
             - -auth-mode=token
+            - -agent-interval=15s
             - -owner-annotation=kubesentry.io/owner
             - -production-label=environment=production
             - -alerts=true
@@ -649,6 +650,18 @@ spec:
             - -alerts-max-new=100
             - -alerts-owner-max-new=10
             - -alerts-leak-crit-hours=12
+            - -alerts-disable-checks=nodeport
+            - -alerts-audit=audit-exec,audit-rbac-change,audit-anonymous
+            - -alerts-audit-production-only=audit-exec
+            - -alerts-audit-denied-burst=50
+            - -alerts-audit-hold=2h
+            - -alerts-digest-at=Mon 09:00
+            - -alerts-digest-tz=Europe/Berlin
+            - -alerts-digest-kinds=rbac-posture,certificates
+            - -alerts-cert-digest-days=21
+            - -agent-daemonset=kubesentry/kubesentry-agent
+            - -agent-fanout=true
+            - -alerts-agents=on
             - -external-url=https://kubesentry.example.com
             - -prometheus-autodiscover=true
             - -audit-store=memory

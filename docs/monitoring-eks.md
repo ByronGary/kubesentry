@@ -165,7 +165,7 @@ There are two ways to use AMP:
    - `node` on pod alerts whose pods all run on one node
    - `cluster` (`-cluster-name`)
    - a `kubesentry_<x>` routing hint for every other `kubesentry.io/<x>` namespace annotation
-   - `kubesentry_digest="true"` on digests
+   - `kubesentry_digest="true"` on digests, and `digest` (the kind) on standing digests
 
    The dedupe key (`check/kind/namespace/name`), a link to the finding (`kubesentry_url`, with `externalURL`) and, once the alert's episode has joined an incident, a link to the incident (`incident_url`, with `externalURL` and incidents on) are annotations.
 2. **Owner.** The owner comes from the annotation `kubesentry.io/owner` on the namespace:
@@ -176,9 +176,10 @@ There are two ways to use AMP:
    ```
 
    A finding in a namespace without the annotation, or a cluster-scoped finding such as RBAC drift, gets `alerts.defaultOwner` (`platform`). It then falls through to the platform receivers, unless you give `owner="platform"` a branch of its own. The same annotation on a workload, Service, Ingress, Certificate or RBAC object overrides its namespace's for that object's alerts; the namespace's routing hints then stay off them (`docs/alerts.md`, Owners).
-3. **Production.** The namespace label `environment=production` sets `production="true"`, so a route can page for production only (`matchers: ['production = "true"', 'severity = "critical"']`). Production-only checks, such as exec into a production pod, come in phase C.
+3. **Production.** The namespace label `environment=production` sets `production="true"`, so a route can page for production only (`matchers: ['production = "true"', 'severity = "critical"']`). Some checks count only production namespaces: exec, port-forward and debug containers, and secret reads by people (`KubesentryAuditActivity`, `alerts.audit.productionOnly`); a workload sharing the host's namespaces is critical there.
 4. **Storms.** When more than `alerts.maxNew` (50) new findings appear at once, as on a first install, or one owner gets more than `alerts.ownerMaxNew` (20) in `alerts.ownerWindow` (15m), kubesentry sends one `KubesentryFindingsDigest` per owner with `kubesentry_digest="true"`, which the digest route below keeps quiet. A digested finding that turns critical fires on its own.
-5. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration. Acknowledging or silencing a finding in kubesentry (`docs/alerts.md`) changes what it posts (an ack adds `acknowledged_by`; a silence ends the alert, which receivers with `send_resolved` report as resolved), but never creates an Alertmanager silence. Duplicate posts (an HA pair, a leader change) are harmless: Alertmanager knows an alert by its label set.
+5. **Standing digests.** With `alerts.digests.at` set (e.g. `"Mon 09:00"`), kubesentry sends one `KubesentryStandingDigest` per owner and kind at that time: RBAC posture, unused volumes with their cost, and certificates more than 14 days from expiry (`docs/alerts.md`, Standing-state digests). They carry `kubesentry_digest="true"` and `severity="info"`, are sent once and end an hour later, so their route groups by `owner` and `digest` and notifies within minutes, never pages. Keep `kubesentry_digest!="true"` on any InfoInhibitor rule, or a cluster-wide info alert mutes them (the profile does).
+6. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration. Acknowledging or silencing a finding in kubesentry (`docs/alerts.md`) changes what it posts (an ack adds `acknowledged_by`; a silence ends the alert, which receivers with `send_resolved` report as resolved), but never creates an Alertmanager silence. Duplicate posts (an HA pair, a leader change) are harmless: Alertmanager knows an alert by its label set.
 
 **Routing hints.** A receiver can take its destination from a hint instead of needing one branch per team. For example, one Slack receiver for every team that set `kubesentry.io/slack-channel`:
 
@@ -206,6 +207,7 @@ Group such a route by `kubesentry_slack_channel` as well, so that every notifica
 |---|---|---|
 | dead man's switch | `alertname="Watchdog"` | `deadmans-switch`: pings a heartbeat service every 5 minutes |
 | helper | `alertname="InfoInhibitor"` | `null` |
+| standing digests | `kubesentry_digest="true"`, `severity="info"` | `digest`, grouped by `owner` and `digest`: each notifies once, within minutes, never a page |
 | digests | `kubesentry_digest="true"` | `digest`: one message per owner per day, never a page |
 | one branch per team | `owner="payments"`, and within it `severity="critical"` | `team-payments`, `team-payments-pager` |
 | unowned critical | `severity="critical"` | `platform-pager` |
@@ -226,6 +228,7 @@ Group such a route by `kubesentry_slack_channel` as well, so that every notifica
 - A critical alert mutes the warning or info alert with the same name about the same object. The `equal` list includes kubesentry's `workload` and `object` labels: a label missing from both alerts counts as equal, so without them a critical alert about one workload would mute the warnings about every other workload in its namespace.
 - A NotReady or unreachable node mutes alerts carrying its `node` label. The profile adds `node` to node-exporter series, and kubesentry sets it on pod alerts whose pods all run on one node (pods stuck terminating, evictions). The rule requires `node` to be set on the muted alert; without that, every alert lacking a `node` label would be muted while any node is down.
 - `KubeAPIDown` mutes the client-side errors that follow it, kubesentry's included.
+- `InfoInhibitor` mutes info alerts in namespaces with nothing worse firing, except kubesentry's standing digests (`kubesentry_digest!="true"`): they have no namespace, and would otherwise be muted by any cluster-wide info alert.
 
 **Prometheus alerts and owners.** Prometheus alerts, unlike kubesentry's, carry no owner, so they all go to the platform team. Two ways to route a team's Prometheus alerts too:
 

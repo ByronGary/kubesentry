@@ -1,0 +1,4 @@
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+kubesentry:
+- at '/alerts/digests/at': '9am' does not match pattern '^((([Mm]on(day)?|[Tt]ue(sday)?|[Ww]ed(nesday)?|[Tt]hu(rsday)?|[Ff]ri(day)?|[Ss]at(urday)?|[Ss]un(day)?) )?([01][0-9]|2[0-3]):[0-5][0-9])?$'
+

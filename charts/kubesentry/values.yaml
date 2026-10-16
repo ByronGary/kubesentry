@@ -560,6 +560,42 @@ alerts:
   # -- Each alert's runbook_url is this plus "#<alert name in lower case>";
   # empty: docs/alerts.md on GitHub. Point it at your own copy if you keep runbooks internally.
   runbookBaseURL: ""
+  # -- Checks that never alert (-alerts-disable-checks), e.g. [nodeport,
+  # ingress-no-tls]; their open findings resolve. The checks are listed in
+  # docs/alerts.md, section 3.
+  disableChecks: []
+  # -- KubesentryAuditActivity: exec, secret reads, RBAC changes,
+  # impersonation, bursts of denied requests and anonymous access, read from
+  # the audit store (audit.sources). null keeps the server default (in brackets).
+  audit:
+    # -- -alerts-audit: the audit checks to run (all six); [] runs none.
+    checks: null
+    # -- -alerts-audit-production-only (audit-exec, audit-secret-read): checks
+    # that count only events in production namespaces; [] for none.
+    productionOnly: null
+    hold: null          # -alerts-audit-hold (1h) a finding stays open this long after its newest event
+    deniedBurst: null   # -alerts-audit-denied-burst (20) denied requests by one actor...
+    deniedWindow: null  # -alerts-audit-denied-window (10m) ...within this window
+  # -- Standing-state digests (KubesentryStandingDigest, severity info,
+  # kubesentry_digest="true"): one alert per owner and kind at a fixed time,
+  # for what stands rather than what changed. Route them to a quiet receiver
+  # (docs/monitoring-eks.md).
+  digests:
+    # -- -alerts-digest-at: "Mon 09:00" weekly, "09:00" daily; empty: off.
+    at: ""
+    # -- -alerts-digest-tz: the time zone of at (an IANA name).
+    tz: UTC
+    # -- -alerts-digest-kinds: rbac-posture, unused-volumes, certificates;
+    # null sends all three.
+    kinds: null
+    # -- -alerts-cert-digest-days (14): with the certificates digest, an
+    # expiring certificate with more days left is only listed there.
+    certDays: null
+  # -- -alerts-agents: KubesentryAgentMissing, for nodes running the chart's
+  # agent whose reports stopped. auto: on with replicas 1 or agent.fanout
+  # (every replica hears every agent); "on"; "off" (quote them: YAML reads
+  # bare on and off as booleans).
+  agents: auto
   alertmanager:
     # -- Alertmanager base URLs (-alertmanager-url); every alert goes to each
     # (list both members of an HA pair). Amazon Managed Prometheus:

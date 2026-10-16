@@ -301,6 +301,16 @@ alertmanager:
         # kube-prometheus-stack's helper alert that mutes lone info alerts.
         - receiver: "null"
           matchers: ['alertname = "InfoInhibitor"']
+        # kubesentry's standing-state digests (KubesentryStandingDigest,
+        # severity info; alerts.digests.at): RBAC posture, unused volumes and
+        # certificates far from expiry, per owner. Each is sent once and ends
+        # after an hour, so it gets a group of its own that notifies at once.
+        - receiver: digest
+          matchers: ['kubesentry_digest = "true"', 'severity = "info"']
+          group_by: [owner, digest]
+          group_wait: 1m
+          group_interval: 1h
+          repeat_interval: 168h
         # Low-urgency findings kubesentry sends as digests: one quiet message
         # per owner a day, never a page, whatever the severity.
         - receiver: digest
@@ -339,9 +349,11 @@ alertmanager:
         target_matchers: ['severity = "info"']
         equal: [alertname, namespace, name, pod, persistentvolumeclaim, node, instance, device, mountpoint, workload, object]
       # Info alerts reach someone only next to a warning or critical in the
-      # same namespace (kube-prometheus-stack's InfoInhibitor).
+      # same namespace (kube-prometheus-stack's InfoInhibitor). kubesentry's
+      # standing digests are info without a namespace: they must not be muted
+      # by an InfoInhibitor of cluster-wide info alerts.
       - source_matchers: ['alertname = "InfoInhibitor"']
-        target_matchers: ['severity = "info"']
+        target_matchers: ['severity = "info"', 'kubesentry_digest != "true"']
         equal: [namespace]
       # A node that is down mutes the alerts about things on it. The target must
       # carry a node label: without node =~ ".+", every alert lacking one would

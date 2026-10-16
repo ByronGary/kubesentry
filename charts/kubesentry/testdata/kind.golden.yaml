@@ -568,6 +568,7 @@ spec:
             - -ops-addr=:9090
             - -cluster-name=kind-kubesentry
             - -auth-mode=token
+            - -agent-interval=15s
             - -pvc-min-age=5m
             - -owner-annotation=kubesentry.io/owner
             - -production-label=environment=production

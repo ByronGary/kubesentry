@@ -819,6 +819,7 @@ spec:
             - -authz-deny-ttl=1m
             - -authz-share-by-groups=true
             - -system-namespaces-add=cert-manager,external-secrets,monitoring,kubesentry-agent
+            - -agent-interval=15s
             - -ebs-prices=gp2=0.1,gp3=0.08,io2=0.125
             - -owner-annotation=kubesentry.io/owner
             - -production-label=environment=production
@@ -832,6 +833,8 @@ spec:
             - -alerts-resolve-grace=5m
             - -alerts-max-new=50
             - -alerts-owner-max-new=20
+            - -agent-daemonset=kubesentry-agent/kubesentry-agent
+            - -agent-fanout=true
             - -external-url=https://kubesentry.prod.example.com
             - -prometheus-url=https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012
             - -prometheus-sigv4=true

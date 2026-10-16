@@ -206,6 +206,12 @@ routes team-payments alertname=KubesentryCertificateExpiring severity=warning ow
   object=Certificate/api-tls check=cert-expiring production=false
 routes platform-pager alertname=KubesentryRBACDrift severity=critical owner=platform object=ClusterRoleBinding/erin-admin check=cluster-admin
 routes digest alertname=KubesentryFindingsDigest severity=warning owner=payments check=digest kubesentry_digest=true
+routes digest alertname=KubesentryStandingDigest severity=info owner=payments digest=unused-volumes kubesentry_digest=true
+routes team-payments alertname=KubesentryAuditActivity severity=warning owner=payments namespace=payments \
+  object=User/alice@example.com check=audit-exec production=true
+routes platform-pager alertname=KubesentryAuditActivity severity=critical owner=platform object=User/system:anonymous check=audit-anonymous
+routes team-payments alertname=KubesentryExposureChange severity=warning owner=payments namespace=payments object=Service/api check=loadbalancer
+routes platform alertname=KubesentryAgentMissing severity=warning owner=platform object=DaemonSet/kubesentry/kubesentry-agent check=agent-missing
 
 if [ -n "$kps" ]; then
   echo "== kube-prometheus-stack ($kps) rendered with $PROFILE"

@@ -606,6 +606,7 @@ spec:
             - -ops-addr=:9090
             - -cluster-name=prod-eks
             - -auth-mode=token
+            - -agent-interval=15s
             - -owner-annotation=kubesentry.io/owner
             - -production-label=environment=production
             - -alerts-default-owner=platform

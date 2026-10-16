@@ -1,7 +1,9 @@
 # The alerts golden case (hack/helm-test.sh): findings go to an in-cluster
 # Alertmanager pair with a bearer token and a private CA, through a
 # restricted egress policy, with the alerting rules rendered; editors may
-# acknowledge and silence, also from the team portal.
+# acknowledge and silence, also from the team portal. NodePorts never alert,
+# audit exec counts in production only, a 2h hold, weekly digests in Berlin
+# time, and the agent check on the chart's own agents.
 alerts:
   enabled: true
   defaultOwner: platform-team
@@ -10,6 +12,18 @@ alerts:
   ownerWindow: 30m
   maxSilence: 3d
   leakCritHours: 12
+  disableChecks: [nodeport]
+  audit:
+    checks: [audit-exec, audit-rbac-change, audit-anonymous]
+    productionOnly: [audit-exec]
+    hold: 2h
+    deniedBurst: 50
+  digests:
+    at: Mon 09:00
+    tz: Europe/Berlin
+    kinds: [rbac-posture, certificates]
+    certDays: 21
+  agents: "on"
   alertmanager:
     urls:
       - https://alertmanager-0.alertmanager-operated.monitoring:9093

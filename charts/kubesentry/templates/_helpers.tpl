@@ -228,6 +228,9 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if and $am.ca.configMap $am.ca.secret -}}
 {{- fail "kubesentry: set alerts.alertmanager.ca.configMap or alerts.alertmanager.ca.secret, not both." -}}
 {{- end -}}
+{{- if and (eq $v.alerts.agents "on") (not $v.agent.enabled) -}}
+{{- fail "kubesentry: alerts.agents=on watches the chart's agent DaemonSet: it needs agent.enabled." -}}
+{{- end -}}
 {{- end -}}
 {{- $inc := $v.incidents -}}
 {{- $ctMode := include "kubesentry.cloudtrailMode" . -}}
@@ -355,6 +358,8 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- $addNS = append $addNS $agentNS -}}
 {{- end -}}
 {{- with $addNS }}{{ $a = append $a (printf "-system-namespaces-add=%s" (join "," .)) }}{{ end -}}
+{{- /* The server judges agent reports by the interval its agents use (stale process data, missing agents). */ -}}
+{{- if and $v.agent.enabled $v.agent.interval }}{{ $a = append $a (printf "-agent-interval=%s" $v.agent.interval) }}{{ end -}}
 {{- $t := $v.thresholds -}}
 {{- $tflags := dict "restartWarn" "restart-warn" "restartCrit" "restart-crit" "oomRecent" "oom-recent" "pendingGrace" "pending-grace" "notReadyGrace" "not-ready-grace" "terminatingGrace" "terminating-grace" "recentPod" "recent-pod" "activityWindow" "activity-window" "pvcMinAge" "pvc-min-age" "leakCritHours" "leak-crit-hours" "leakMinSlope" "leak-min-slope" "leakMinR2" "leak-min-r2" "leakDropRatio" "leak-drop-ratio" "leakMinPoints" "leak-min-points" "certCritCap" "cert-crit-cap" "certWarnCap" "cert-warn-cap" -}}
 {{- range $key, $flag := $tflags -}}
@@ -381,6 +386,28 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if not (kindIs "invalid" $al.maxNew) }}{{ $a = append $a (printf "-alerts-max-new=%s" (include "kubesentry.scalar" $al.maxNew)) }}{{ end -}}
 {{- if not (kindIs "invalid" $al.ownerMaxNew) }}{{ $a = append $a (printf "-alerts-owner-max-new=%s" (include "kubesentry.scalar" $al.ownerMaxNew)) }}{{ end -}}
 {{- if not (kindIs "invalid" $al.leakCritHours) }}{{ $a = append $a (printf "-alerts-leak-crit-hours=%s" (include "kubesentry.scalar" $al.leakCritHours)) }}{{ end -}}
+{{- with $al.disableChecks }}{{ $a = append $a (printf "-alerts-disable-checks=%s" (join "," .)) }}{{ end -}}
+{{- /* audit checks: null keeps the server default, [] is a value too */ -}}
+{{- $aa := $al.audit -}}
+{{- if not (kindIs "invalid" $aa.checks) }}{{ $a = append $a (printf "-alerts-audit=%s" (default "none" (join "," $aa.checks))) }}{{ end -}}
+{{- if not (kindIs "invalid" $aa.productionOnly) }}{{ $a = append $a (printf "-alerts-audit-production-only=%s" (join "," $aa.productionOnly)) }}{{ end -}}
+{{- range $flag, $val := dict "alerts-audit-hold" $aa.hold "alerts-audit-denied-burst" $aa.deniedBurst "alerts-audit-denied-window" $aa.deniedWindow -}}
+{{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
+{{- end -}}
+{{- /* standing-state digests */ -}}
+{{- $dg := $al.digests -}}
+{{- with $dg.at -}}
+{{- $a = append $a (printf "-alerts-digest-at=%s" .) -}}
+{{- with $dg.tz }}{{ $a = append $a (printf "-alerts-digest-tz=%s" .) }}{{ end -}}
+{{- if not (kindIs "invalid" $dg.kinds) }}{{ $a = append $a (printf "-alerts-digest-kinds=%s" (join "," $dg.kinds)) }}{{ end -}}
+{{- if not (kindIs "invalid" $dg.certDays) }}{{ $a = append $a (printf "-alerts-cert-digest-days=%s" (include "kubesentry.scalar" $dg.certDays)) }}{{ end -}}
+{{- end -}}
+{{- /* agent-missing: the chart's own agent DaemonSet; every replica hears every agent with one replica or fan-out */ -}}
+{{- if $v.agent.enabled -}}
+{{- $a = append $a (printf "-agent-daemonset=%s/%s-agent" (include "kubesentry.agentNamespace" .) (include "kubesentry.fullname" .)) -}}
+{{- if or (eq (int $v.replicas) 1) $v.agent.fanout }}{{ $a = append $a "-agent-fanout=true" }}{{ end -}}
+{{- end -}}
+{{- if ne $al.agents "auto" }}{{ $a = append $a (printf "-alerts-agents=%s" $al.agents) }}{{ end -}}
 {{- else if $v.incidents.enabled -}}
 {{- /* Incidents in a namespace without an owner annotation belong to the alerts' default owner. */ -}}
 {{- with $al.defaultOwner }}{{ $a = append $a (printf "-alerts-default-owner=%s" .) }}{{ end -}}

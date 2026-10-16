@@ -126,6 +126,8 @@ echo "== refused configurations"
 refuses guardrail-memory-replicas --set replicas=2 --set audit.sources.webhook.enabled=true
 # Two replicas would each notify on their own: the alerts lock needs Postgres.
 refuses guardrail-alerts-replicas --set replicas=2 --set alerts.enabled=true
+# The agent check watches the chart's own agent DaemonSet.
+refuses guardrail-alerts-agents-on --set alerts.enabled=true --set alerts.agents=on --set agent.enabled=false
 # AMP's alert manager takes SigV4 from the pod's role, not a token.
 refuses guardrail-alerts-sigv4-secret --set alerts.enabled=true --set alerts.alertmanager.existingSecret=am \
   --set 'alerts.alertmanager.urls={https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-1/alertmanager}'
@@ -151,6 +153,7 @@ refuses guardrail-incident-logs-group --set incidents.enabled=true --set inciden
 refuses schema-auth-mode --set auth.mode=sso
 refuses schema-production-label --set 'alerts.production.labelKey=bad key'
 refuses schema-allowed-origins --set 'server.allowedOrigins={portal.example.com}'
+refuses schema-digest-at --set 'alerts.digests.at=9am'
 # An incident covers at most 24 hours.
 refuses schema-incidents-max-range --set incidents.enabled=true --set incidents.maxRange=48h
 
