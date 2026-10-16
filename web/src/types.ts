@@ -754,6 +754,8 @@ export interface IncidentKubeEvent {
   lastSeen: string
   regarding: ObjectRef
   source?: string
+  /** The workload root the event resolved to, when known. */
+  subject?: IncidentSubject
 }
 
 export interface IncidentDetail {
@@ -786,7 +788,8 @@ export interface IncidentLogLine {
 export interface IncidentLogsResponse {
   from: string
   to: string
-  source: 'kubernetes' | 'cloudwatch'
+  /** "" when no log source is configured (the response then carries a warning). */
+  source: 'kubernetes' | 'cloudwatch' | ''
   lines: IncidentLogLine[]
   truncated: boolean
   warnings?: string[]
