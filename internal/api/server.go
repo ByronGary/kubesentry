@@ -13,6 +13,7 @@ import (
 
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 	"github.com/ByronGary/kubesentry/internal/model"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
@@ -145,6 +146,13 @@ type Server struct {
 	// Alerts, if set, serves GET /api/v1/alerts, /info's alerts and the
 	// Overview's alerts widget from the alerting runner's board.
 	Alerts AlertsSource
+	// Incidents, if set, serves GET /api/v1/incidents and the routes under
+	// it, /info's incidents, the Overview's open incidents and the pod
+	// page's incidents from the incidents runner.
+	Incidents IncidentsSource
+	// IncidentStore, if set, serves list ranges older than the incidents
+	// board (up to the retention); without it the board answers them.
+	IncidentStore incidents.Store
 
 	cacheOnce sync.Once
 	recheckMu sync.Mutex
@@ -280,6 +288,7 @@ var cachedRoutes = map[string][]auth.Capability{
 	"GET /api/v1/certificates": {auth.ViewNamespace, auth.ViewClusterIssuer},
 	"GET /api/v1/overview":     overviewCaps,
 	alertsRoute:                alertsCaps,
+	incidentsRoute:             incidentsCaps,
 }
 
 // cacheWindows bounds how long a cached route's response is served, for
@@ -287,13 +296,15 @@ var cachedRoutes = map[string][]auth.Capability{
 // (the overview's age, health and activity): the key gains the window.
 var cacheWindows = map[string]time.Duration{
 	"GET /api/v1/overview": overviewCacheWindow,
+	incidentsRoute:         incidentsCacheWindow,
 }
 
 // cacheKey keys a cached route's response by path, query, the caller's scope
 // over the route's capabilities and the view version (and for /alerts the
 // board's version). Other requests, and
 // every request while the provider cannot name its current view (before the
-// first view exists, too), are not cached. The scope is looked up through
+// first view exists, too), are not cached; /incidents adds the incidents
+// board's version. The scope is looked up through
 // the request's authzMemo, so the handler filters by exactly the scope the
 // key names.
 func (s *Server) cacheKey(r *http.Request) (string, bool) {
@@ -308,6 +319,9 @@ func (s *Server) cacheKey(r *http.Request) (string, bool) {
 	}
 	if ok && r.Pattern == alertsRoute {
 		key += "\x00" + s.alertsCacheKey()
+	}
+	if ok && r.Pattern == incidentsRoute {
+		key += "\x00" + s.incidentsCacheKey()
 	}
 	return key, ok
 }
@@ -374,6 +388,12 @@ func (s *Server) apiRoutes() http.Handler {
 	}
 	if s.Alerts != nil {
 		s.route(mux, alertsRoute, "alerts", t, s.alertsList)
+	}
+	if s.Incidents != nil {
+		s.route(mux, incidentsRoute, "incidents", t, s.incidentsList)
+		s.routeCapped(mux, incidentRoute, "incident", long, expensive, s.incidentDetail)
+		s.routeCapped(mux, incidentLogsRoute, "incident_logs", long, expensive, s.incidentLogs)
+		s.routeCapped(mux, incidentBundleRoute, "incident_bundle", long, expensive, s.incidentBundle)
 	}
 	return withAuthzMemo(mux)
 }

@@ -22,7 +22,7 @@ import (
 // tailer and the CloudWatch reader, with their metrics and health checks.
 // The returned cleanups flush and close the store; the Postgres store is
 // returned too (nil with the memory store), for the alerts.
-func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *api.Server) (closers, *pgstore.Store, error) {
+func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *api.Server, cwl *cwLogs) (closers, *pgstore.Store, error) {
 	var cleanup closers
 	if cfg.auditLogFile == "" && cfg.auditToken == "" && cfg.auditJournal == "" && !cfg.cloudwatch && cfg.auditStore != "postgres" {
 		return cleanup, nil, nil
@@ -34,6 +34,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		pg, err = pgstore.Open(ctx, pgstore.ResolveDSN(cfg.pgDSN), pgstore.Options{
 			Schema: cfg.pgSchema, Retention: cfg.auditRetention, Owner: hostname(), Logger: slog.Default(),
 			MaxConns: int32(cfg.pgMaxConns), QueryTimeout: cfg.pgQueryTimeout,
+			EventsRetention: cfg.incidents.eventsRetention, IncidentRetention: cfg.incidents.retention,
 		})
 		if err != nil {
 			return cleanup, nil, fmt.Errorf("audit store: %w", err)
@@ -90,7 +91,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 
 	var cw *cwRunner
 	if cfg.cloudwatch {
-		client, err := cloudwatch.New(ctx, cfg.awsRegion, cfg.cloudwatchEndpoint)
+		client, err := cwl.client(ctx, "")
 		if err != nil {
 			return cleanup, nil, err
 		}
@@ -100,7 +101,7 @@ func setupAudit(ctx context.Context, cfg *config, policy detectors.Policy, srv *
 		}
 		cw = &cwRunner{
 			api: client, logGroup: group, prefix: cfg.cloudwatchPrefix, start: cfg.cloudwatchStart,
-			pg: pg, store: ing.Active(),
+			pg: pg, store: ing.Active(), pacer: cwl.pacer,
 			ingest: func(b []byte) ([]audit.Event, error) {
 				events, err := audit.Parse(bytes.NewReader(b))
 				if err == nil {
@@ -175,6 +176,7 @@ type cwRunner struct {
 	ingest   func([]byte) ([]audit.Event, error)
 	pg       *pgstore.Store // nil: memory store
 	store    audit.Store
+	pacer    *cloudwatch.Pacer // shared with the other CloudWatch Logs readers; nil makes one
 
 	cur atomic.Pointer[cloudwatch.Reader]
 }
@@ -183,7 +185,7 @@ type cwRunner struct {
 const leaderRetry = 30 * time.Second
 
 func (c *cwRunner) reader(store cloudwatch.Committer) *cloudwatch.Reader {
-	return &cloudwatch.Reader{API: c.api, Store: store, LogGroup: c.logGroup, StreamPrefix: c.prefix, Start: c.start, Ingest: c.ingest}
+	return &cloudwatch.Reader{API: c.api, Store: store, LogGroup: c.logGroup, StreamPrefix: c.prefix, Start: c.start, Ingest: c.ingest, Pacer: c.pacer}
 }
 
 func (c *cwRunner) run(ctx context.Context) {

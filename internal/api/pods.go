@@ -163,6 +163,9 @@ type podDiagnosticsResponse struct {
 	Activity         []audit.Event           `json:"activity"`
 	ActivityWindow   string                  `json:"activityWindow"` // Go duration of the activity look-back
 	Warnings         []string                `json:"warnings,omitempty"`
+	// Incidents (open, or resolved within the board's day) whose subject
+	// owns the pod, or that name it; left out when incidents are off.
+	Incidents []incidentRef `json:"incidents,omitempty"`
 }
 
 // podDiagnostics builds the per-pod report: a verdict per check, memory history
@@ -290,6 +293,7 @@ func (s *Server) podDiagnostics(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	resp.Incidents = s.podIncidents(v, ns, name)
 	resp.Checks = detectors.DiagnosePodWith(detectors.PodInput{
 		Pod: *pod, Volumes: resp.Volumes, Leaks: leaks,
 		MetricsAvailable: resp.MetricsAvailable, AuditAvailable: resp.AuditAvailable,

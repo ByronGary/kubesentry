@@ -300,10 +300,20 @@ func NewCluster(now time.Time) *Cluster {
 			pvc("data", "feature-store", "gp3", "Pending", 0, 20*time.Minute, now),
 		},
 	}
+	// The shop's services are one app (app.kubernetes.io/part-of), so their
+	// incidents are related.
+	for i := range c.pods {
+		if p := &c.pods[i]; p.Namespace == "prod" && shopApps[p.Labels["app"]] {
+			p.Labels["app.kubernetes.io/part-of"] = "shop"
+		}
+	}
 	c.addInventory(now)
 	c.link(now)
 	return c
 }
+
+// shopApps are the shop's services in prod.
+var shopApps = map[string]bool{"checkout-web": true, "checkout-api": true, "catalog-api": true, "recommendations": true}
 
 // crashLooping makes a container wait in CrashLoopBackOff after failing.
 func crashLooping(c model.ContainerStatus, msg string, lastFailed time.Time) model.ContainerStatus {

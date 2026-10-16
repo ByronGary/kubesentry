@@ -55,6 +55,8 @@ type overviewResponse struct {
 	History    overviewHistory  `json:"history"`
 	// Alerts is left out when alerting is off.
 	Alerts *overviewAlerts `json:"alerts,omitempty"`
+	// Incidents is left out when incidents are off.
+	Incidents *overviewIncidents `json:"incidents,omitempty"`
 }
 
 type overviewScope struct {
@@ -709,7 +711,8 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	leaks := s.selectedLeaks(sel)
-	top, total, worst := mergeLeaks(v, idx, base.groups, leaks)
+	incExtras, incCounts := s.selectedIncidents(v, sel)
+	top, total, worst := mergeExtras(idx, base.groups, append(leakExtras(v, leaks), incExtras...))
 	resp.Attention = make([]attentionItem, len(top))
 	for i, g := range top {
 		resp.Attention[i] = g.out(idx.owner[g.key.ns])
@@ -733,6 +736,11 @@ func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.History, resp.Security.NewSince24h = s.overviewHistory(now, sel, base.security)
 	resp.Alerts = s.overviewAlerts(sel)
+	if resp.Incidents = incCounts; incCounts != nil {
+		if n := incCounts.Open.Critical + incCounts.Open.Warning; n > 0 {
+			resp.Badges["incidents"] = badge{Count: n, Severity: worse(incCounts.Open.Critical > 0)}
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
