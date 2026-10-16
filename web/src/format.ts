@@ -117,6 +117,26 @@ export function truncateMiddle(s: string, max: number): string {
   return `${s.slice(0, head)}…${s.slice(s.length - (keep - head))}`
 }
 
+/** Requests a second: "0.35/s", "4.2/s", "35/s", "1.2k/s". */
+export function formatRate(n: number): string {
+  if (!Number.isFinite(n)) return '-'
+  const a = Math.abs(n)
+  if (a === 0) return '0/s'
+  if (a >= 1000) return `${(n / 1000).toFixed(a >= 10_000 ? 0 : 1).replace(/\.0$/, '')}k/s`
+  if (a >= 10) return `${Math.round(n)}/s`
+  if (a >= 1) return `${n.toFixed(1).replace(/\.0$/, '')}/s`
+  return `${Number(n.toPrecision(2))}/s`
+}
+
+/** A ratio as a percent: "0%", "0.5%", "12%". */
+export function formatPercent(ratio: number): string {
+  if (!Number.isFinite(ratio)) return '-'
+  const p = ratio * 100
+  if (p === 0) return '0%'
+  if (Math.abs(p) < 10) return `${Number(p.toFixed(1))}%`
+  return `${Math.round(p)}%`
+}
+
 /** "a, b, c and 2 more" */
 export function listSome(items: string[], max = 3): string {
   if (items.length <= max) return items.join(', ')

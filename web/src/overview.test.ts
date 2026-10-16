@@ -182,6 +182,29 @@ describe('tiles', () => {
   })
 })
 
+describe('incidents on the Overview', () => {
+  it('puts an open-incidents tile first when the server tracks them, linked to the open list', () => {
+    const t = tiles(overview({ incidents: { open: { critical: 2, warning: 1 } } }), { namespace: 'shop', owner: '' })
+    expect(t.map((x) => x.key)).toEqual(['incidents', 'nodes', 'pods', 'workloads', 'certificates', 'security'])
+    expect(t[0]).toMatchObject({ total: 3, status: 'crit', totalHref: '#/incidents?state=open&namespace=shop' })
+    expect(t[0].lines.map((l) => [l.count, l.status, l.href])).toEqual([
+      [2, 'crit', '#/incidents?state=open&namespace=shop&severity=critical'],
+      [1, 'warn', '#/incidents?state=open&namespace=shop&severity=warning'],
+    ])
+    expect(tiles(overview({ incidents: { open: { critical: 0, warning: 0 } } }))[0].status).toBe('ok')
+  })
+  it('has no tile without incidents (off, or an older server)', () => {
+    expect(tiles(overview()).some((x) => x.key === 'incidents')).toBe(false)
+  })
+  it('labels incident attention items and keeps their link', () => {
+    const rows = attentionRows(
+      [{ severity: 'crit', kind: 'incident', namespace: 'shop', name: 'checkout-web', title: 'Requests and memory spiked (+1 more)', href: '#/incidents/20261015T120000Z-abcdef012345' }],
+      now,
+    )
+    expect(rows[0]).toMatchObject({ kind: 'Incident', href: '#/incidents/20261015T120000Z-abcdef012345', subject: 'shop/checkout-web' })
+  })
+})
+
 describe('attentionRows', () => {
   it('shows severity, subject, owner, relative age and a safe link, top 10', () => {
     const items = Array.from({ length: 12 }, (_, i) => ({

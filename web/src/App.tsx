@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react'
-import { can, hiddenNote } from './access'
+import { can, hasFeature, hiddenNote } from './access'
 import { ApiError, setAuthSource } from './api'
 import { InfoContext, NO_INFO, PrometheusNotice, StatusBanners } from './components/Access'
 import { AppHeader, Sidebar, useSidebar, useTheme } from './components/Shell'
@@ -9,6 +9,8 @@ import { Activity } from './pages/Activity'
 import { Agents } from './pages/Agents'
 import { Certificates } from './pages/Certificates'
 import { Findings } from './pages/Findings'
+import { IncidentDetail } from './pages/IncidentDetail'
+import { Incidents } from './pages/Incidents'
 import { MapPage } from './pages/Map'
 import { Memory } from './pages/Memory'
 import { Nodes } from './pages/Nodes'
@@ -23,10 +25,10 @@ import { prometheusOutage } from './sources'
 import type { Capability, Info, OverviewResponse } from './types'
 import { useApi, usePolled, type ApiState } from './useApi'
 
-type Flag = 'inventory' | 'certs'
+type Flag = 'inventory' | 'certs' | 'incidents'
 
 /** Pages built around wide tables (and the Overview's tiles) get more room; the map and node pages get the most. */
-const TABLE_PAGES = new Set<PageKey>(['overview', 'pods', 'workloads', 'storage', 'activity', 'agents'])
+const TABLE_PAGES = new Set<PageKey>(['overview', 'pods', 'workloads', 'storage', 'activity', 'agents', 'incidents', 'incident'])
 const WIDE_PAGES = new Set<PageKey>(['map', 'nodes'])
 
 /** Pages that read metrics: the Prometheus notice above them replaces the generic banner's line. */
@@ -46,14 +48,16 @@ function Gate({ state, title, needs, cap, children }: { state: ApiState<Info>; t
       </>
     )
   }
-  if (needs && !state.data[needs]) {
+  if (needs && !hasFeature(state.data, needs)) {
     return (
       <>
         <PageHead title={title} />
         <Empty title={`${title} is not available on this server`}>
           {needs === 'certs'
             ? 'This kubesentry server does not read cert-manager objects.'
-            : 'This kubesentry server does not list workloads, services and nodes, so this page has nothing to show.'}
+            : needs === 'incidents'
+              ? 'This kubesentry server does not track incidents: it is older than incidents, or runs without -incidents.'
+              : 'This kubesentry server does not list workloads, services and nodes, so this page has nothing to show.'}
         </Empty>
       </>
     )
@@ -136,6 +140,16 @@ export function App() {
       break
     case 'activity':
       page = <Gate state={infoState} title="Activity" cap="audit">{(i) => <Activity route={route} info={i} />}</Gate>
+      break
+    case 'incidents':
+      page = <Gate state={infoState} title="Incidents" needs="incidents">{(i) => <Incidents route={route} info={i} />}</Gate>
+      break
+    case 'incident':
+      page = (
+        <Gate state={infoState} title="Incident" needs="incidents">
+          {(i) => <IncidentDetail key={parts[1]} id={parts[1]} route={route} info={i} />}
+        </Gate>
+      )
       break
     case 'agents':
       page = <Gate state={infoState} title="Agents" cap="agents">{() => <Agents onMissing={() => hideRoute('/agents')} />}</Gate>

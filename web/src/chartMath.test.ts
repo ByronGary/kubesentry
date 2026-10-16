@@ -1,5 +1,30 @@
 import { describe, expect, it } from 'vitest'
-import { byteTicks, findDrops, nearestIndex, niceTicks, projectToLimit, sparkline, sparkText, thin, timeTicks, type Point } from './chartMath'
+import {
+  brushRange,
+  bucketCounts,
+  byteTicks,
+  extent,
+  findDrops,
+  linePath,
+  medianStep,
+  nearestIndex,
+  niceTicks,
+  plotGeometry,
+  projectToLimit,
+  rateTicks,
+  sharedDomain,
+  sparkline,
+  sparkText,
+  spreadLabels,
+  stackMarkers,
+  thin,
+  timeAt,
+  timeTicks,
+  valueAt,
+  xOf,
+  type MarkerIn,
+  type Point,
+} from './chartMath'
 
 describe('sparkline', () => {
   it('scales counts from a zero baseline across the box', () => {
@@ -101,5 +126,146 @@ describe('thin', () => {
     expect(t).toHaveLength(10)
     expect(t[9]).toEqual([99, 99])
     expect(thin(s.slice(0, 5), 10)).toHaveLength(5)
+  })
+})
+
+const MIN = 60_000
+
+describe('sharedDomain', () => {
+  it('uses the window when there is one, so every chart shares it', () => {
+    expect(sharedDomain([1000, 5000 + MIN], [[0, 99 * MIN]])).toEqual([1000, 5000 + MIN])
+    // Reversed ends are put in order.
+    expect(sharedDomain([10 * MIN, 0])).toEqual([0, 10 * MIN])
+  })
+  it('falls back to the union of the data extents', () => {
+    expect(sharedDomain(undefined, [[2 * MIN, 5 * MIN], undefined, [0, 3 * MIN]])).toEqual([0, 5 * MIN])
+    expect(sharedDomain([NaN, 1], [[0, 2 * MIN]])).toEqual([0, 2 * MIN])
+  })
+  it('grows a too-narrow span around its middle and gives up on nothing', () => {
+    expect(sharedDomain(undefined, [[MIN, MIN]])).toEqual([MIN / 2, MIN * 1.5])
+    expect(sharedDomain(undefined, [])).toBeUndefined()
+  })
+  it('reads extents from series', () => {
+    expect(extent([[5, 1], [9, 2], [7, 3]])).toEqual([5, 9])
+    expect(extent([])).toBeUndefined()
+  })
+})
+
+describe('xOf and timeAt', () => {
+  const d: [number, number] = [0, 100]
+  it('map time to pixels and back', () => {
+    expect(xOf(50, d, 10, 200)).toBe(110)
+    expect(timeAt(110, d, 10, 200)).toBe(50)
+  })
+  it('clamp pixels outside the plot to the domain', () => {
+    expect(timeAt(-40, d, 10, 200)).toBe(0)
+    expect(timeAt(900, d, 10, 200)).toBe(100)
+    expect(timeAt(50, d, 10, 0)).toBe(0)
+  })
+})
+
+describe('rateTicks', () => {
+  it('gives round steps that reach the maximum', () => {
+    expect(rateTicks(37)).toEqual([0, 10, 20, 30, 40])
+    expect(rateTicks(0.3)).toEqual([0, 0.1, 0.2, 0.3])
+    expect(rateTicks(0.031)).toEqual([0, 0.01, 0.02, 0.03, 0.04])
+  })
+  it('never collapses to a lone zero', () => {
+    expect(rateTicks(0)).toEqual([0, 1])
+    expect(rateTicks(NaN)).toEqual([0, 1])
+    expect(rateTicks(1e-9).length).toBeGreaterThan(1)
+  })
+})
+
+describe('brushRange', () => {
+  const d: [number, number] = [0, 60 * MIN]
+  it('orders the ends and clamps them to the domain', () => {
+    expect(brushRange(30 * MIN, 10 * MIN, d)).toEqual([10 * MIN, 30 * MIN])
+    expect(brushRange(-5 * MIN, 70 * MIN, d)).toEqual([0, 60 * MIN])
+  })
+  it('treats a click as no brush', () => {
+    expect(brushRange(5, 5, d)).toBeNull()
+    expect(brushRange(NaN, 5, d)).toBeNull()
+  })
+  it('grows a tiny brush to the minimum span, inside the domain', () => {
+    expect(brushRange(10 * MIN, 10 * MIN + 1000, d)).toEqual([10 * MIN + 500 - MIN / 2, 10 * MIN + 500 + MIN / 2])
+    // At the left edge it grows rightwards.
+    expect(brushRange(0, 1000, d)).toEqual([0, MIN])
+    // At the right edge, leftwards.
+    expect(brushRange(60 * MIN - 1000, 60 * MIN, d)).toEqual([59 * MIN, 60 * MIN])
+    // A domain narrower than the minimum is used whole.
+    expect(brushRange(0, 10, [0, 30_000])).toEqual([0, 30_000])
+  })
+})
+
+describe('bucketCounts', () => {
+  it('counts times per equal slice, keeping the end in the last one', () => {
+    expect(bucketCounts([0, 1, 2, 5, 9, 10], [0, 10], 2)).toEqual([3, 3])
+    expect(bucketCounts([0, 3, 3, 7], [0, 10], 5)).toEqual([1, 2, 0, 1, 0])
+  })
+  it('leaves out times outside the domain', () => {
+    expect(bucketCounts([-1, 11, NaN, 5], [0, 10], 1)).toEqual([1])
+    expect(bucketCounts([1], [0, 0], 3)).toEqual([0, 0, 0])
+    expect(bucketCounts([1], [0, 10], 0)).toEqual([])
+  })
+})
+
+describe('stackMarkers', () => {
+  const px = (t: number) => t
+  const m = (t: number, kind: string): MarkerIn => ({ t, kind, label: `${kind}@${t}` })
+  it('merges close markers of one kind into one glyph', () => {
+    const s = stackMarkers([m(0, 'restart'), m(5, 'restart'), m(40, 'restart')], px, 12)
+    expect(s.map((x) => [x.px, x.row, x.items.length])).toEqual([[0, 0, 2], [40, 0, 1]])
+  })
+  it('stacks colliding kinds in rows, then folds into the top row', () => {
+    const s = stackMarkers([m(0, 'oom'), m(2, 'restart'), m(4, 'deploy'), m(6, 'event')], px, 12, 3)
+    expect(s.map((x) => [x.kind, x.row])).toEqual([['oom', 0], ['restart', 1], ['deploy', 2]])
+    expect(s[2].items.map((i) => i.kind)).toEqual(['deploy', 'event'])
+  })
+  it('reuses the lowest free row and sorts by time', () => {
+    const s = stackMarkers([m(30, 'event'), m(0, 'oom'), m(3, 'deploy')], px, 12)
+    expect(s.map((x) => [x.kind, x.row])).toEqual([['oom', 0], ['deploy', 1], ['event', 0]])
+  })
+})
+
+describe('spreadLabels', () => {
+  it('keeps labels apart and in order', () => {
+    expect(spreadLabels([50, 52, 100], 12, 0, 200)).toEqual([50, 62, 100])
+    expect(spreadLabels([52, 50], 12, 0, 200)).toEqual([62, 50])
+  })
+  it('pushes a run back up from the bottom', () => {
+    expect(spreadLabels([198, 199, 200], 10, 0, 200)).toEqual([180, 190, 200])
+  })
+})
+
+describe('linePath and medianStep', () => {
+  const id = (n: number) => n
+  it('breaks the line at gaps and missing values', () => {
+    expect(linePath([[0, 1], [10, 2], [40, 3], [50, NaN], [60, 4]], id, id, 15)).toBe('M0.0,1.0L10.0,2.0M40.0,3.0M60.0,4.0')
+    expect(linePath([], id, id)).toBe('')
+  })
+  it('finds the usual sample spacing', () => {
+    expect(medianStep([[0, 1], [10, 1], [20, 1], [90, 1]])).toBe(10)
+    expect(medianStep([[0, 1]])).toBeUndefined()
+  })
+  it('lays out a plot: margins, a y scale with headroom to a round tick, the shared x', () => {
+    const g = plotGeometry({ width: 400, height: 200, margin: { top: 10, right: 40, bottom: 30, left: 60 }, domain: [0, 100], values: [37, 12, NaN], ticks: (m) => rateTicks(m) })
+    expect([g.iw, g.ih]).toEqual([300, 160])
+    expect(g.yTicks).toEqual([0, 10, 20, 30, 40])
+    expect(g.yTop).toBe(40)
+    expect(g.y(0)).toBe(170)
+    expect(g.y(40)).toBe(10)
+    expect(g.x(0)).toBe(60)
+    expect(g.x(100)).toBe(360)
+    // Nothing to fit still gives a usable scale.
+    const flat = plotGeometry({ width: 400, height: 200, margin: { top: 0, right: 0, bottom: 0, left: 0 }, domain: [0, 1], values: [], ticks: (m) => byteTicks(m) })
+    expect(flat.yTop).toBe(1)
+    expect(Number.isFinite(flat.y(0))).toBe(true)
+  })
+  it('reads a value near a time, within a tolerance', () => {
+    const s: Point[] = [[0, 1], [10, 2]]
+    expect(valueAt(s, 9, 2)).toBe(2)
+    expect(valueAt(s, 5, 2)).toBeUndefined()
+    expect(valueAt([], 5, 2)).toBeUndefined()
   })
 })

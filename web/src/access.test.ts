@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { busiestNamespace, can, chooseMapNamespace, hiddenNote, isScoped, missingCapabilities, namesOnlyNote, seesNothing, visibleNav, type NavItem } from './access'
+import { busiestNamespace, can, chooseMapNamespace, hasFeature, hiddenNote, isScoped, missingCapabilities, namesOnlyNote, seesNothing, visibleNav, type NavItem } from './access'
 import type { Info } from './types'
 
 const base: Info = { demo: false, metrics: true, audit: true, processes: true, inventory: true, certs: true }
@@ -43,6 +43,25 @@ describe('visibleNav', () => {
   it('hides routes found missing at run time', () => {
     const info = { ...base, capabilities: { audit: true, agents: true } }
     expect(hrefs(visibleNav(nav, info, new Set(['/agents'])))).toEqual(['/', '/map', '/certificates', '/activity'])
+  })
+})
+
+describe('hasFeature', () => {
+  const inc = { enabled: true, sources: {}, maxRangeHours: 24, logLeadSeconds: 300, logLagSeconds: 600 }
+  it('counts incidents only when /info says they are enabled', () => {
+    expect(hasFeature({ ...base, incidents: inc }, 'incidents')).toBe(true)
+    expect(hasFeature({ ...base, incidents: { ...inc, enabled: false } }, 'incidents')).toBe(false)
+    expect(hasFeature(base, 'incidents')).toBe(false)
+    expect(hasFeature(undefined, 'inventory')).toBe(false)
+  })
+  it('reads the boolean flags as before', () => {
+    expect(hasFeature(base, 'inventory')).toBe(true)
+    expect(hasFeature({ ...base, certs: false }, 'certs')).toBe(false)
+  })
+  it('gates a nav item on incidents', () => {
+    const items: NavItem[] = [{ href: '/incidents', label: 'Incidents', needs: 'incidents' }]
+    expect(visibleNav(items, base)).toEqual([])
+    expect(visibleNav(items, { ...base, incidents: inc })).toHaveLength(1)
   })
 })
 

@@ -5,10 +5,11 @@ import { PrometheusNotice } from '../components/Access'
 import { ActivityTable } from '../components/ActivityTable'
 import { MemoryChart } from '../components/MemoryChart'
 import { Async, BusyNotice, PageHead, Segmented, StatusGlyph } from '../components/ui'
-import { ago, formatBytes, formatCPU, plural } from '../format'
+import { ago, formatBytes, formatCPU, formatDateTime, plural } from '../format'
+import { incidentHref, severityGlyph } from '../incidents'
 import { activityEmptyText, metricsHistoryHours, metricsWhy, windowChoices, type WindowOption } from '../retention'
 import { podActivity, prometheusOutage, unexplainedWarnings } from '../sources'
-import type { Info, PodDiagnostics, ProcessesResponse, Status } from '../types'
+import type { IncidentRef, Info, PodDiagnostics, ProcessesResponse, Status } from '../types'
 import { useApi } from '../useApi'
 
 /** The server's memory windows (it accepts up to 7 days); longer than Prometheus keeps are disabled. */
@@ -67,6 +68,7 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
                 <span>{v.text}</span>
               </p>
               {warnings.map((w) => <div className="notice warn" key={w}>{w}</div>)}
+              {d.incidents && d.incidents.length > 0 && <IncidentBanner refs={d.incidents} />}
 
               <section aria-labelledby="h-checks">
                 <h2 id="h-checks">Diagnosis</h2>
@@ -190,5 +192,35 @@ export function PodDetail({ ns, name, info }: { ns: string; name: string; info: 
         }}
       </Async>
     </>
+  )
+}
+
+/** The incidents this pod is part of (open, or resolved within a day), newest first. */
+function IncidentBanner({ refs }: { refs: IncidentRef[] }) {
+  const open = refs.filter((r) => r.state === 'open')
+  const worst = open.some((r) => r.severity === 'critical') ? 'crit' : open.length ? 'warn' : ''
+  return (
+    <section className={`notice inc-banner ${worst}`} aria-labelledby="h-pod-inc">
+      <h2 id="h-pod-inc" className="inc-banner-title">
+        {open.length > 0
+          ? `${open.length} open ${plural(open.length, 'incident involves', 'incidents involve')} this pod`
+          : `${refs.length} recent ${plural(refs.length, 'incident involved', 'incidents involved')} this pod`}
+      </h2>
+      <ul className="plain">
+        {refs.slice(0, 5).map((r) => (
+          <li key={r.id}>
+            <StatusGlyph status={severityGlyph(r.severity)} label={false} /> <a href={incidentHref(r.id)}>{r.title}</a>{' '}
+            <span className="muted small" title={formatDateTime(r.start)}>
+              {r.state}, started {ago(r.start)}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {refs.length > 5 && (
+        <p className="small">
+          <a href="#/incidents">All incidents</a>
+        </p>
+      )}
+    </section>
   )
 }

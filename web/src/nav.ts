@@ -13,6 +13,7 @@ export type NavKey =
   | 'pods'
   | 'nodes'
   | 'agents'
+  | 'incidents'
   | 'findings'
   | 'memory'
   | 'storage'
@@ -45,6 +46,7 @@ export const NAV: NavEntry[] = [
   { key: 'nodes', section: 'cluster', href: '/nodes', label: 'Nodes', needs: 'inventory', cap: 'nodes' },
   // Agent status is a newer route: only servers that scope per user have it.
   { key: 'agents', section: 'cluster', href: '/agents', label: 'Agents', needs: 'processes', cap: 'agents', scopedOnly: true },
+  { key: 'incidents', section: 'health', href: '/incidents', label: 'Incidents', needs: 'incidents' },
   { key: 'findings', section: 'health', href: '/findings', label: 'Findings' },
   { key: 'memory', section: 'health', href: '/memory', label: 'Memory' },
   { key: 'storage', section: 'health', href: '/storage', label: 'Storage' },
@@ -163,7 +165,7 @@ export function groupNav(info: Info, opts: GroupOptions = {}, items: NavEntry[] 
 
 // ---- Routes ----
 
-export type PageKey = Exclude<NavKey, 'alerts'> | 'pod'
+export type PageKey = Exclude<NavKey, 'alerts'> | 'pod' | 'incident'
 
 export interface Resolved {
   page: PageKey
@@ -173,7 +175,7 @@ export interface Resolved {
   redirect?: string
 }
 
-const PAGES = new Set<string>(['map', 'workloads', 'pods', 'nodes', 'agents', 'findings', 'memory', 'storage', 'security', 'certificates', 'activity'])
+const PAGES = new Set<string>(['map', 'workloads', 'pods', 'nodes', 'agents', 'incidents', 'findings', 'memory', 'storage', 'security', 'certificates', 'activity'])
 
 /** Old paths that still work. */
 const ALIAS: Record<string, string> = { volumes: 'storage' }
@@ -191,7 +193,8 @@ function decode(s: string): string {
  * /overview (`overview: false`): then it is Findings, the old home page.
  * Findings itself lives at `#/findings`; it never took query parameters, so an
  * old `#/` link needs no translation. Older addresses redirect:
- * `#/map?view=nodes` to `#/nodes`, `#/volumes` to `#/storage`.
+ * `#/map?view=nodes` to `#/nodes`, `#/volumes` to `#/storage`. An incident's
+ * page is `#/incidents/<id>`.
  */
 export function resolveRoute(path: string, query: URLSearchParams, opts: { overview: boolean }): Resolved {
   const parts = path.split('/').filter(Boolean).map(decode)
@@ -213,6 +216,8 @@ export function resolveRoute(path: string, query: URLSearchParams, opts: { overv
     return { page: 'nodes', parts: ['nodes'], redirect: `#/nodes${q ? `?${q}` : ''}` }
   }
   if (first === 'pods' && parts.length >= 3) return { page: 'pod', parts }
+  // One incident: #/incidents/<id>; the id arrives decoded in parts[1].
+  if (first === 'incidents' && parts.length >= 2 && parts[1]) return { page: 'incident', parts }
   if (PAGES.has(first)) return { page: first as PageKey, parts }
   // Unknown paths (and Alerts, until it exists) show the home page, as before.
   return { page: home, parts }
@@ -220,7 +225,7 @@ export function resolveRoute(path: string, query: URLSearchParams, opts: { overv
 
 /** The nav item to mark as the current page. */
 export function activeKey(page: PageKey): NavKey {
-  return page === 'pod' ? 'pods' : page
+  return page === 'pod' ? 'pods' : page === 'incident' ? 'incidents' : page
 }
 
 // ---- Layout and folding ----

@@ -142,6 +142,31 @@ describe('resolveRoute', () => {
   it('survives malformed escapes', () => {
     expect(r('/pods/shop/%E0%A4%A').parts).toEqual(['pods', 'shop', '%E0%A4%A'])
   })
+  it('opens the incidents list and one incident under Incidents', () => {
+    expect(r('/incidents?state=open').page).toBe('incidents')
+    const x = r('/incidents/20261015T120000Z-abcdef012345?from=2026-10-15T12%3A10%3A00Z')
+    expect(x).toEqual({ page: 'incident', parts: ['incidents', '20261015T120000Z-abcdef012345'] })
+    expect(activeKey(x.page)).toBe('incidents')
+    // An encoded slash stays inside the id.
+    expect(r('/incidents/a%2Fb').parts).toEqual(['incidents', 'a/b'])
+  })
+})
+
+describe('incidents in the sidebar', () => {
+  const on: Info = { ...scoped, incidents: { enabled: true, sources: {}, maxRangeHours: 24, logLeadSeconds: 300, logLagSeconds: 600 } }
+  it('shows Incidents first in Health when the server tracks them', () => {
+    expect(keys(on).find(([k]) => k === 'health')).toEqual(['health', ['incidents', 'findings', 'memory', 'storage']])
+  })
+  it('hides it on older servers and when incidents are switched off', () => {
+    expect(keys(scoped).find(([k]) => k === 'health')![1]).not.toContain('incidents')
+    const off: Info = { ...scoped, incidents: { enabled: false, sources: {}, maxRangeHours: 24, logLeadSeconds: 0, logLagSeconds: 0 } }
+    expect(keys(off).find(([k]) => k === 'health')![1]).not.toContain('incidents')
+  })
+  it('carries the open-incidents badge to the open list', () => {
+    const health = groupNav(on, { badges: { incidents: { count: 2, severity: 'crit' } } }).find((s) => s.key === 'health')!
+    expect(health.items[0].badge).toEqual({ count: 2, severity: 'crit', href: '#/incidents?state=open', label: '2 open incidents, critical' })
+    expect(health.worst).toBe('crit')
+  })
 })
 
 describe('layout', () => {

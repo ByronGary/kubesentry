@@ -133,7 +133,7 @@ export interface TileSpark {
   span: string
 }
 
-export type TileKey = 'nodes' | 'pods' | 'workloads' | 'certificates' | 'security'
+export type TileKey = 'incidents' | 'nodes' | 'pods' | 'workloads' | 'certificates' | 'security'
 
 export interface Tile {
   key: TileKey
@@ -177,11 +177,31 @@ const flag = (n: number, s: AttentionSeverity): AttentionSeverity | undefined =>
  * The tiles, in the wireframe's order. A null `nodes` (no access) keeps its
  * tile, saying "not visible to you"; a null `certificates` (no cert-manager)
  * drops the tile. Every number links to the page that explains it, with the
- * namespace filter carried over where that page understands it.
+ * namespace filter carried over where that page understands it. Open
+ * incidents come first when the server tracks them (absent `incidents`: no tile).
  */
 export function tiles(o: OverviewResponse, f: OverviewFilter = { namespace: '', owner: '' }): Tile[] {
   const ns = f.namespace || undefined
   const out: Tile[] = []
+
+  if (o.incidents) {
+    const { critical = 0, warning = 0 } = o.incidents.open ?? {}
+    const scope = { state: 'open', namespace: ns, owner: f.owner || undefined }
+    const iLines: TileLine[] = [
+      { key: 'critical', count: critical, text: 'reached critical', status: flag(critical, 'crit'), href: link('incidents', { ...scope, severity: 'critical' }) },
+      { key: 'warning', count: warning, text: 'warning only', status: flag(warning, 'warn'), href: link('incidents', { ...scope, severity: 'warning' }) },
+    ]
+    out.push({
+      key: 'incidents',
+      title: 'Open incidents',
+      total: critical + warning,
+      totalHref: link('incidents', scope),
+      status: worst(iLines),
+      lines: iLines,
+      extras: [],
+      foot: 'Spikes, restarts and alerts per workload',
+    })
+  }
 
   if (o.nodes === null) {
     out.push({ key: 'nodes', title: 'Nodes', restricted: true, status: 'unknown', lines: [], extras: [] })
@@ -292,6 +312,7 @@ const KIND_LABEL: Record<string, string> = {
   crashloop: 'Crash loop',
   'image-pull': 'Image pull',
   oom: 'OOMKilled',
+  incident: 'Incident',
   leak: 'Memory leak',
   pending: 'Pending',
   'cert-expiring': 'Certificate',

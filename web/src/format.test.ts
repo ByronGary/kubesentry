@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { ago, formatAge, formatBytes, formatCPU, formatExpiry, formatHours, formatUSD, hoursUntil, listSome, percent, plural, truncateMiddle } from './format'
+import { ago, formatAge, formatBytes, formatCPU, formatExpiry, formatHours, formatPercent, formatRate, formatUSD, hoursUntil, listSome, percent, plural, truncateMiddle } from './format'
+
+describe('formatRate and formatPercent', () => {
+  it('keeps request rates short', () => {
+    expect([0, 0.354, 4.25, 4, 35.4, 1240, 14_400, NaN].map(formatRate)).toEqual(['0/s', '0.35/s', '4.3/s', '4/s', '35/s', '1.2k/s', '14k/s', '-'])
+  })
+  it('shows error ratios as percents', () => {
+    expect([0, 0.005, 0.0512, 0.2, 1, NaN].map(formatPercent)).toEqual(['0%', '0.5%', '5.1%', '20%', '100%', '-'])
+  })
+})
 
 describe('formatBytes', () => {
   it('uses binary units and drops needless decimals', () => {

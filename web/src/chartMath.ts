@@ -165,3 +165,281 @@ export function thin(series: Point[], max: number): Point[] {
   for (let i = 0; i < max; i++) out.push(series[Math.round(i * stride)])
   return out
 }
+
+// ---- Time-aligned charts (incidents): one x domain shared by every chart, lane and strip on a page ----
+
+/** A [from, to] time range in unix ms. */
+export type Range = [number, number]
+
+const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n)
+
+/** First and last sample time of a series; undefined when empty. */
+export function extent(points: readonly Point[]): Range | undefined {
+  let lo = Infinity
+  let hi = -Infinity
+  for (const p of points) {
+    if (!finite(p[0])) continue
+    if (p[0] < lo) lo = p[0]
+    if (p[0] > hi) hi = p[0]
+  }
+  return lo <= hi ? [lo, hi] : undefined
+}
+
+/**
+ * The x domain charts on one page share, so a time sits at the same x in each.
+ * The window (the incident's padded window) wins when it is valid; otherwise
+ * the union of the data extents. A span narrower than `minSpan` grows around
+ * its middle, so a single sample still gets an axis. Undefined when there is
+ * nothing to go on.
+ */
+export function sharedDomain(window: Range | undefined, extents: readonly (Range | undefined)[] = [], minSpan = 60_000): Range | undefined {
+  let lo = Infinity
+  let hi = -Infinity
+  if (window && finite(window[0]) && finite(window[1])) {
+    lo = Math.min(window[0], window[1])
+    hi = Math.max(window[0], window[1])
+  } else {
+    for (const e of extents) {
+      if (!e || !finite(e[0]) || !finite(e[1])) continue
+      lo = Math.min(lo, e[0], e[1])
+      hi = Math.max(hi, e[0], e[1])
+    }
+  }
+  if (!(lo <= hi)) return undefined
+  if (hi - lo < minSpan) {
+    const mid = (lo + hi) / 2
+    return [mid - minSpan / 2, mid + minSpan / 2]
+  }
+  return [lo, hi]
+}
+
+/** x pixel for time t on a domain drawn from `left` over `width` pixels. */
+export function xOf(t: number, domain: Range, left: number, width: number): number {
+  const span = domain[1] - domain[0]
+  return left + (span > 0 ? ((t - domain[0]) / span) * width : 0)
+}
+
+/** The time under pixel `px`, clamped to the domain. */
+export function timeAt(px: number, domain: Range, left: number, width: number): number {
+  if (!(width > 0)) return domain[0]
+  const f = Math.min(1, Math.max(0, (px - left) / width))
+  return domain[0] + f * (domain[1] - domain[0])
+}
+
+/**
+ * Round ticks from zero for a rate or ratio axis, reaching at least `max`.
+ * Unlike niceTicks it never returns a lone 0 (an all-zero series still gets a
+ * scale) and computes each tick by multiplication, so 0.1 steps do not drift
+ * to 0.30000000000000004.
+ */
+export function rateTicks(max: number, target = 4): number[] {
+  if (!(max > 0) || !Number.isFinite(max)) return [0, 1]
+  const rough = max / target
+  const pow = Math.pow(10, Math.floor(Math.log10(rough)))
+  const frac = rough / pow
+  const step = (frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 5 ? 5 : 10) * pow
+  const n = Math.max(1, Math.ceil(max / step - 1e-9))
+  const out: number[] = []
+  for (let i = 0; i <= n; i++) out.push(Number((i * step).toPrecision(12)))
+  return out
+}
+
+/**
+ * The range a brush covers, from its two ends in either order: clamped to the
+ * domain and at least `minSpan` wide (grown around its middle, kept inside the
+ * domain). Null when the ends coincide or are not numbers: a click, not a drag.
+ */
+export function brushRange(a: number, b: number, domain: Range, minSpan = 60_000): Range | null {
+  if (!finite(a) || !finite(b) || a === b) return null
+  let from = Math.max(domain[0], Math.min(a, b))
+  let to = Math.min(domain[1], Math.max(a, b))
+  if (to < from) return null
+  const span = Math.min(minSpan, domain[1] - domain[0])
+  if (to - from < span) {
+    const mid = (from + to) / 2
+    from = mid - span / 2
+    to = mid + span / 2
+    if (from < domain[0]) {
+      to += domain[0] - from
+      from = domain[0]
+    }
+    if (to > domain[1]) {
+      from -= to - domain[1]
+      to = domain[1]
+    }
+  }
+  return [Math.round(from), Math.round(to)]
+}
+
+/** How many of `times` fall in each of `buckets` equal slices of the domain; times outside it are left out. */
+export function bucketCounts(times: readonly number[], domain: Range, buckets: number): number[] {
+  const n = Math.max(0, Math.floor(buckets))
+  const out = new Array<number>(n).fill(0)
+  const span = domain[1] - domain[0]
+  if (n === 0 || !(span > 0)) return out
+  for (const t of times) {
+    if (!finite(t) || t < domain[0] || t > domain[1]) continue
+    out[Math.min(n - 1, Math.floor(((t - domain[0]) / span) * n))]++
+  }
+  return out
+}
+
+export interface MarkerIn<K extends string = string> {
+  t: number
+  kind: K
+  label: string
+}
+
+export interface MarkerStack<K extends string = string> {
+  /** Where the stack sits: its first marker's time and x. */
+  t: number
+  px: number
+  /** 0 is the row nearest the axis. */
+  row: number
+  kind: K
+  /** Every marker this one glyph stands for. */
+  items: MarkerIn<K>[]
+}
+
+/**
+ * Lays out event markers (OOM, restart, deploy, event) so their glyphs do not
+ * overlap. Markers of one kind closer than `gap` pixels merge into one glyph
+ * with a count; a different kind that would collide moves up a row; once
+ * `maxRows` are used, it joins the latest stack on the top row instead.
+ */
+export function stackMarkers<K extends string>(markers: readonly MarkerIn<K>[], toPx: (t: number) => number, gap = 12, maxRows = 3): MarkerStack<K>[] {
+  const sorted = markers.filter((m) => finite(m.t)).slice().sort((a, b) => a.t - b.t)
+  // Same kind, close together: one glyph.
+  const groups: MarkerStack<K>[] = []
+  const lastOfKind = new Map<K, MarkerStack<K>>()
+  for (const m of sorted) {
+    const px = toPx(m.t)
+    const g = lastOfKind.get(m.kind)
+    if (g && px - g.px < gap) {
+      g.items.push(m)
+      continue
+    }
+    const ng: MarkerStack<K> = { t: m.t, px, row: 0, kind: m.kind, items: [m] }
+    groups.push(ng)
+    lastOfKind.set(m.kind, ng)
+  }
+  // Different kinds that collide: stack in rows.
+  const rows = Math.max(1, Math.floor(maxRows))
+  const rowEnd: number[] = []
+  const rowLast: MarkerStack<K>[] = []
+  const out: MarkerStack<K>[] = []
+  for (const g of groups) {
+    let r = rowEnd.findIndex((end) => g.px - end >= gap)
+    if (r === -1 && rowEnd.length < rows) r = rowEnd.length
+    if (r === -1) {
+      rowLast[rows - 1].items.push(...g.items)
+      continue
+    }
+    g.row = r
+    rowEnd[r] = g.px
+    rowLast[r] = g
+    out.push(g)
+  }
+  return out
+}
+
+/**
+ * Moves label centres apart so none are closer than `gap`, keeping their
+ * order and staying within [top, bottom] where there is room. Returns the new
+ * positions in the input order (end labels beside several lines).
+ */
+export function spreadLabels(ys: readonly number[], gap: number, top: number, bottom: number): number[] {
+  const order = ys.map((y, i) => ({ y, i })).sort((a, b) => a.y - b.y || a.i - b.i)
+  const pos = order.map((o) => Math.min(bottom, Math.max(top, o.y)))
+  for (let k = 1; k < pos.length; k++) if (pos[k] - pos[k - 1] < gap) pos[k] = pos[k - 1] + gap
+  // Pushed past the bottom: shift the run back up, but not above the top.
+  if (pos.length && pos[pos.length - 1] > bottom) {
+    for (let k = pos.length - 1; k >= 0; k--) {
+      const limit = k === pos.length - 1 ? bottom : pos[k + 1] - gap
+      pos[k] = Math.max(top, Math.min(pos[k], limit))
+    }
+  }
+  const out = new Array<number>(ys.length)
+  order.forEach((o, k) => (out[o.i] = Math.round(pos[k] * 10) / 10))
+  return out
+}
+
+/**
+ * SVG path through the points, broken at non-finite values and where two
+ * samples are more than `breakAfter` ms apart (no samples there).
+ */
+export function linePath(points: readonly Point[], x: (t: number) => number, y: (v: number) => number, breakAfter = Infinity): string {
+  let d = ''
+  let prev: number | undefined
+  for (const [t, v] of points) {
+    if (!finite(t) || !finite(v)) {
+      prev = undefined
+      continue
+    }
+    const move = prev === undefined || t - prev > breakAfter
+    d += `${move ? 'M' : 'L'}${x(t).toFixed(1)},${y(v).toFixed(1)}`
+    prev = t
+  }
+  return d
+}
+
+/** The usual spacing of a series' samples (the median gap); undefined with fewer than two. */
+export function medianStep(points: readonly Point[]): number | undefined {
+  if (points.length < 2) return undefined
+  const gaps: number[] = []
+  for (let i = 1; i < points.length; i++) gaps.push(points[i][0] - points[i - 1][0])
+  gaps.sort((a, b) => a - b)
+  return gaps[Math.floor(gaps.length / 2)]
+}
+
+export interface Margin {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
+export interface PlotGeometry {
+  /** Inner width and height: the plot inside the margins. */
+  iw: number
+  ih: number
+  yTop: number
+  yTicks: number[]
+  xTicks: number[]
+  x: (t: number) => number
+  y: (v: number) => number
+}
+
+/**
+ * Where everything goes in a time chart `width` x `height`: the y scale fits
+ * every value in `values` (the lines, thresholds, a projection) with 6%
+ * headroom and reaches a round tick; the x scale is the shared domain.
+ */
+export function plotGeometry(o: { width: number; height: number; margin: Margin; domain: Range; values: readonly number[]; ticks: (max: number) => number[] }): PlotGeometry {
+  const { width, height, margin: m, domain } = o
+  const iw = Math.max(1, width - m.left - m.right)
+  const ih = Math.max(1, height - m.top - m.bottom)
+  let max = 0
+  for (const v of o.values) if (finite(v) && v > max) max = v
+  const yMax = max * 1.06
+  const yTicks = o.ticks(yMax)
+  const top = Math.max(yMax, yTicks[yTicks.length - 1] ?? 0)
+  const yTop = top > 0 ? top : 1
+  return {
+    iw,
+    ih,
+    yTop,
+    yTicks,
+    xTicks: timeTicks(domain[0], domain[1], Math.max(3, Math.floor(width / 110))),
+    x: (t) => xOf(t, domain, m.left, iw),
+    y: (v) => m.top + ih - (v / yTop) * ih,
+  }
+}
+
+/** The value of a series at time t: the nearest sample within `tolerance` ms, else undefined. */
+export function valueAt(points: readonly Point[], t: number, tolerance: number): number | undefined {
+  if (!points.length) return undefined
+  const i = nearestIndex(points as Point[], t)
+  const p = points[i]
+  return p && Math.abs(p[0] - t) <= tolerance ? p[1] : undefined
+}
