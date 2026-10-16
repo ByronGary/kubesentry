@@ -1,4 +1,5 @@
 import { hiddenNote, seesNothing } from '../access'
+import { alertsWidget } from '../alerts'
 import { NoNamespaces, useInfo } from '../components/Access'
 import { Sparkline } from '../components/Sparkline'
 import { Async, Empty, PageHead, StatusGlyph } from '../components/ui'
@@ -120,6 +121,7 @@ function Body({ o, filter }: { o: OverviewResponse; filter: OverviewFilter }) {
           {o.activity && <Activity a={o.activity} />}
         </div>
         <div className="ov-col">
+          {o.alerts && <AlertsPanel a={o.alerts} worst={o.badges?.alerts?.severity} filter={filter} />}
           {o.nodes && <Capacity nodes={o.nodes} />}
           <section className="panel" aria-labelledby="h-waste">
             <div className="panel-head">
@@ -362,6 +364,54 @@ function Activity({ a }: { a: NonNullable<OverviewResponse['activity']> }) {
       )}
       <p className="panel-more">
         <a href="#/activity">All activity</a>
+      </p>
+    </section>
+  )
+}
+
+/** Not-resolved alerts by state and owner; `worst` is the sidebar badge's severity (the worst open alert that notifies on its own). */
+function AlertsPanel({ a, worst, filter }: { a: NonNullable<OverviewResponse['alerts']>; worst?: 'crit' | 'warn'; filter: OverviewFilter }) {
+  const w = alertsWidget(a, filter)
+  return (
+    <section className="panel" aria-labelledby="h-alerts">
+      <div className="panel-head">
+        <h2 id="h-alerts">Alerts</h2>
+        <span className="muted small">not resolved</span>
+      </div>
+      {w.total === 0 ? (
+        <p className="ov-calm">
+          <StatusGlyph status="ok" decorative /> Nothing is alerting.
+        </p>
+      ) : (
+        <>
+          <ul className="ov-counts ov-alert-states">
+            {w.states.map((s) => (
+              <li key={s.key}>
+                <a href={s.href}>
+                  {s.key === 'open' && s.count > 0 && worst && <StatusGlyph status={worst} label={false} />}
+                  <strong>{s.count.toLocaleString('en-US')}</strong> {s.label}
+                  {s.key === 'open' && s.count > 0 && worst && <span className="sr-only">, the worst {worst === 'crit' ? 'critical' : 'warning'}</span>}
+                </a>
+              </li>
+            ))}
+          </ul>
+          {w.owners.length > 0 && (
+            <>
+              <h3 className="panel-sub">By owner</h3>
+              <ul className="ov-owners">
+                {w.owners.map((o) => (
+                  <li key={o.owner}>
+                    {o.href ? <a href={o.href}>{o.label}</a> : <span className="muted">{o.label}</span>}
+                    <span className="num">{o.count.toLocaleString('en-US')}</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
+      )}
+      <p className="panel-more">
+        <a href={w.href}>All alerts</a>
       </p>
     </section>
   )

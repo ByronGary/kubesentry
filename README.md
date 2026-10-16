@@ -23,7 +23,7 @@ Each user sees only what their Kubernetes RBAC allows.
 | **Security, certificates** | Pod security, RBAC, exposure and Pod Security labels; cert-manager expiry and failing issuers. |
 | **Storage** | Unused PVCs with an estimated monthly cost; EBS-aware, with EFS/FSx shown as "billed by usage". |
 | **Processes** | Per-pod processes from an optional node agent. |
-| **Alerts** | Findings sent to Alertmanager (or the AMP alert manager), routed by owning team. Opt-in. |
+| **Alerts** | Findings sent to Alertmanager (or the AMP alert manager), routed by owning team, with an Alerts page to acknowledge and silence them. Opt-in. |
 
 **Built for enterprise clusters:**
 - SSO through oauth2-proxy, with per-user scope by SubjectAccessReview.

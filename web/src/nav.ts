@@ -26,8 +26,6 @@ export type SectionKey = 'top' | 'cluster' | 'health' | 'security'
 export interface NavEntry extends NavItem {
   key: NavKey
   section: SectionKey
-  /** Listed for when its server feature lands, but not shown until then (Alerts, after alerting phase B). */
-  placeholder?: boolean
 }
 
 export const SECTIONS: { key: SectionKey; label: string }[] = [
@@ -39,7 +37,7 @@ export const SECTIONS: { key: SectionKey; label: string }[] = [
 
 export const NAV: NavEntry[] = [
   { key: 'overview', section: 'top', href: '/', label: 'Overview' },
-  { key: 'alerts', section: 'top', href: '/alerts', label: 'Alerts', placeholder: true },
+  { key: 'alerts', section: 'top', href: '/alerts', label: 'Alerts', needs: 'alerts' },
   { key: 'map', section: 'cluster', href: '/map', label: 'Map', needs: 'inventory' },
   { key: 'workloads', section: 'cluster', href: '/workloads', label: 'Workloads', needs: 'inventory' },
   { key: 'pods', section: 'cluster', href: '/pods', label: 'Pods' },
@@ -77,6 +75,7 @@ const BADGE_HREF: Record<BadgeKey, (s: AttentionSeverity) => string> = {
   security: (s) => `#/security?severity=${s}`,
   certificates: () => '#/certificates?status=unhealthy',
   incidents: () => '#/incidents?state=open',
+  alerts: () => '#/alerts?state=open',
 }
 
 const BADGE_NOUN: Record<BadgeKey, [string, string]> = {
@@ -87,6 +86,7 @@ const BADGE_NOUN: Record<BadgeKey, [string, string]> = {
   security: ['security finding', 'security findings'],
   certificates: ['certificate needs attention', 'certificates need attention'],
   incidents: ['open incident', 'open incidents'],
+  alerts: ['open alert', 'open alerts'],
 }
 
 const SEVERITY_WORD: Record<AttentionSeverity, string> = { crit: 'critical', warn: 'warning' }
@@ -137,8 +137,6 @@ export interface GroupOptions {
   /** Routes found missing at run time (an older server without /overview or /agents). */
   hidden?: ReadonlySet<string>
   badges?: Badges
-  /** The server provides alerts (alerting phase B). Until then the Alerts item stays hidden. */
-  alerts?: boolean
 }
 
 /**
@@ -147,11 +145,7 @@ export interface GroupOptions {
  * nothing visible disappears.
  */
 export function groupNav(info: Info, opts: GroupOptions = {}, items: NavEntry[] = NAV): NavSection[] {
-  const shown = visibleNav(
-    items.filter((i) => !i.placeholder || (i.key === 'alerts' && opts.alerts === true)),
-    info,
-    opts.hidden,
-  )
+  const shown = visibleNav(items, info, opts.hidden)
   const out: NavSection[] = []
   for (const s of SECTIONS) {
     const list: ShownEntry[] = shown.filter((i) => i.section === s.key).map((i) => ({ ...i, badge: badgeFor(i.key, opts.badges) }))
@@ -165,7 +159,7 @@ export function groupNav(info: Info, opts: GroupOptions = {}, items: NavEntry[] 
 
 // ---- Routes ----
 
-export type PageKey = Exclude<NavKey, 'alerts'> | 'pod' | 'incident'
+export type PageKey = NavKey | 'pod' | 'incident'
 
 export interface Resolved {
   page: PageKey
@@ -175,7 +169,7 @@ export interface Resolved {
   redirect?: string
 }
 
-const PAGES = new Set<string>(['map', 'workloads', 'pods', 'nodes', 'agents', 'incidents', 'findings', 'memory', 'storage', 'security', 'certificates', 'activity'])
+const PAGES = new Set<string>(['alerts', 'map', 'workloads', 'pods', 'nodes', 'agents', 'incidents', 'findings', 'memory', 'storage', 'security', 'certificates', 'activity'])
 
 /** Old paths that still work. */
 const ALIAS: Record<string, string> = { volumes: 'storage' }
@@ -219,7 +213,7 @@ export function resolveRoute(path: string, query: URLSearchParams, opts: { overv
   // One incident: #/incidents/<id>; the id arrives decoded in parts[1].
   if (first === 'incidents' && parts.length >= 2 && parts[1]) return { page: 'incident', parts }
   if (PAGES.has(first)) return { page: first as PageKey, parts }
-  // Unknown paths (and Alerts, until it exists) show the home page, as before.
+  // Unknown paths show the home page, as before.
   return { page: home, parts }
 }
 

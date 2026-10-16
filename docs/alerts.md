@@ -90,7 +90,7 @@ New findings that would fire together are summed up per owner in one digest aler
 
 ### Acknowledging and silencing
 
-People act on findings through `POST /api/v1/alerts/actions` (section 4), which the Alerts page uses. It needs `update` on the virtual resource `alerts.kubesentry.io` where the finding is: per namespace through a RoleBinding, and cluster-wide (a ClusterRoleBinding) for cluster-scoped findings such as RBAC drift. The chart ships it as the ClusterRole `<release>-alerts-responder`; `rbac.viewerRoles.alertsResponder.aggregateTo: [edit]` adds it to the built-in `edit` (and so `admin`) role.
+People act on findings on the Alerts page (`#/alerts`: per row, or on the rows selected; Silence asks how long and why), which uses `POST /api/v1/alerts/actions` (section 4). It needs `update` on the virtual resource `alerts.kubesentry.io` where the finding is: per namespace through a RoleBinding, and cluster-wide (a ClusterRoleBinding) for cluster-scoped findings such as RBAC drift. The chart ships it as the ClusterRole `<release>-alerts-responder`; `rbac.viewerRoles.alertsResponder.aggregateTo: [edit]` adds it to the built-in `edit` (and so `admin`) role.
 
 | Action | Applies to | What Alertmanager gets |
 |---|---|---|
@@ -513,9 +513,8 @@ Warning, except `audit-anonymous`. The finding stays open until `-alerts-audit-h
 
 ## 6. Limits of this release
 
-The catalog, standing digests, acknowledging and silencing, full storm protection and per-object owners are in. Still to come in phase C:
+The catalog, standing digests, acknowledging and silencing (with the Alerts page), full storm protection and per-object owners are in. Limits:
 
-- **The UI.** The Alerts page with its Ack and Silence buttons. Until then, use `POST /api/v1/alerts/actions` (section 4).
 - **Long acknowledgements.** The actions log keeps 31 days, so an episode open longer than that loses its acknowledgement.
 - **Audit reads.** Each evaluation reads up to 10,000 events per audit tag; a larger flood within one interval is counted only in part. Audit polling adds Postgres reads on the leader: watch `kubesentry_alerts_evaluation_seconds`.
 - **Denied bursts** are counted per actor across the cluster, so they are cluster-scoped findings, which only callers who may read the whole audit log see.

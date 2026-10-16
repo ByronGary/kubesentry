@@ -33,10 +33,22 @@ describe('groupNav', () => {
       ['security', ['security', 'certificates', 'activity']],
     ])
   })
-  it('never shows the Alerts placeholder until the server provides alerts', () => {
+  it('shows Alerts only when /info says alerting is enabled', () => {
     expect(NAV.some((n) => n.key === 'alerts')).toBe(true)
+    // An older server leaves info.alerts out; one running without -alerts sends it switched off.
     expect(groupNav(scoped)[0].items.map((i) => i.key)).toEqual(['overview'])
-    expect(groupNav(scoped, { alerts: true })[0].items.map((i) => i.key)).toEqual(['overview', 'alerts'])
+    expect(groupNav({ ...scoped, alerts: { enabled: false, sink: 'none' } })[0].items.map((i) => i.key)).toEqual(['overview'])
+    expect(groupNav({ ...scoped, alerts: { enabled: true, sink: 'none' } })[0].items.map((i) => i.key)).toEqual(['overview', 'alerts'])
+    // Seeing alerts needs no capability: the server scopes the list itself.
+    expect(groupNav({ ...scoped, capabilities: {}, alerts: { enabled: true, sink: 'alertmanager' } })[0].items.map((i) => i.key)).toEqual(['overview', 'alerts'])
+  })
+  it('badges Alerts with the open count, worst severity first', () => {
+    const on: Info = { ...scoped, alerts: { enabled: true, sink: 'none' } }
+    const top = groupNav(on, { badges: { alerts: { count: 6, severity: 'crit' } } })[0]
+    const alerts = top.items.find((i) => i.key === 'alerts')!
+    expect(alerts.badge).toEqual({ count: 6, severity: 'crit', href: '#/alerts?state=open', label: '6 open alerts, critical' })
+    expect(top.worst).toBe('crit')
+    expect(badgeFor('alerts', { alerts: { count: 1, severity: 'warn' } })?.label).toBe('1 open alert, warning')
   })
   it('gates items like the old tabs: server features, capabilities, scoped-only routes', () => {
     // An unscoped server: everything allowed, but no Agents (a newer, scoped-only route).
@@ -119,10 +131,14 @@ describe('resolveRoute', () => {
     expect(r('/findings', false).page).toBe('findings')
     expect(activeKey(r('/', false).page)).toBe('findings')
   })
-  it('shows the home page for unknown paths, and for Alerts until it exists', () => {
+  it('shows the home page for unknown paths', () => {
     expect(r('/nope').page).toBe('overview')
-    expect(r('/alerts').page).toBe('overview')
-    expect(r('/alerts', false).page).toBe('findings')
+    expect(r('/nope', false).page).toBe('findings')
+  })
+  it('routes Alerts, keeping its filters, and marks it in the sidebar', () => {
+    expect(r('/alerts?key=a/b/c/d&state=all')).toEqual({ page: 'alerts', parts: ['alerts'] })
+    expect(r('/alerts', false).page).toBe('alerts')
+    expect(activeKey('alerts')).toBe('alerts')
   })
   it('redirects the Map node view to the Nodes page, keeping the node', () => {
     expect(r('/map?view=nodes&node=ip-10-0-1-5&namespace=shop')).toEqual({ page: 'nodes', parts: ['nodes'], redirect: '#/nodes?node=ip-10-0-1-5' })

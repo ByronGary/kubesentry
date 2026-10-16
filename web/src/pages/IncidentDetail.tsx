@@ -9,6 +9,7 @@ import { TimeChart } from '../components/TimeChart'
 import { Async, Empty, PageHead, StatusGlyph } from '../components/ui'
 import { ago, formatBytes, formatDateTime, formatPercent, formatRate, plural } from '../format'
 import {
+  alertLinks,
   bundlePath,
   chartLines,
   chartMarks,
@@ -92,6 +93,7 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
   const peak = severityGlyph(inc.peakSeverity)
   const tags = tagChips(inc.tags)
   const chips = typeChips(inc)
+  const alerts = alertLinks(d.signals)
   const pad = paddingText(inc, win, info.incidents)
   const sources = sourceRows(d.sources)
 
@@ -241,6 +243,21 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
                   {n}
                 </a>
               ))}
+            </dd>
+          </div>
+        )}
+        {alerts.length > 0 && (
+          <div className="wide">
+            <dt>Alerts</dt>
+            <dd>
+              <ul className="plain inc-related">
+                {alerts.map((l) => (
+                  <li key={l.key}>
+                    <StatusGlyph status={l.severity} label={false} /> <a href={l.href}>{l.title}</a>{' '}
+                    <span className="muted small">{l.ongoing ? 'still open' : 'ended'}</span>
+                  </li>
+                ))}
+              </ul>
             </dd>
           </div>
         )}

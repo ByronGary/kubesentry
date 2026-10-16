@@ -2,6 +2,7 @@
 // signal type looks like and which lane it goes in, the merged timeline, the
 // 24-hour cap, and log levels. Kept free of React so it is testable.
 
+import { alertHref } from './alerts'
 import { auditTarget } from './components/ActivityTable'
 import { bucketCounts, brushRange, type MarkerIn, type Range } from './chartMath'
 import { plural } from './format'
@@ -504,6 +505,8 @@ export interface TimelineItem {
   title: string
   detail?: string
   mark?: MarkKind
+  /** A page that explains it: an alert signal's finding on the Alerts page. */
+  href?: string
 }
 
 function ms(s: string | undefined): number | undefined {
@@ -602,6 +605,7 @@ export function mergeTimeline(d: Pick<IncidentDetail, 'signals' | 'events' | 'au
       title: s.title || m.label,
       detail: signalDetail({ ...s, title: s.title || m.label }),
       mark: m.mark,
+      href: s.type === 'alert' && s.attrs?.key ? alertHref(s.attrs.key) : undefined,
     })
   }
   const lane = (l: Lane) => LANES.findIndex((x) => x.key === l)
@@ -778,4 +782,33 @@ export function countText(n: number, one: string, many: string): string {
 function humanize(s: string): string {
   const t = s.replace(/[-_]+/g, ' ').trim()
   return t ? t[0].toUpperCase() + t.slice(1) : s
+}
+
+// ---- Alerts ----
+
+export interface AlertLink {
+  key: string
+  title: string
+  severity: Status
+  href: string
+  /** The episode still fires (or is acknowledged or silenced). */
+  ongoing: boolean
+}
+
+/**
+ * The alert findings whose episodes joined the incident (alert signals carry
+ * the finding's key in attrs.key), once each, newest episode last, linking to
+ * the finding on the Alerts page.
+ */
+export function alertLinks(signals: readonly IncidentSignal[] | undefined): AlertLink[] {
+  const byKey = new Map<string, AlertLink & { t: number }>()
+  for (const s of signals ?? []) {
+    const key = s.type === 'alert' ? s.attrs?.key : undefined
+    if (!key) continue
+    const t = ms(s.start) ?? 0
+    const prev = byKey.get(key)
+    if (prev && prev.t > t) continue
+    byKey.set(key, { key, t, title: s.title || key, severity: severityGlyph(s.severity), href: alertHref(key), ongoing: !s.end })
+  }
+  return [...byKey.values()].sort((a, b) => a.t - b.t || a.key.localeCompare(b.key)).map(({ key, title, severity, href, ongoing }) => ({ key, title, severity, href, ongoing }))
 }

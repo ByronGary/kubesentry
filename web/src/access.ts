@@ -18,16 +18,17 @@ export function isScoped(info: Pick<Info, 'capabilities'> | undefined): boolean 
   return info?.capabilities !== undefined
 }
 
-export type Flag = 'inventory' | 'certs' | 'processes' | 'audit' | 'incidents'
+export type Flag = 'inventory' | 'certs' | 'processes' | 'audit' | 'incidents' | 'alerts'
 
 /**
- * Whether the server offers a feature. Incidents count only when /info says
- * they are enabled: older servers leave `incidents` out, and a server could
- * send it switched off.
+ * Whether the server offers a feature. Incidents and alerts count only when
+ * /info says they are enabled: older servers leave them out, and a server
+ * sends them switched off when it runs without -incidents or -alerts.
  */
 export function hasFeature(info: Info | undefined, flag: Flag): boolean {
   if (!info) return false
   if (flag === 'incidents') return info.incidents?.enabled === true
+  if (flag === 'alerts') return info.alerts?.enabled === true
   return info[flag] === true
 }
 

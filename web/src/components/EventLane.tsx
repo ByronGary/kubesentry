@@ -119,7 +119,7 @@ function LaneRow({ lane, label, width, items: all, domain, hoverT, onHover, brus
       {shown.length > 0 ? (
         <ol className="lane-items">
           {shown.map((i) => (
-            <li key={i.key}>
+            <li key={i.key} className={i.href ? 'lane-linked' : undefined}>
               <button
                 type="button"
                 className={`lane-item${hoverT === i.t ? ' on' : ''}`}
@@ -138,6 +138,11 @@ function LaneRow({ lane, label, width, items: all, domain, hoverT, onHover, brus
                 </span>
                 {i.role === 'trigger' && <span className="tag">trigger</span>}
               </button>
+              {i.href && (
+                <a className="lane-link" href={i.href} aria-label={`Open the alert in Alerts: ${i.title}`}>
+                  Open alert
+                </a>
+              )}
             </li>
           ))}
         </ol>

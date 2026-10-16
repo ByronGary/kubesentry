@@ -7,6 +7,7 @@ import { Async, Empty, PageHead } from './components/ui'
 import { activeKey, groupNav, resolveRoute, type PageKey } from './nav'
 import { Activity } from './pages/Activity'
 import { Agents } from './pages/Agents'
+import { Alerts } from './pages/Alerts'
 import { Certificates } from './pages/Certificates'
 import { Findings } from './pages/Findings'
 import { IncidentDetail } from './pages/IncidentDetail'
@@ -25,10 +26,10 @@ import { prometheusOutage } from './sources'
 import type { Capability, Info, OverviewResponse } from './types'
 import { useApi, usePolled, type ApiState } from './useApi'
 
-type Flag = 'inventory' | 'certs' | 'incidents'
+type Flag = 'inventory' | 'certs' | 'incidents' | 'alerts'
 
 /** Pages built around wide tables (and the Overview's tiles) get more room; the map and node pages get the most. */
-const TABLE_PAGES = new Set<PageKey>(['overview', 'pods', 'workloads', 'storage', 'activity', 'agents', 'incidents', 'incident'])
+const TABLE_PAGES = new Set<PageKey>(['overview', 'alerts', 'pods', 'workloads', 'storage', 'activity', 'agents', 'incidents', 'incident'])
 const WIDE_PAGES = new Set<PageKey>(['map', 'nodes'])
 
 /** Pages that read metrics: the Prometheus notice above them replaces the generic banner's line. */
@@ -57,7 +58,9 @@ function Gate({ state, title, needs, cap, children }: { state: ApiState<Info>; t
             ? 'This kubesentry server does not read cert-manager objects.'
             : needs === 'incidents'
               ? 'This kubesentry server does not track incidents: it is older than incidents, or runs without -incidents.'
-              : 'This kubesentry server does not list workloads, services and nodes, so this page has nothing to show.'}
+              : needs === 'alerts'
+                ? 'This kubesentry server does not evaluate alerts: it is older than alerting, or runs without -alerts.'
+                : 'This kubesentry server does not list workloads, services and nodes, so this page has nothing to show.'}
         </Empty>
       </>
     )
@@ -143,6 +146,9 @@ export function App() {
       break
     case 'incidents':
       page = <Gate state={infoState} title="Incidents" needs="incidents">{(i) => <Incidents route={route} info={i} />}</Gate>
+      break
+    case 'alerts':
+      page = <Gate state={infoState} title="Alerts" needs="alerts">{(i) => <Alerts route={route} info={i} />}</Gate>
       break
     case 'incident':
       page = (

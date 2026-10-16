@@ -40,6 +40,8 @@ export interface Info {
     /** Standing-state digests (-alerts-digest-at): when the last one was sent and the next is due. */
     lastDigestAt?: string
     nextDigestAt?: string
+    /** The longest silence an action may ask for (-alerts-max-silence), in seconds; absent on older servers (then 7 days). */
+    maxSilenceSeconds?: number
   }
   /** AI investigator (-investigator); absent when off or on older servers. */
   investigator?: {
@@ -599,7 +601,7 @@ export interface OverviewResponse {
   /** Owners (namespace annotation kubesentry.io/owner) of the caller's visible namespaces, for the filter. */
   owners: string[]
   /** Sidebar badges, keyed by nav item; absent when zero. */
-  badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates' | 'incidents', { count: number; severity: AttentionSeverity }>>
+  badges: Partial<Record<'workloads' | 'pods' | 'findings' | 'memory' | 'security' | 'certificates' | 'incidents' | 'alerts', { count: number; severity: AttentionSeverity }>>
   history: OverviewHistory
   /** Alert findings not resolved, in the caller's scope and filter (cluster-scoped ones only without a filter). Absent when alerting is off. */
   alerts?: { open: number; acknowledged: number; silenced: number; byOwner: Record<string, number> }

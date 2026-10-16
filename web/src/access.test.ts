@@ -54,6 +54,11 @@ describe('hasFeature', () => {
     expect(hasFeature(base, 'incidents')).toBe(false)
     expect(hasFeature(undefined, 'inventory')).toBe(false)
   })
+  it('counts alerts only when /info says alerting is enabled', () => {
+    expect(hasFeature({ ...base, alerts: { enabled: true, sink: 'alertmanager' } }, 'alerts')).toBe(true)
+    expect(hasFeature({ ...base, alerts: { enabled: false, sink: 'none' } }, 'alerts')).toBe(false)
+    expect(hasFeature(base, 'alerts')).toBe(false)
+  })
   it('reads the boolean flags as before', () => {
     expect(hasFeature(base, 'inventory')).toBe(true)
     expect(hasFeature({ ...base, certs: false }, 'certs')).toBe(false)

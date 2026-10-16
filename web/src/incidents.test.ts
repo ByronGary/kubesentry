@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  alertLinks,
   atLeast,
   bundlePath,
   chartLines,
@@ -397,6 +398,36 @@ describe('mergeTimeline', () => {
   })
   it('copes with an empty detail', () => {
     expect(mergeTimeline({ signals: [], events: [] })).toEqual([])
+  })
+  it('links alert signals to their finding on the Alerts page', () => {
+    const key = 'workload-unhealthy/Deployment/shop/api'
+    const items = mergeTimeline({
+      signals: [sig({ id: `alert:${key}@x`, type: 'alert', severity: 'critical', attrs: { key } }), sig({ id: 'alert:nokey', type: 'alert' }), sig({ id: 'd', type: 'deploy' })],
+      events: [],
+    })
+    expect(Object.fromEntries(items.map((i) => [i.key, i.href]))).toEqual({
+      [`signal:alert:${key}@x`]: '#/alerts?key=workload-unhealthy%2FDeployment%2Fshop%2Fapi',
+      'signal:alert:nokey': undefined,
+      'signal:d': undefined,
+    })
+  })
+})
+
+describe('alertLinks', () => {
+  it('lists each alert finding once, its latest episode, oldest first', () => {
+    const a = 'workload-unhealthy/Deployment/shop/api'
+    const b = 'memory-leak/Deployment/shop/api'
+    const links = alertLinks([
+      sig({ id: `alert:${a}@1`, type: 'alert', severity: 'warning', start: iso(0), end: iso(5), title: 'old episode', attrs: { key: a } }),
+      sig({ id: `alert:${b}@1`, type: 'alert', severity: 'warning', start: iso(2), title: 'leak', attrs: { key: b } }),
+      sig({ id: `alert:${a}@2`, type: 'alert', severity: 'critical', start: iso(10), title: 'Deployment shop/api: CrashLoopBackOff ×1', attrs: { key: a } }),
+      sig({ id: 'r', type: 'restart', attrs: { key: 'not an alert' } }),
+    ])
+    expect(links).toEqual([
+      { key: b, title: 'leak', severity: 'warn', href: '#/alerts?key=memory-leak%2FDeployment%2Fshop%2Fapi', ongoing: true },
+      { key: a, title: 'Deployment shop/api: CrashLoopBackOff ×1', severity: 'crit', href: '#/alerts?key=workload-unhealthy%2FDeployment%2Fshop%2Fapi', ongoing: true },
+    ])
+    expect(alertLinks(undefined)).toEqual([])
   })
 })
 
