@@ -80,6 +80,25 @@ var (
 		[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
 	// AlertsLeader is 1 on the replica that evaluates and notifies.
 	AlertsLeader = NewGauge("kubesentry_alerts_leader", "1 on the replica that evaluates alerts and notifies.")
+
+	// Incidents counts open incidents on the replica that runs the
+	// incidents engine; the others report 0. Label: severity ("warning",
+	// "critical"; the current severity).
+	Incidents = NewGaugeVec("kubesentry_incidents", "Open incidents by severity (on the replica running the engine).", "severity")
+	// IncidentSignals counts signals handed to the incidents engine. Label:
+	// type (the signal type, e.g. "request-spike", "deploy").
+	IncidentSignals = NewCounterVec("kubesentry_incident_signals_total", "Signals handed to the incidents engine by type.", "type")
+	// KubeEvents counts Kubernetes events the incidents engine kept. Label:
+	// result ("stored", "error").
+	KubeEvents = NewCounterVec("kubesentry_k8s_events_total", "Kubernetes events stored for incidents by result.", "result")
+	// CloudTrailEvents counts CloudTrail events read for incidents. Label:
+	// result: "fetched", "duplicate", "unparsed", "truncated" and "throttled"
+	// from the source; "kept" (matched to a related resource) and "error"
+	// (a failed poll) from the engine.
+	CloudTrailEvents = NewCounterVec("kubesentry_cloudtrail_events_total", "CloudTrail events and polls for incidents by result.", "result")
+	// IncidentLogFetches counts container log reads for incidents. Labels:
+	// source ("kubernetes", "cloudwatch"), result ("ok", "truncated", "error").
+	IncidentLogFetches = NewCounterVec("kubesentry_incident_log_fetches_total", "Container log reads for incidents by source and result.", "source", "result")
 )
 
 func init() { Default.RegisterRuntime() }

@@ -24,10 +24,12 @@ const attentionLimit = 10
 const maxTitle = 140
 
 // Categories order items of one severity, as the Findings page orders its
-// own: a node down first (it takes many pods with it), then workloads, memory
-// leaks, security, certificates.
+// own, after open incidents (which tie a workload's problems together and
+// link to all of them): a node down first (it takes many pods with it), then
+// workloads, memory leaks, security, certificates.
 const (
-	catNode = iota
+	catIncident = iota
+	catNode
 	catWorkload
 	catLeak
 	catSecurity
@@ -159,8 +161,8 @@ var (
 )
 
 // buildAttention collects every item the view can raise and folds them into
-// groups. Leak findings come later, per request (the scanner runs on its
-// own schedule).
+// groups. Leak findings and open incidents come later, per request (the
+// scanner and the incidents engine run on their own schedules).
 func buildAttention(v *snapshot.View, idx *ovIndex) {
 	a := v.Assoc()
 	groups := map[groupKey]*attnGroup{}
@@ -363,43 +365,51 @@ func leakItem(f detectors.LeakFinding, critHours float64) attnItem {
 	return it
 }
 
-// mergeLeaks folds the leak findings into the selection's groups and
-// returns the top attentionLimit, plus how many groups there are in all and
-// the worst severity among them. groups is sorted and shared; leaks must be
-// in the selection already.
-func mergeLeaks(v *snapshot.View, idx *ovIndex, groups []*attnGroup, leaks []detectors.LeakFinding) (top []*attnGroup, total int, worst string) {
-	total = len(groups)
-	if len(groups) > 0 {
-		worst = groups[0].worst().severity
-	}
-	if len(leaks) == 0 {
-		return groups[:min(len(groups), attentionLimit)], total, worst
-	}
+// leakExtras turns the leak findings into items of their workloads' groups.
+func leakExtras(v *snapshot.View, leaks []detectors.LeakFinding) []attnExtra {
 	a := v.Assoc()
 	critHours := v.Policy.Thresholds.LeakCritHours
-	merged := map[groupKey]*attnGroup{}
-	var order []groupKey
+	out := make([]attnExtra, 0, len(leaks))
 	for _, f := range leaks {
 		k, name := groupKey{f.Namespace, "Pod", f.Pod}, f.Pod
 		if p, ok := a.PodNamed(f.Namespace, f.Pod); ok {
 			kind, root := a.RootOf(p)
 			k, name = groupKey{f.Namespace, kind, root}, root
 		}
-		g := merged[k]
+		out = append(out, attnExtra{key: k, name: name, item: leakItem(f, critHours)})
+	}
+	return out
+}
+
+// mergeExtras folds per-request items (leak findings, open incidents) into
+// the selection's groups and returns the top attentionLimit, plus how many
+// groups there are in all and the worst severity among them. groups is
+// sorted and shared; the extras must be in the selection already.
+func mergeExtras(idx *ovIndex, groups []*attnGroup, extras []attnExtra) (top []*attnGroup, total int, worst string) {
+	total = len(groups)
+	if len(groups) > 0 {
+		worst = groups[0].worst().severity
+	}
+	if len(extras) == 0 {
+		return groups[:min(len(groups), attentionLimit)], total, worst
+	}
+	merged := map[groupKey]*attnGroup{}
+	var order []groupKey
+	for _, x := range extras {
+		g := merged[x.key]
 		if g == nil {
-			g = &attnGroup{key: k, name: name}
-			if old := idx.groups[k]; old != nil && !old.rbac {
+			g = &attnGroup{key: x.key, name: x.name}
+			if old := idx.groups[x.key]; old != nil && !old.rbac && inGroups(groups, old) {
 				g.items = append(g.items, old.items...)
 			} else {
 				total++
 			}
-			merged[k] = g
-			order = append(order, k)
+			merged[x.key] = g
+			order = append(order, x.key)
 		}
-		it := leakItem(f, critHours)
-		g.items = append(g.items, it)
-		if severityRank(it.severity) < severityRank(worst) || worst == "" {
-			worst = it.severity
+		g.items = append(g.items, x.item)
+		if worst == "" || severityRank(x.item.severity) < severityRank(worst) {
+			worst = x.item.severity
 		}
 	}
 	top = make([]*attnGroup, 0, attentionLimit+len(merged))
@@ -419,4 +429,15 @@ func mergeLeaks(v *snapshot.View, idx *ovIndex, groups []*attnGroup, leaks []det
 	}
 	sortGroups(top)
 	return top[:min(len(top), attentionLimit)], total, worst
+}
+
+// inGroups reports whether g is one of the selection's groups. Groups are
+// shared per view, so this compares pointers.
+func inGroups(groups []*attnGroup, g *attnGroup) bool {
+	for _, x := range groups {
+		if x == g {
+			return true
+		}
+	}
+	return false
 }

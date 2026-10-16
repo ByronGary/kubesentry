@@ -88,35 +88,43 @@ func hash(k model.ContainerKey) uint32 {
 func (m *Metrics) series(key model.ContainerKey, p profile, lookback, step time.Duration) model.ContainerSeries {
 	now := time.Now()
 	n := int(lookback/step) + 1
+	return m.seriesRange(key, p, now.Add(-time.Duration(n-1)*step), n, step)
+}
+
+// seriesRange is n samples of a container's memory from start, step apart.
+func (m *Metrics) seriesRange(key model.ContainerKey, p profile, start time.Time, n int, step time.Duration) model.ContainerSeries {
 	rng := rand.New(rand.NewSource(int64(hash(key))))
 	out := model.ContainerSeries{Key: key, Samples: make([]model.Sample, 0, n)}
+	for i := 0; i < n; i++ {
+		t := start.Add(time.Duration(i) * step)
+		out.Samples = append(out.Samples, model.Sample{T: t, V: m.valueAt(p, t, rng) * mib})
+	}
+	return out
+}
 
+// valueAt is a profile's memory at t, in MiB.
+func (m *Metrics) valueAt(p profile, t time.Time, rng *rand.Rand) float64 {
 	const lifetime = 4 * time.Hour
 	// Anchor the sawtooth so the current process started 90 minutes ago when
 	// the server started, and keeps cycling every 4 hours after that.
 	anchor := m.start.Add(-90 * time.Minute)
-
-	for i := 0; i < n; i++ {
-		t := now.Add(-time.Duration(n-1-i) * step)
-		var v float64
-		switch p.kind {
-		case leak:
-			age := t.Sub(anchor) % lifetime
-			if age < 0 {
-				age += lifetime
-			}
-			frac := float64(age) / float64(lifetime)
-			v = p.baseMiB + (p.limitMiB*0.93-p.baseMiB)*frac
-			v *= 1 + rng.NormFloat64()*0.008
-		case creeper:
-			v = p.baseMiB + 6*t.Sub(m.start.Add(-20*time.Hour)).Hours()
-			v *= 1 + rng.NormFloat64()*0.006
-		default:
-			v = p.baseMiB * (1 + rng.NormFloat64()*0.03)
+	var v float64
+	switch p.kind {
+	case leak:
+		age := t.Sub(anchor) % lifetime
+		if age < 0 {
+			age += lifetime
 		}
-		out.Samples = append(out.Samples, model.Sample{T: t, V: v * mib})
+		frac := float64(age) / float64(lifetime)
+		v = p.baseMiB + (p.limitMiB*0.93-p.baseMiB)*frac
+		v *= 1 + rng.NormFloat64()*0.008
+	case creeper:
+		v = p.baseMiB + 6*t.Sub(m.start.Add(-20*time.Hour)).Hours()
+		v *= 1 + rng.NormFloat64()*0.006
+	default:
+		v = p.baseMiB * (1 + rng.NormFloat64()*0.03)
 	}
-	return out
+	return v
 }
 
 func (m *Metrics) limits(filter func(model.ContainerKey) bool) map[model.ContainerKey]float64 {

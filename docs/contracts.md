@@ -289,9 +289,16 @@ Go types: `internal/incidents/types.go`. Model additions: `internal/model/incide
 | `GET /api/v1/incidents/{id}/bundle` | Agent-ready. JSON, or `?format=ndjson`: an `IncidentBundleHeader` record, then `{"kind":"signal"\|"metric"\|"event"\|"log"\|"audit"\|"cloudtrail", …}` records. Schema `kubesentry.io/incident-bundle/v1`. Caps: logs 2k lines / 1 MiB, events 2k, audit 1k, CloudTrail 500, total 4 MiB, each with `truncated`. Redacted. Sections the caller can't see go in `omitted`, with `complete:false`; `?require=all` makes that a 403. |
 
 **Elsewhere:**
-- `/info`: `incidents{enabled, leader, sources, maxRangeHours, logLeadSeconds, logLagSeconds}`, and `capabilities.podLogs` / `cloudtrail`.
-- Overview: open incidents fold into "Needs attention" (`href` `#/incidents/<id>`), plus `badges.incidents` and `incidents.open{critical,warning}`.
-- Pod diagnostics: `incidents[]`.
+- `/info`: `incidents{enabled, leader, sources, maxRangeHours, logLeadSeconds, logLagSeconds}` (left out when incidents are off; a CloudTrail source error reads just `error` without the `cloudtrail` capability), and `capabilities.podLogs` / `cloudtrail`.
+- Overview: open incidents fold into "Needs attention" as `kind: "incident"` items in their workload's line, ranked before the other items of the same severity (`href` `#/incidents/<id>`), plus `badges.incidents` and `incidents.open{critical,warning}` (left out when incidents are off). Node incidents need `ViewNodes`, and with a filter a selected pod on the node.
+- Pod diagnostics: `incidents[]` (`IncidentRef`): board incidents whose subject owns the pod or that name it, newest first, at most 20.
+
+**Wire details (D):**
+- Severity in `counts`, `IncidentRef.severity`, the Overview and the `severity` filter is the **peak** severity. `counts.byType` counts incidents holding each type.
+- Gates also apply to the incident's own `types`/`counts` (list, detail and bundle): `audit-change` needs `ViewAudit` in the namespace (`ViewClusterAudit` for a node), `cloudtrail-change` needs `ViewCloudTrail`. The detail reports such sources, and the log sources without `ViewPodLogs`, as `"forbidden"`; events about a node need `ViewNodes`.
+- Only the list is response-cached (`incidentsCaps`: namespace, nodes, audit, cluster audit, CloudTrail; plus the board version and a 10s window). The detail, logs and bundle are not cached, so an unknown ID costs no authorization review; they share the per-identity cap of the expensive routes.
+- Logs: an unconfigured `source=` is 400; with no log source at all, or for a node incident, 200 with no lines and a warning. Windows (`window`, logs `from`/`to`, the bundle's) are UTC.
+- The bundle answers with `Content-Disposition: attachment` and `Cache-Control: no-store`.
 
 **New capabilities:**
 - `ViewPodLogs` = `get pods/log`, namespaced. `auth.Capability` gains `Subresource`, threaded through the Reviewer, the SAR, the cache keys and `RBACIndex`.
@@ -309,7 +316,7 @@ Go types: `internal/incidents/types.go`. Model additions: `internal/model/incide
 
 ### Flags (Helm `incidents{…}`)
 - **Main:**
-  - `-incidents` (needs `-cache`; more than one replica needs the Postgres store)
+  - `-incidents` (needs `-cache`; more than one replica needs the Postgres store: `-audit-store=postgres` keeps the incidents, the events and the lease too, and without it the server warns to run one replica)
   - `-incident-interval` 1m
   - `-incident-max-range` 24h (refused above)
   - `-incident-retention` 7d, `-incident-events-retention` 48h
@@ -325,8 +332,9 @@ Go types: `internal/incidents/types.go`. Model additions: `internal/model/incide
 - **Sources:**
   - `-incident-request-sources` (`nginx,app`; built-in profiles), `-incident-request-profiles-file`, `-incident-alb`
   - `-incident-event-normal-reasons` (`SuccessfulRescale`)
-  - `-incident-logs` (`auto|kubernetes|cloudwatch|off`), `-incident-logs-group` (default `/aws/containerinsights/<cluster>/application`), `-incident-logs-stream-prefix`, `-incident-logs-max-lines` 2000, `-incident-logs-max-bytes` 1MiB, `-incident-redact-patterns`
-- **CloudTrail:** `-cloudtrail` (`off|lookup|logs`), `-cloudtrail-log-group`, `-cloudtrail-region`, `-cloudtrail-qps` 1, `-cloudtrail-start` 1h
+  - `-incident-logs` (`auto|kubernetes|cloudwatch|off`; `auto` reads CloudWatch first when `-incident-logs-group` is set, then `pods/log`), `-incident-logs-group` (default with `cloudwatch`: `/aws/containerinsights/<cluster>/application`), `-incident-logs-stream-prefix`, `-incident-logs-max-lines` 2000, `-incident-logs-max-bytes` 1MiB, `-incident-redact-patterns` (repeat the flag for more patterns)
+  - Incidents without an owner annotation belong to `-alerts-default-owner`.
+- **CloudTrail:** `-cloudtrail` (`off|lookup|logs`; needs `-incidents`), `-cloudtrail-log-group` (`logs` only), `-cloudtrail-region` (default `-aws-region`), `-cloudtrail-qps` 1, `-cloudtrail-start` 1h. One CloudWatch Logs client per region and one throttling pacer are shared by the audit reader, container logs and the trail.
 
 **Request profiles:** `{name, metric, namespaceLabel, serviceLabel|podLabel, statusLabel, errorRegex}`. Queries are always built through the prom package's selector, so `-prometheus-selector` applies. ALB uses CloudWatch `GetMetricData` with `SEARCH` over `AWS/ApplicationELB` (RequestCount, HTTPCode_Target_5XX_Count), keyed by the TargetGroupBinding's target group. CloudTrail `LookupEvents` and `GetMetricData` use SigV4-signed HTTP calls (`internal/aws/**`), so no new modules are needed.
 
@@ -338,7 +346,7 @@ Go types: `internal/incidents/types.go`. Model additions: `internal/model/incide
 - `kubesentry_incidents{severity}`
 - `kubesentry_incident_signals_total{type}`
 - `kubesentry_k8s_events_total{result}`
-- `kubesentry_cloudtrail_events_total{result}`
+- `kubesentry_cloudtrail_events_total{result}`: `fetched`, `duplicate`, `unparsed`, `truncated`, `throttled` from the source; `kept` (matched a related resource) and `error` (a failed poll) from the engine
 - `kubesentry_incident_log_fetches_total{source,result}`
 - `kubesentry_dependency_up{dependency="cloudtrail"}`
 - Route labels: `incidents`, `incident`, `incident_logs`, `incident_bundle`.

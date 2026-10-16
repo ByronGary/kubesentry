@@ -1,8 +1,8 @@
 // Package uilink builds the hash routes of the pages that explain a
 // finding, with the query parameters those pages read (web/src/pages):
 // Workloads namespace and q, Security check and q, Certificates q, Nodes
-// node, the Overview owner. The Overview's attention list and the alerts'
-// kubesentry_url share them. Stdlib only.
+// node, the Overview owner, an incident. The Overview's attention list and
+// the alerts' kubesentry_url share them. Stdlib only.
 package uilink
 
 import "net/url"
@@ -30,6 +30,11 @@ func Certificate(ns, name string) string {
 // Node is the Nodes page with one node open.
 func Node(name string) string {
 	return "#/nodes?" + url.Values{"node": {name}}.Encode()
+}
+
+// Incident is one incident's page.
+func Incident(id string) string {
+	return "#/incidents/" + url.PathEscape(id)
 }
 
 // Owner is the Overview filtered to one owner's namespaces.

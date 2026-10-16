@@ -10,6 +10,8 @@ func TestRoutes(t *testing.T) {
 		Certificate("payments", "api-tls"):                "#/certificates?q=payments%2Fapi-tls",
 		Node("ip-10-0-0-1"):                               "#/nodes?node=ip-10-0-0-1",
 		Owner("team a"):                                   "#/?owner=team+a",
+		Incident("20261015T101500Z-0a1b2c3d4e5f"):         "#/incidents/20261015T101500Z-0a1b2c3d4e5f",
+		Incident("a/b"):                                   "#/incidents/a%2Fb",
 		Absolute("https://ks.example.com/", "#/pods/a/b"): "https://ks.example.com/#/pods/a/b",
 		Absolute("", "#/pods/a/b"):                        "",
 	} {

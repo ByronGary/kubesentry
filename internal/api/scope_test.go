@@ -253,7 +253,7 @@ func namespacesIn(raw json.RawMessage) (map[string]int, int) {
 // binding proposes it), cluster-scoped data degrades without its
 // capability, and carol, who holds nothing, gets empty lists.
 func TestNoAuthorizationLeaks(t *testing.T) {
-	s := tenantServer(t)
+	s, _ := withTenantIncidents(t, tenantServer(t))
 	h := s.Handler()
 	routes := []string{
 		"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/security?view=summary",
@@ -261,6 +261,9 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		"/api/v1/nodes", "/api/v1/nodes?summary=true", "/api/v1/nodes/n1", "/api/v1/oom", "/api/v1/audit/summary",
 		"/api/v1/overview", "/api/v1/overview?namespace=team-a", "/api/v1/overview?owner=team-alpha",
 		"/api/v1/alerts", "/api/v1/alerts?state=open", "/api/v1/alerts?owner=team-alpha",
+		"/api/v1/incidents", "/api/v1/incidents?state=open", "/api/v1/incidents?state=resolved", "/api/v1/incidents?owner=team-alpha",
+		"/api/v1/incidents?namespace=team-a", "/api/v1/incidents?type=oom-kill", "/api/v1/incidents?type=eviction",
+		"/api/v1/incidents?window=1h&severity=critical",
 	}
 	for _, route := range routes {
 		seen := 0
@@ -273,7 +276,8 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 			}
 			seen += n
 		}
-		if seen == 0 && !strings.HasPrefix(route, "/api/v1/nodes") && !strings.HasPrefix(route, "/api/v1/audit/summary") {
+		if seen == 0 && !strings.HasPrefix(route, "/api/v1/nodes") && !strings.HasPrefix(route, "/api/v1/audit/summary") &&
+			!strings.HasSuffix(route, "type=eviction") {
 			t.Errorf("%s: alice sees nothing of team-a either", route)
 		}
 
@@ -292,7 +296,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 			}
 			continue
 		}
-		if strings.Contains(route, "namespace=") || strings.HasPrefix(route, "/api/v1/nodes/") {
+		if (strings.Contains(route, "namespace=") && !strings.HasPrefix(route, "/api/v1/incidents")) || strings.HasPrefix(route, "/api/v1/nodes/") {
 			if rec := getAs(t, h, "carol", route, nil); rec.Code != 404 {
 				t.Errorf("%s as carol = %d, want 404", route, rec.Code)
 			}
@@ -441,8 +445,27 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		t.Errorf("carol's overview alerts = %+v", carolOv.Alerts)
 	}
 
+	// Incidents: team-a's, never the node's (no ViewNodes) and never a
+	// CloudTrail change (no ViewCloudTrail); the Overview counts the same.
+	var inc incidentsResponse
+	getAs(t, h, "alice", "/api/v1/incidents?type=eviction", &inc)
+	if len(inc.Items) != 0 {
+		t.Errorf("alice sees the node incident: %+v", inc.Items)
+	}
+	getAs(t, h, "alice", "/api/v1/incidents", &inc)
+	for _, in := range inc.Items {
+		if in.Subject.Namespace != "team-a" || hasType(in, "cloudtrail-change") {
+			t.Errorf("alice's incident %+v", in)
+		}
+	}
+	if ov.Incidents == nil || ov.Incidents.Open.Critical+ov.Incidents.Open.Warning != inc.Counts.Open {
+		t.Errorf("alice's overview incidents %+v, her list counts %+v", ov.Incidents, inc.Counts)
+	}
+
 	// Single objects elsewhere are not found, rather than forbidden.
-	for _, path := range []string{"/api/v1/map?namespace=team-b", "/api/v1/pods/team-b/web-0/diagnostics", "/api/v1/pods/team-b/web-0/processes", "/api/v1/nodes/n9"} {
+	for _, path := range []string{"/api/v1/map?namespace=team-b", "/api/v1/pods/team-b/web-0/diagnostics", "/api/v1/pods/team-b/web-0/processes", "/api/v1/nodes/n9",
+		"/api/v1/incidents/" + incidentID("team-b"), "/api/v1/incidents/" + incidentID("team-b") + "/logs", "/api/v1/incidents/" + incidentID("team-b") + "/bundle",
+		"/api/v1/incidents/" + nodeIncidentID} {
 		if rec := getAs(t, h, "alice", path, nil); rec.Code != 404 {
 			t.Errorf("%s as alice = %d, want 404", path, rec.Code)
 		}
