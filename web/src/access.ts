@@ -61,6 +61,8 @@ const NOUN: Record<Capability, string> = {
   agents: 'node agents',
   podLogs: 'pod logs',
   cloudtrail: 'AWS CloudTrail events',
+  alertsUpdate: 'alert actions (ack and silence)',
+  investigate: 'AI investigations',
 }
 
 /** Inline note where the server degrades a source to names only. */
@@ -80,6 +82,8 @@ const HIDDEN: Record<Capability, string> = {
   agents: 'Agent status is hidden: it needs cluster-wide access.',
   podLogs: 'Logs are hidden: your access does not include pod logs (get pods/log) in this namespace.',
   cloudtrail: 'CloudTrail changes are hidden: they need the kubesentry CloudTrail viewer role.',
+  alertsUpdate: 'Ack and silence are unavailable: they need the kubesentry alerts responder role.',
+  investigate: 'Investigate is unavailable: it needs the kubesentry investigator role.',
 }
 
 /** Note for a section hidden because the user lacks a capability. */

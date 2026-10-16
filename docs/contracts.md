@@ -18,7 +18,7 @@ This file fixes the shared interfaces before the parallel workstreams start. The
 
 Shared contract files (read-only for streams): `internal/model/*.go`, `internal/detectors/inventory.go`, `internal/detectors/policy.go`, `internal/snapshot/snapshot.go`, `internal/auth/auth.go`, the `Store`/`Query`/`Cursor`/`Coverage` part of `internal/audit/store.go`, `web/src/types.ts`.
 
-Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only in `internal/pgstore`; AWS SDK v2 only in `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**`. Everything else is stdlib, `internal/alerts` included (its Postgres store is `pgstore.AlertStore`, its SigV4 transport comes from `internal/awsauth` through `cmd/server`).
+Dependency rule: client-go only in `internal/kube` (and `test/stress`); pgx only in `internal/pgstore`; AWS SDK v2 only in `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**` and `internal/llm` (Bedrock credentials); the Anthropic SDK only in `internal/llm`. Everything else is stdlib, `internal/alerts` included (its Postgres store is `pgstore.AlertStore`, its SigV4 transport comes from `internal/awsauth` through `cmd/server`).
 
 ## HTTP
 
@@ -376,3 +376,155 @@ Go types: `internal/incidents/types.go`. Model additions: `internal/model/incide
 - `kubesentry_incident_log_fetches_total{source,result}`: source `kubernetes` or `cloudwatch`; result `ok`, `truncated`, `error`. Counts reads for the logs route and bundles, not the error-log counter
 - `kubesentry_dependency_up{dependency="cloudtrail"}`
 - Route labels: `incidents`, `incident`, `incident_logs`, `incident_bundle`.
+
+## Close the gaps (2026-10): incident follow-ups, alerting phase C, AI investigator
+
+Milestones land in order M1 → M7; each section names its milestone. TypeScript: `AlertFinding` additions, `AlertAction*`, `Info.alerts`/`Info.investigator` and `Investigation*` in `web/src/types.ts`.
+
+### Write routes: cross-origin and body rules (M2)
+- Every `/api/` request whose method is not GET, HEAD or OPTIONS passes `http.CrossOriginProtection` right after authentication. Trusted origins: the origin of `-external-url`, plus `-allowed-origins` (comma-separated `scheme://host[:port]`). A browser request from any other origin (`Sec-Fetch-Site: cross-site`/`same-site`, or an `Origin` that doesn't match the Host) is 403 `{"error":"cross-origin request refused"}` and counts `kubesentry_http_rejected_total{reason="cross_origin"}`. Requests without `Sec-Fetch-Site` and `Origin` (curl with the API token) pass.
+- JSON bodies: `Content-Type: application/json` (415 otherwise), at most 16 KiB (413), unknown fields rejected (400).
+
+### Incident follow-ups (M1)
+- **Alert → incident:** the incidents board indexes signal ID → incident ID on every replica. A finding whose episode (`EpisodeID`, `alert:<key>@<firstSeen>`) has joined an incident gains the Alertmanager **annotation** `incident_url` (`-external-url` + `#/incidents/<id>`; never a label, so it never retires the alert). It goes out at the next resend. `firstSeen` is stored at microsecond precision on the leader too, so the episode ID is the same on every replica.
+- `GET /api/v1/alerts` items gain `incidentId` (resolved at response time; same namespace as the finding).
+- **Source health:** the runner probes every source, including `events` and each `logs:<name>`, every 10 minutes on every replica. `events` returns to `ok` on a successful probe, on a received batch, or once the watch has run 30s; `cloudtrail` returns to `ok` after a successful poll. Sources only the leader updates reset to their initial state when leadership ends.
+- `/info.unavailable` gains `incidents:<source>` for sources in error (the CloudTrail reason reads `error` without the `cloudtrail` capability).
+- Metrics: `kubesentry_incident_source_up{source}` (1 `ok`, 0 error; `absent` sources not exported), `kubesentry_incidents_leader`.
+- Rules: `KubesentryIncidentSourceDown` (15m; `min by (namespace, source)` on the leader, CloudTrail excluded since `KubesentryCloudTrailFailing` covers it); `KubesentryIncidentEventsFailing` also fires on `kubesentry_incident_source_up{source="events"} == 0`.
+
+### Alerting phase C (M2, M3)
+
+**Ack and silence.** Human actions are an append-only log, written through the pool by any replica and applied by the leader's evaluator and by every follower's refresh (one pure function, `alerts.applyMarks`):
+- **ack** applies to the current episode (`firstSeen`) and clears when the finding turns from warning to critical. An acknowledged finding keeps being re-posted with the annotations `acknowledged_by`, `acknowledged_at`. It does not stop Alertmanager's `repeat_interval`; use an Alertmanager silence for that.
+- **silence** applies to the key until it expires or is lifted, across resolve and reopen. Silencing posts the alert once with `endsAt=now` and the annotations `silenced_by`, `silenced_until`, `silence_reason`, then stops; expiry or `unsilence` fires it again at once. Silenced findings are left out of digests. Duration 5m to `-alerts-max-silence` (default 7d, at most 30d); reason 3–500 characters.
+- kubesentry never writes to Alertmanager's silence API.
+- The acting replica republishes its board at once (the board version, and so the response cache, moves on) and wakes the leader, so notifications follow within one `-alerts-interval`.
+
+| Route | Notes |
+|---|---|
+| `POST /api/v1/alerts/actions` | Body `AlertActionRequest` (`keys` ≤ 100). 400 malformed, 403 without `alertsUpdate` anywhere, 413, 415. Otherwise 200 `AlertActionResponse` with a result per key: `not found` (unknown, or not visible to the caller), `forbidden` (visible, but no `UpdateAlerts` there), `resolved`, `invalid`. Cross-origin rule applies. Route label `alert_actions` |
+| `GET /api/v1/alerts/actions` | `?key=&limit=` (≤ 200), newest first, only actions on findings the caller can see; `no-store`; in `TestNoAuthorizationLeaks`. Route label `alert_actions_list` |
+
+**Capability:** `UpdateAlerts` = `update alerts.kubesentry.io`, namespaced (UI `alertsUpdate`); cluster-scoped findings need it cluster-wide. Chart role `<release>-alerts-responder`, `rbac.viewerRoles.alertsResponder.aggregateTo` (default `[]`).
+
+**Visibility by finding kind** (`Finding.Gate()`; `/alerts`, `/alerts/actions` and the Overview counter share it):
+
+| Gate | Namespaced finding | Cluster-scoped finding |
+|---|---|---|
+| `namespace` | `ViewNamespace` | — |
+| `rbac` | `ViewNamespace` + `ViewRBAC` | `ViewClusterRBAC` |
+| `audit` | `ViewNamespace` + `ViewAudit` | `ViewClusterAudit` |
+| `node` | — | `ViewNodes` |
+| `agents` | — | `ViewAgents` |
+
+The `/alerts` response cache adds `ViewAudit`, `ViewClusterAudit`, `ViewNodes`, `ViewAgents` and `UpdateAlerts` to its key (items carry `actionable`).
+
+**Storm protection,** in order: the global `-alerts-max-new` breaker; a per-owner budget (`-alerts-owner-max-new` 20 per `-alerts-owner-window` 15m; the rest join that owner's digest); a digested finding that turns critical leaves the digest and fires (at most `-alerts-max-new` per evaluation); quiet findings never count. Metric `kubesentry_alerts_digested_total{reason}` (`max_new`, `owner_budget`).
+
+**Standing-state digests:** on the leader at `-alerts-digest-at` (`"Mon 09:00"`, or `"09:00"` daily; empty turns them off) in `-alerts-digest-tz` (UTC), for `-alerts-digest-kinds` (`rbac-posture,unused-volumes,certificates`). One alert per owner and kind, sent once: `alertname="KubesentryStandingDigest"`, `severity="info"`, `digest=<kind>`, `kubesentry_digest="true"`, `owner`, `cluster`; `endsAt=startsAt+1h`; annotations `summary`, `count`, `findings` (the 10 worst), `monthly_cost_usd` (volumes), `kubesentry_url` (the page filtered by owner). The last run per kind is kept in `alert_digest_runs`; a new leader catches up only the latest missed slot. Certificates with more than `-alerts-cert-digest-days` (14) left are `quiet`: listed in the digest, never notified alone, until they cross the threshold. `/info.alerts` gains `lastDigestAt`, `nextDigestAt`. Metric `kubesentry_alerts_standing_digests_total{kind}`.
+
+**New alerts:**
+
+| Alert | `check` | Severity | Gate | Rule |
+|---|---|---|---|---|
+| `KubesentryExposureChange` | `loadbalancer` (internet-facing only), `nodeport`, `external-ip`, `ingress-no-tls` | warning | namespace | change-based (baseline like RBAC drift); system findings skipped |
+| `KubesentryPrivilegedWorkload` | `privileged`; `host-namespaces` | critical; warning (critical in production) | namespace | change-based, per workload root |
+| `KubesentryAuditActivity` | `audit-exec` (exec, attach, port-forward, debug containers), `audit-secret-read` (humans; both production-only by default); `audit-rbac-change` (humans); `audit-impersonation`; `audit-denied-burst` (≥ `-alerts-audit-denied-burst` 20 in `-alerts-audit-denied-window` 10m per actor); `audit-anonymous` (allowed requests) | warning; `audit-anonymous` critical | audit | open while the newest matching event is within `-alerts-audit-hold` (1h); key `check/User/<namespace>/<actor>`, label `object="User/<actor>"`; annotations `actor`, `actor_kind`, `count`, `first_at`, `last_at`, `verbs`, `examples` (≤ 3, redacted) |
+| `KubesentryAgentMissing` | `agent-missing` | warning, 10m pending | agents | one per agent DaemonSet (`-agent-daemonset` ns/name): nodes running its pod that haven't reported for 3 intervals; Fargate, NotReady and nodes younger than 10m excluded; annotations `nodes` (first 20), `count`; `node` label when exactly one. `-alerts-agents=auto` (on with one replica or agent fanout), `on`, `off` |
+
+Flags: `-alerts-disable-checks` (comma-separated checks), `-alerts-audit` (enabled audit checks; default all when an audit store exists), `-alerts-audit-production-only` (default `audit-exec,audit-secret-read`), `-alerts-audit-hold`, `-alerts-owner-max-new`, `-alerts-owner-window`, `-alerts-max-silence`, `-alerts-digest-at`, `-alerts-digest-tz`, `-alerts-digest-kinds`, `-alerts-cert-digest-days`, `-alerts-agents`, `-agent-daemonset`, `-allowed-origins`. Helm: `alerts{ownerMaxNew,ownerWindow,maxSilence,disableChecks,audit{checks,productionOnly,hold,deniedBurst,deniedWindow},digests{at,tz,kinds,certDays},agents}`, `rbac.viewerRoles.alertsResponder`.
+
+**Object-level owners:** the owner annotation (`-owner-annotation`) is kept on Deployments, StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingresses, Certificates, Roles, RoleBindings, ClusterRoles and ClusterRoleBindings (no other annotation is added to the informer cache). Owner precedence: the object, then its namespace, then `-alerts-default-owner`. When the object's owner differs from its namespace's, the namespace's `kubesentry_*` routing labels are not copied. Pods carry no annotations; a bare pod uses its namespace's owner.
+
+**`AlertFinding` additions:** `ackBy`, `ackAt`, `silencedBy`, `silencedAt`, `silenceReason`, `link` (UI route), `incidentId`, `quiet`, `actionable`.
+
+**Storage (`0005_alerts_actions.sql`):**
+```sql
+ALTER TABLE alert_findings ADD COLUMN IF NOT EXISTS link  text    NOT NULL DEFAULT '';
+ALTER TABLE alert_findings ADD COLUMN IF NOT EXISTS quiet boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS alert_actions (
+  id bigserial PRIMARY KEY, key text COLLATE "C" NOT NULL, first_seen timestamptz NOT NULL,
+  action text NOT NULL CHECK (action IN ('ack','unack','silence','unsilence')),
+  actor text NOT NULL, reason text NOT NULL DEFAULT '', until timestamptz,
+  severity text NOT NULL, at timestamptz NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS alert_actions_key ON alert_actions (key, id);
+CREATE INDEX IF NOT EXISTS alert_actions_at  ON alert_actions (at);
+CREATE TABLE IF NOT EXISTS alert_digest_runs (name text PRIMARY KEY, last_sent timestamptz NOT NULL);
+```
+`alert_actions` is written through the pool by any replica (not the lock connection); `alert_findings` and `alert_digest_runs` stay leader-only. Maintenance deletes actions older than `alerts.Retention` + 1 day. Parity: `TestPGAlertsMatchMemory` covers actions and digest runs.
+
+Metrics: `kubesentry_alert_actions_total{action,result}` (`ok`, `forbidden`, `not_found`, `invalid`, `resolved`).
+
+### AI investigator (M5–M7)
+
+**Off by default.** `-investigator=off|anthropic|bedrock`; any value but `off` also needs `-investigator-egress-ack=true` and `-incidents`. It sends a redacted digest of an incident, and the tool results the starting user may see, to the provider.
+
+**Packages:** `internal/investigate` (stdlib: the `LLM` interface, digest, egress filter, tools, agent loop, prompt, report validation, `Service`, `Store` and memory store, `investigatetest.ScriptedLLM`); `internal/llm` (the only importer of `github.com/anthropics/anthropic-sdk-go`, and for Bedrock of the AWS SDK config); `internal/pgstore/investigations.go`. `investigate` never imports `llm`; `cmd/server` wires them.
+
+**Capability:** `InvestigateIncidents` = `create investigations.kubesentry.io`, namespaced (UI `investigate`); node and cluster incidents need it cluster-wide. Chart role `<release>-investigator`, `rbac.viewerRoles.investigator.aggregateTo` (default `[]`).
+
+| Route | Notes |
+|---|---|
+| `POST /api/v1/incidents/{id}/investigations` | Body `{fresh?: bool}` (or empty). 404 before any authorization review when the incident is unknown or out of scope; 403 without `investigate`; 409 `{runningId}` while one runs for the incident; 429 + `Retry-After` when the caller's or the global hourly quota is spent; 503 + `Retry-After: 30` when this replica runs `-investigator-concurrency` jobs. A completed run with the same input hash in the last 24h answers 200 `{investigation, cached: true}` without a model call (and without using quota) unless `fresh`. Otherwise 202 `{investigation}` (status `running`). Cross-origin and body rules apply. Route label `incident_investigate` |
+| `GET /api/v1/incidents/{id}/investigations` | `InvestigationsResponse`: summaries the caller may read, newest first, plus `hidden`. Route label `incident_investigations`; in `TestNoAuthorizationLeaks` |
+| `GET /api/v1/incidents/{id}/investigations/{iid}` | `Investigation`; 404 when the caller may not read it. Route label `incident_investigation` |
+| `POST /api/v1/incidents/{id}/investigations/{iid}/cancel` | the starter only (403 otherwise); 409 when not running. Route label `incident_investigation_cancel` |
+
+All answer `Cache-Control: no-store` and are never response-cached. Poll every 2s while `running`. Each start writes one access-log line (identity, incident, provider, model).
+
+**Access is frozen at start:** `{logs: ViewPodLogs, audit: ViewAudit (ViewClusterAudit for node incidents), cloudtrail: ViewCloudTrail, nodes: ViewNodes}`, stored with the run. Tools the starter lacks are still offered to the model but answer an error without reading the source, and the section is listed in `omitted`. Reading a run needs the incident visible and every capability its `access` holds as true; otherwise 404, and lists count it in `hidden`. A permission revoked mid-run is not seen (a run lasts at most `-investigator-timeout`).
+
+**Digest** (first user message, at most `-investigator-digest-bytes`, 64 KiB): header (incident, window, cluster, now, omitted, truncated), every trigger signal and the context signals (first and last per type plus counts when over a third of the budget), per-series metric statistics and a 30-point max-preserving downsample, Kubernetes events grouped by reason/type/object (top 50, warnings first), log templates (digits, hex, UUIDs, IPs, timestamps stripped; top 40, errors first, 2 samples nearest a trigger), audit writes and tagged events (≤ 100), CloudTrail summaries. Every record carries a `ref`.
+
+**Tools** (inputs validated with unknown fields rejected; times clamped to the padded window; pods must be the incident's; 30s each; output through the egress filter, capped, JSON-encoded inside `<untrusted source="…">`):
+
+| Tool | Input | Needs | Cap |
+|---|---|---|---|
+| `list_signals` | `type`, `role`, `from`, `to`, `limit` ≤ 200 | — | 32 KiB |
+| `get_logs` | `pods` ≤ 5, `containers` ≤ 5, `from`, `to`, `level`, `contains` ≤ 200, `limit` ≤ 200 | logs | lines ≤ 2 KiB; 48 KiB |
+| `get_metric_series` | `metric` (memory, requests, errors), `label`, `from`, `to`, `max_points` ≤ 120 | — | 24 KiB |
+| `get_k8s_events` | `object_kind`, `object_name`, `reason`, `type`, `from`, `to`, `limit` ≤ 200 | nodes (Node events) | the incident's namespace only; messages ≤ 500; 32 KiB |
+| `get_audit_events` | `verb`, `resource`, `user`, `tag`, `from`, `to`, `limit` ≤ 100 | audit | no source IPs or user agents; 32 KiB |
+| `get_cloudtrail_events` | `event_name`, `from`, `to`, `limit` ≤ 50 | cloudtrail | from the incident's signals (no new AWS calls); raw ≤ 1 KiB without `sourceIPAddress`, `userAgent` |
+| `get_workload_state` | — | nodes (node conditions) | the current snapshot, labelled as now; 16 KiB |
+| `submit_report` | `InvestigationReport` (strict) | — | ends the run |
+
+**Budgets** (flags): `-investigator-max-turns` 16, `-investigator-max-tool-calls` 24, `-investigator-max-tokens` 1,500,000 (input + output + cache reads + cache writes over the run), `-investigator-max-output-tokens` 16,000 per turn, `-investigator-timeout` 10m. Exhausted: pending calls answer "budget exhausted", one turn for `submit_report`, then a final turn with tools off and the report schema as structured output.
+
+**Report validation:** refs not shown to the model during the run move to `unverified`; timeline entries more than 1h outside the window are dropped; lists and strings are capped. A `command` must start with an allowed read-only form (`kubectl get|describe|logs|top|events|explain|auth can-i|rollout history|rollout status|api-resources|version`, `cmctl status`, `helm status|history|get`, `aws <service> describe-*|get-*|list-*|lookup-*`) and contain none of ``;|&$`<>`` or a newline; otherwise it is removed and the description gains "(command removed: not read-only)". Output is shown as plain text; commands are never run.
+
+**Model and provider:** `-investigator-model` (default `claude-opus-5-5`; with `bedrock`, `anthropic.claude-opus-5-5`, or an inference-profile ID or ARN), `-investigator-effort` (`high`; `low|medium|high|xhigh|max`), `-investigator-region` (default `-aws-region`), `-investigator-bedrock-api` (`mantle`, the SDK's Messages-API Bedrock endpoint, or `runtime`, InvokeModel), `-investigator-endpoint` (override for a VPC endpoint, proxy or tests). `ANTHROPIC_API_KEY` from the environment only. Adaptive thinking is implied (no `thinking` field is sent); effort goes in `output_config`.
+
+**Limits:** `-investigator-per-hour` 10 per identity, `-investigator-per-hour-total` 60 (both counted from stored runs, so they hold across replicas; cache hits are free), `-investigator-concurrency` 2 per replica, one running run per incident. Cache key: SHA-256 of digest, model, effort, prompt version and access.
+
+**`/info.investigator`:** `{enabled, provider, model, effort, perHour}` (absent when off).
+
+**Redaction additions** (also in bundle downloads): signal `tags` and metric series labels are redacted; new built-in rules for GitHub (`ghp_`, `gho_`, `github_pat_`), Slack (`xox[abpr]-`), Anthropic (`sk-ant-`), Stripe (`sk_live_`) tokens and `aws_secret_access_key=`. Investigator egress also drops audit source IPs and user agents, the `sourceIP`/`userAgent` attributes, and CloudTrail `sourceIPAddress`/`userAgent`.
+
+**Storage (`0006_investigations.sql`):**
+```sql
+CREATE TABLE IF NOT EXISTS incident_investigations (
+  id text PRIMARY KEY,
+  incident_id text COLLATE "C" NOT NULL REFERENCES incidents (id) ON DELETE CASCADE,
+  namespace text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+  finished_at timestamptz, requested_by text NOT NULL,
+  provider text NOT NULL, model text NOT NULL, effort text NOT NULL, prompt_version text NOT NULL,
+  input_sha256 text NOT NULL, cached_from text,
+  access jsonb NOT NULL, omitted jsonb NOT NULL DEFAULT '{}',
+  status text NOT NULL CHECK (status IN ('running','completed','refused','failed','cancelled')),
+  error text, refusal jsonb, progress jsonb NOT NULL DEFAULT '[]', report jsonb,
+  input_tokens bigint NOT NULL DEFAULT 0, output_tokens bigint NOT NULL DEFAULT 0,
+  cache_read_tokens bigint NOT NULL DEFAULT 0, cache_write_tokens bigint NOT NULL DEFAULT 0,
+  turns int NOT NULL DEFAULT 0, tool_calls int NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS incident_investigations_incident ON incident_investigations (incident_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS incident_investigations_running ON incident_investigations (incident_id) WHERE status = 'running';
+CREATE INDEX IF NOT EXISTS incident_investigations_quota ON incident_investigations (requested_by, created_at);
+CREATE INDEX IF NOT EXISTS incident_investigations_hash ON incident_investigations (input_sha256, created_at DESC) WHERE status = 'completed';
+```
+Written through the pool by the replica running the job, after every turn (`updated_at` is the heartbeat; a `running` row older than 2 minutes reads as `failed`, `interrupted`). Shutdown marks the replica's running jobs failed. Rows go with their incident (cascade). Memory mode keeps the newest 1,000 runs.
+
+**Helm:** `incidents.investigator{enabled,provider,acknowledgeDataEgress,model,effort,region,bedrockAPI,endpoint,timeout,limits{perHour,perHourTotal,concurrency,maxTurns,maxToolCalls,maxTokens},existingSecret,apiKeyKey}`. The chart refuses it without `acknowledgeDataEgress`, without `incidents.enabled`, or with provider `anthropic` and no secret. Bedrock IAM: the inference action of the chosen Bedrock API on the model and inference-profile ARNs (`docs/deploy-eks.md`).
+
+**Metrics:** `kubesentry_investigations_total{provider,result}` (`completed`, `refused`, `failed`, `timeout`, `budget`, `cancelled`, `cached`, `quota`, `busy`), `kubesentry_investigations_running`, `kubesentry_investigation_duration_seconds`, `kubesentry_investigation_tokens_total{provider,model,kind}` (`input`, `output`, `cache_read`, `cache_write`), `kubesentry_investigation_tool_calls_total{tool,result}` (`ok`, `error`, `denied`, `invalid`), `kubesentry_llm_requests_total{provider,code}`.

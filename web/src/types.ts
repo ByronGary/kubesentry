@@ -37,6 +37,20 @@ export interface Info {
     lastSentAt?: string
     /** Why the latest delivery failed, while it still fails ("alertmanager 1 of 2: HTTP 503 ..."). */
     lastError?: string
+    /** Standing-state digests (-alerts-digest-at): when the last one was sent and the next is due. */
+    lastDigestAt?: string
+    nextDigestAt?: string
+  }
+  /** AI investigator (-investigator); absent when off or on older servers. */
+  investigator?: {
+    enabled: boolean
+    /** Where the redacted incident data is sent. "demo" is the scripted, offline investigator of cmd/demo. */
+    provider: 'anthropic' | 'bedrock' | 'demo'
+    /** e.g. "claude-opus-5-5" or "anthropic.claude-opus-5-5". */
+    model: string
+    effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+    /** Runs one caller may start per hour (cache hits are free). */
+    perHour: number
   }
   /** Incidents (-incidents); absent when off or on older servers. */
   incidents?: {
@@ -52,6 +66,10 @@ export interface Info {
 }
 
 export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'clusterIssuers' | 'processes' | 'audit' | 'clusterAudit' | 'agents' | 'podLogs' | 'cloudtrail'
+  /** `update alerts.kubesentry.io` somewhere: may ack and silence the alerts it can see there. */
+  | 'alertsUpdate'
+  /** `create investigations.kubesentry.io` somewhere: may start AI investigations of incidents there. */
+  | 'investigate'
 
 /** Optional paging on list responses: pass `continue` back to get the next page. */
 export interface Paged {
@@ -658,6 +676,21 @@ export interface AlertFinding {
   lastSeen: string
   lastNotified?: string
   resolvedAt?: string
+  /** Who acknowledged this episode, and when (state "acknowledged"). Cleared when a new episode starts or it turns critical. */
+  ackBy?: string
+  ackAt?: string
+  /** Who silenced the finding, when, and why (state "silenced", until silencedUntil). */
+  silencedBy?: string
+  silencedAt?: string
+  silenceReason?: string
+  /** UI route of the object, e.g. "#/workloads?namespace=shop&q=checkout". */
+  link?: string
+  /** The incident this finding's episode joined, when there is one. */
+  incidentId?: string
+  /** Reported only in the standing digest for now (a certificate far from expiry); never notified on its own. */
+  quiet?: boolean
+  /** The caller may ack or silence it (alertsUpdate in its namespace, or cluster-wide for cluster-scoped findings). */
+  actionable?: boolean
 }
 
 export interface AlertsResponse extends Paged {
@@ -668,6 +701,55 @@ export interface AlertsResponse extends Paged {
   counts: Record<AlertState, number>
   /** When the findings were last evaluated (the leader) or read from the store; absent before the first evaluation. */
   updatedAt?: string
+}
+
+// ---- Alert actions (POST/GET /api/v1/alerts/actions) ----
+// Ack is per episode (the finding's firstSeen); silence is per key and lasts
+// until it expires or is lifted. Neither writes to Alertmanager's silences.
+
+export type AlertActionKind = 'ack' | 'unack' | 'silence' | 'unsilence'
+
+export interface AlertActionRequest {
+  /** At most 100 dedupe keys. */
+  keys: string[]
+  action: AlertActionKind
+  /** Silence only: a Go duration from 5m to the server's maximum (default 7d), e.g. "4h". */
+  for?: string
+  /** Silence only: 3 to 500 characters. */
+  reason?: string
+}
+
+export interface AlertActionResult {
+  key: string
+  ok: boolean
+  /** A key the caller cannot see answers "not found", like an unknown one. */
+  error?: 'not found' | 'forbidden' | 'resolved' | 'invalid'
+  /** The finding after the action. */
+  finding?: AlertFinding
+}
+
+export interface AlertActionResponse {
+  results: AlertActionResult[]
+}
+
+export interface AlertAction {
+  id: number
+  key: string
+  /** The episode acted on. */
+  firstSeen: string
+  action: AlertActionKind
+  actor: string
+  reason?: string
+  /** Silence only. */
+  until?: string
+  /** The finding's severity when the action was taken. */
+  severity: AlertSeverity
+  at: string
+}
+
+/** GET /api/v1/alerts/actions?key=&limit= : newest first, at most 200, only for findings the caller can see. */
+export interface AlertActionsResponse {
+  items: AlertAction[]
 }
 
 // ---- Incidents (GET /api/v1/incidents…) ----
@@ -808,3 +890,101 @@ export interface IncidentBundleHeader {
   truncated?: Record<string, boolean>
 }
 
+// ---- AI investigator (/api/v1/incidents/{id}/investigations…) ----
+// An agent reads a redacted digest of the incident, pulls more evidence through
+// read-only tools limited to the starting user's permissions, and submits a
+// report. Runs are asynchronous: POST answers 202, then poll the run.
+// See docs/contracts.md "AI investigator".
+
+export type InvestigationStatus = 'running' | 'completed' | 'refused' | 'failed' | 'cancelled'
+
+/** Sections the run could read for its starter (frozen at start). Reading the run needs the same. */
+export interface InvestigationAccess { logs: boolean; audit: boolean; cloudtrail: boolean; nodes: boolean }
+
+export interface InvestigationStep {
+  at: string
+  /** "turn" (a model reply), "tool" (a tool call), or "note" (budget, retry, fallback). */
+  kind: 'turn' | 'tool' | 'note'
+  /** Tool name for kind "tool": list_signals, get_logs, get_metric_series, get_k8s_events, get_audit_events, get_cloudtrail_events, get_workload_state, submit_report. */
+  tool?: string
+  /** One line for people, e.g. "get_logs checkout-7d9 error 12:01–12:20: 48 lines". Never raw tool input. */
+  text: string
+  result?: 'ok' | 'error' | 'denied' | 'invalid'
+}
+
+/** A reference to evidence: signal:<id>, event:<uid>, log:<n>, logtpl:<n>, audit:<id>, cloudtrail:<id>, metric:<label>. */
+export type EvidenceRef = string
+
+export interface InvestigationEvidence {
+  ref: EvidenceRef
+  kind: 'signal' | 'event' | 'log' | 'logtpl' | 'audit' | 'cloudtrail' | 'metric'
+  time?: string
+  /** Pod, object or series label. */
+  object?: string
+  /** Redacted, at most 300 characters. */
+  snippet?: string
+}
+
+export interface InvestigationReport {
+  summary: string
+  status: 'root_cause_identified' | 'likely_cause' | 'inconclusive'
+  root_cause: { statement: string; confidence: 'high' | 'medium' | 'low'; evidence: EvidenceRef[] }
+  contributing_factors: { statement: string; evidence: EvidenceRef[] }[]
+  timeline: { time: string; event: string; evidence: EvidenceRef[] }[]
+  impact: string
+  /** Read-only checks; kubesentry never runs them. A command that was not read-only is removed and the description says so. */
+  suggested_checks: { description: string; command: string }[]
+  remediation_ideas: { description: string; risk: string }[]
+  open_questions: string[]
+  data_gaps: string[]
+  /** Refs the model cited that the run never showed it (set by the server, not the model). */
+  unverified?: EvidenceRef[]
+}
+
+export interface InvestigationUsage { input: number; output: number; cacheRead: number; cacheWrite: number }
+
+export interface InvestigationSummary {
+  id: string
+  incidentId: string
+  status: InvestigationStatus
+  requestedBy: string
+  createdAt: string
+  finishedAt?: string
+  provider: 'anthropic' | 'bedrock' | 'demo'
+  model: string
+  effort: string
+  /** The report's status and root-cause confidence, once completed. */
+  outcome?: InvestigationReport['status']
+  confidence?: InvestigationReport['root_cause']['confidence']
+  /** Served from an earlier run with the same input (no new model call). */
+  cachedFrom?: string
+}
+
+export interface Investigation extends InvestigationSummary {
+  access: InvestigationAccess
+  /** Sections the starter could not see, with the reason (e.g. {"logs": "forbidden"}). */
+  omitted?: Record<string, string>
+  steps: InvestigationStep[]
+  report?: InvestigationReport
+  evidence?: InvestigationEvidence[]
+  /** status "refused": the model's refusal category and explanation. */
+  refusal?: { category: string; explanation: string }
+  /** status "failed": a short reason without provider response bodies ("timeout", "budget: tool calls", "interrupted", "HTTP 529 overloaded"). */
+  error?: string
+  usage: InvestigationUsage
+  turns: number
+  toolCalls: number
+}
+
+/** POST /api/v1/incidents/{id}/investigations: 202 with the new run, or 200 with cached: true. */
+export interface InvestigationStartResponse {
+  investigation: Investigation
+  cached?: boolean
+}
+
+/** GET /api/v1/incidents/{id}/investigations: newest first. */
+export interface InvestigationsResponse {
+  items: InvestigationSummary[]
+  /** Runs on this incident that used sections the caller cannot see. */
+  hidden: number
+}
