@@ -481,6 +481,7 @@ var uiCapabilities = []struct {
 	{"audit", ViewAudit},
 	{"podLogs", ViewPodLogs},
 	{"cloudtrail", ViewCloudTrail},
+	{"alertsUpdate", UpdateAlerts},
 }
 
 // Capabilities asks a for every capability the UI gates on and returns the

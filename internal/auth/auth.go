@@ -69,6 +69,11 @@ var (
 	ViewPodLogs = Capability{Verb: "get", Resource: "pods", Subresource: "log", Namespaced: true}
 	// ViewCloudTrail gates AWS CloudTrail events (cluster-wide).
 	ViewCloudTrail = Capability{Verb: "list", Group: "kubesentry.io", Resource: "cloudtrail"}
+	// UpdateAlerts lets a caller acknowledge and silence the alert findings
+	// they can see in a namespace; cluster-scoped findings need it
+	// cluster-wide. kubesentry never writes to the cluster or to
+	// Alertmanager's silences: this is its own actions log.
+	UpdateAlerts = Capability{Verb: "update", Group: "kubesentry.io", Resource: "alerts", Namespaced: true}
 )
 
 // Scope is the set of namespaces a capability is granted in.

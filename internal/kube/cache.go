@@ -14,6 +14,8 @@ import (
 	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,6 +50,12 @@ type CacheOptions struct {
 	// AppLabelKeys are workload labels kept besides DefaultAppLabelKeys
 	// (the custom app tag, -incident-app-label; "prefix*" matches by prefix).
 	AppLabelKeys []string
+	// OwnerAnnotation is the one annotation kept on Deployments,
+	// StatefulSets, DaemonSets, Jobs, CronJobs, Services, Ingresses,
+	// cert-manager Certificates, Roles, RoleBindings, ClusterRoles and
+	// ClusterRoleBindings: the team that owns the object (-owner-annotation),
+	// read into the model's Owner fields. "" keeps it nowhere.
+	OwnerAnnotation string
 	// CertManagerRecheck is how often discovery is re-run for the custom
 	// resource APIs (cert-manager, the AWS Load Balancer Controller's
 	// TargetGroupBindings) and the server version; default 5m.
@@ -253,7 +261,7 @@ func NewCache(c *Clients, o CacheOptions) *Cache {
 	if disc == nil && c.CS != nil {
 		disc = c.CS.Discovery()
 	}
-	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd, o.AppLabelKeys)
+	f := newFilters(o.NodeLabelKeysAdd, o.NamespaceAnnotationKeysAdd, o.AppLabelKeys).withOwner(o.OwnerAnnotation)
 	return &Cache{
 		cs: c.CS, dyn: c.Dyn, disc: disc, opts: o,
 		filters:   f,
@@ -598,6 +606,20 @@ func (c *Cache) convertNamespace(n *corev1.Namespace) model.Namespace {
 	return convertNamespace(n, c.filters.nsAnnotations)
 }
 
+// The conversions that read the owner annotation (filters.owner).
+
+func (c *Cache) convertService(s *corev1.Service) model.Service {
+	return convertService(s, c.filters.owner)
+}
+
+func (c *Cache) convertIngress(in *networkingv1.Ingress) model.Ingress {
+	return convertIngress(in, c.filters.owner)
+}
+
+func (c *Cache) convertCertificate(u *unstructured.Unstructured) model.Certificate {
+	return convertCertificate(u, c.filters.owner)
+}
+
 func issuerConv(kind string) func(*unstructured.Unstructured) model.Issuer {
 	return func(u *unstructured.Unstructured) model.Issuer { return convertIssuer(u, kind) }
 }
@@ -621,9 +643,9 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 	inv.StorageClasses = inventoryItems(c.st("storageclasses"), &m.classes, convertStorageClass, u)
 	inv.Workloads = c.workloads(u)
 	inv.ReplicaSets = inventoryItems(c.st("replicasets"), &m.replicasets, convertReplicaSet, u)
-	inv.Services = inventoryItems(c.st("services"), &m.services, convertService, u)
+	inv.Services = inventoryItems(c.st("services"), &m.services, c.convertService, u)
 	inv.EndpointSlices = inventoryItems(c.st("endpointslices"), &m.slices, convertEndpointSlice, u)
-	inv.Ingresses = inventoryItems(c.st("ingresses"), &m.ingresses, convertIngress, u)
+	inv.Ingresses = inventoryItems(c.st("ingresses"), &m.ingresses, c.convertIngress, u)
 	inv.Nodes = inventoryItems(c.st("nodes"), &m.nodes, c.convertNode, u)
 	inv.Namespaces = inventoryItems(c.st("namespaces"), &m.namespaces, c.convertNamespace, u)
 	inv.ServiceAccounts = inventoryItemsWhere(c.st("serviceaccounts"), &m.serviceaccounts, hasIRSARole, convertServiceAccount, u)
@@ -651,12 +673,12 @@ func (c *Cache) Inventory(ctx context.Context) (model.Inventory, error) {
 func (c *Cache) workloads(unavailable map[string]string) []model.Workload {
 	m := &c.m
 	var out []model.Workload
-	apps := c.filters.appLabels
-	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps) }, unavailable)...)
-	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps) }, unavailable)...)
-	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps) }, unavailable)...)
-	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, func(o *batchv1.Job) model.Workload { return convertJob(o, apps) }, unavailable)...)
-	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps) }, unavailable)...)
+	apps, own := c.filters.appLabels, c.filters.owner
+	out = append(out, inventoryItems(c.st("deployments"), &m.deployments, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps, own) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("statefulsets"), &m.statefulsets, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps, own) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("daemonsets"), &m.daemonsets, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps, own) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("jobs"), &m.jobs, func(o *batchv1.Job) model.Workload { return convertJob(o, apps, own) }, unavailable)...)
+	out = append(out, inventoryItems(c.st("cronjobs"), &m.cronjobs, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps, own) }, unavailable)...)
 	return out
 }
 
@@ -664,11 +686,12 @@ func (c *Cache) workloads(unavailable map[string]string) []model.Workload {
 // ClusterRoleBindings.
 func (c *Cache) rbac(unavailable map[string]string) model.RBAC {
 	m := &c.m
+	own := c.filters.owner
 	var out model.RBAC
-	out.Roles = append(out.Roles, inventoryItems(c.st("roles"), &m.roles, convertRole, unavailable)...)
-	out.Roles = append(out.Roles, inventoryItems(c.st("clusterroles"), &m.clusterroles, convertClusterRole, unavailable)...)
-	out.Bindings = append(out.Bindings, inventoryItems(c.st("rolebindings"), &m.rolebindings, convertRoleBinding, unavailable)...)
-	out.Bindings = append(out.Bindings, inventoryItems(c.st("clusterrolebindings"), &m.clusterrolebindings, convertClusterRoleBinding, unavailable)...)
+	out.Roles = append(out.Roles, inventoryItems(c.st("roles"), &m.roles, func(o *rbacv1.Role) model.Role { return convertRole(o, own) }, unavailable)...)
+	out.Roles = append(out.Roles, inventoryItems(c.st("clusterroles"), &m.clusterroles, func(o *rbacv1.ClusterRole) model.Role { return convertClusterRole(o, own) }, unavailable)...)
+	out.Bindings = append(out.Bindings, inventoryItems(c.st("rolebindings"), &m.rolebindings, func(o *rbacv1.RoleBinding) model.RoleBinding { return convertRoleBinding(o, own) }, unavailable)...)
+	out.Bindings = append(out.Bindings, inventoryItems(c.st("clusterrolebindings"), &m.clusterrolebindings, func(o *rbacv1.ClusterRoleBinding) model.RoleBinding { return convertClusterRoleBinding(o, own) }, unavailable)...)
 	return out
 }
 
@@ -681,7 +704,7 @@ func (c *Cache) certs(unavailable map[string]string) model.CertManager {
 	}
 	m := &c.m
 	out := model.CertManager{Installed: true}
-	out.Certificates = inventoryItems(cm.res["certificates"], &m.certificates, convertCertificate, unavailable)
+	out.Certificates = inventoryItems(cm.res["certificates"], &m.certificates, c.convertCertificate, unavailable)
 	out.Issuers = append(out.Issuers, inventoryItems(cm.res["issuers"], &m.issuers, issuerConv("Issuer"), unavailable)...)
 	out.Issuers = append(out.Issuers, inventoryItems(cm.res["clusterissuers"], &m.clusterissuers, issuerConv("ClusterIssuer"), unavailable)...)
 	out.Requests = inventoryItems(cm.res["certificaterequests"], &m.requests, convertCertificateRequest, unavailable)
@@ -787,11 +810,11 @@ func (c *Cache) ListWorkloads(ctx context.Context) ([]model.Workload, error) {
 }
 
 func (c *Cache) ListServices(ctx context.Context) ([]model.Service, error) {
-	return listCached(c, c.st("services"), &c.m.services, convertService)
+	return listCached(c, c.st("services"), &c.m.services, c.convertService)
 }
 
 func (c *Cache) ListIngresses(ctx context.Context) ([]model.Ingress, error) {
-	return listCached(c, c.st("ingresses"), &c.m.ingresses, convertIngress)
+	return listCached(c, c.st("ingresses"), &c.m.ingresses, c.convertIngress)
 }
 
 func (c *Cache) ListNodes(ctx context.Context) ([]model.Node, error) {

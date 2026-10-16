@@ -735,6 +735,8 @@ export interface AlertActionResponse {
 export interface AlertAction {
   id: number
   key: string
+  /** The namespace of the finding acted on (from its key); absent for cluster-scoped findings. */
+  namespace?: string
   /** The episode acted on. */
   firstSeen: string
   action: AlertActionKind

@@ -55,11 +55,14 @@ func (s *Source) certManager(ctx context.Context, unavailable map[string]string)
 		return model.CertManager{}, fmt.Errorf("discover cert-manager: %w", err)
 	}
 	out := model.CertManager{Installed: true}
+	owner := s.ownerKey()
 	for _, r := range []struct {
 		resource string
 		each     func(*unstructured.Unstructured)
 	}{
-		{"certificates", func(u *unstructured.Unstructured) { out.Certificates = append(out.Certificates, convertCertificate(u)) }},
+		{"certificates", func(u *unstructured.Unstructured) {
+			out.Certificates = append(out.Certificates, convertCertificate(u, owner))
+		}},
 		{"issuers", func(u *unstructured.Unstructured) { out.Issuers = append(out.Issuers, convertIssuer(u, "Issuer")) }},
 		{"clusterissuers", func(u *unstructured.Unstructured) {
 			out.Issuers = append(out.Issuers, convertIssuer(u, "ClusterIssuer"))
@@ -135,7 +138,8 @@ func issuerRef(u *unstructured.Unstructured) (kind, name string) {
 	return kind, name
 }
 
-func convertCertificate(u *unstructured.Unstructured) model.Certificate {
+// convertCertificate reads a Certificate; owner is the owner annotation key.
+func convertCertificate(u *unstructured.Unstructured, owner string) model.Certificate {
 	c := model.Certificate{
 		Namespace: u.GetNamespace(), Name: u.GetName(), Created: u.GetCreationTimestamp().Time,
 		SecretName: str(u, "spec", "secretName"), CommonName: str(u, "spec", "commonName"),
@@ -143,6 +147,7 @@ func convertCertificate(u *unstructured.Unstructured) model.Certificate {
 		RenewalTime: timeField(u, "status", "renewalTime"),
 		Duration:    durationField(u, "spec", "duration"),
 		RenewBefore: durationField(u, "spec", "renewBefore"),
+		Owner:       ownerOf(u.GetAnnotations(), owner),
 	}
 	c.DNSNames, _, _ = unstructured.NestedStringSlice(u.Object, "spec", "dnsNames")
 	c.IssuerKind, c.IssuerName = issuerRef(u)

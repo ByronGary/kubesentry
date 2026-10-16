@@ -12,6 +12,7 @@ package alerts
 
 import (
 	"maps"
+	"strings"
 	"time"
 )
 
@@ -24,8 +25,8 @@ const (
 // State is where a finding is in its lifecycle.
 type State string
 
-// States. Acknowledged and silenced come from people (phase C); the
-// evaluator opens and resolves.
+// States. Acknowledged and silenced come from people (the actions log,
+// marks.go); the evaluator opens and resolves.
 const (
 	StateOpen         State = "open"
 	StateAcknowledged State = "acknowledged"
@@ -84,13 +85,28 @@ type Finding struct {
 	SilencedUntil *time.Time `json:"silencedUntil,omitempty"`
 	// Digest is set when the finding was announced in a per-owner digest
 	// (storm protection) instead of on its own; it then stays in the digest
-	// until it resolves.
+	// until it resolves, or leaves it when it turns critical.
 	Digest bool `json:"digest,omitempty"`
 
 	FirstSeen    time.Time  `json:"firstSeen"`
 	LastSeen     time.Time  `json:"lastSeen"`
 	LastNotified *time.Time `json:"lastNotified,omitempty"`
 	ResolvedAt   *time.Time `json:"resolvedAt,omitempty"`
+
+	// Who acknowledged the current episode, and when; who silenced the
+	// finding, when and why. Derived from the actions log (applyMarks) on
+	// every replica, never stored with the finding.
+	AckBy         string     `json:"ackBy,omitempty"`
+	AckAt         *time.Time `json:"ackAt,omitempty"`
+	SilencedBy    string     `json:"silencedBy,omitempty"`
+	SilencedAt    *time.Time `json:"silencedAt,omitempty"`
+	SilenceReason string     `json:"silenceReason,omitempty"`
+	// Link is the UI route of the page that explains the finding, e.g.
+	// "#/workloads?namespace=shop&q=checkout" (internal/uilink).
+	Link string `json:"link,omitempty"`
+	// Quiet findings are reported only in a standing digest: never notified
+	// on their own, and never counted by storm protection.
+	Quiet bool `json:"quiet,omitempty"`
 }
 
 // Key builds a finding's dedupe key.
@@ -104,7 +120,63 @@ func (f *Finding) Resolved() bool { return f.State == StateResolved }
 // RBAC reports whether the finding is about RBAC, which needs the RBAC
 // capabilities to be seen (ViewRBAC in its namespace, ViewClusterRBAC when
 // cluster-scoped).
-func (f *Finding) RBAC() bool { return f.Alert == AlertRBACDrift }
+func (f *Finding) RBAC() bool { return f.Gate() == GateRBAC }
+
+// Gate names the capability that, besides the namespace, decides who may
+// see a finding (docs/contracts.md, "Visibility by finding kind"):
+//
+//	gate       namespaced finding              cluster-scoped finding
+//	namespace  ViewNamespace                   (ViewNamespace everywhere)
+//	rbac       ViewNamespace + ViewRBAC        ViewClusterRBAC
+//	audit      ViewNamespace + ViewAudit       ViewClusterAudit
+//	node       (ViewNamespace + ViewNodes)     ViewNodes
+//	agents     (ViewNamespace + ViewAgents)    ViewAgents
+//
+// The cases in parentheses do not occur today; internal/api answers them
+// failing closed, as shown.
+type Gate string
+
+// Gates.
+const (
+	GateNamespace Gate = "namespace"
+	GateRBAC      Gate = "rbac"
+	GateAudit     Gate = "audit"
+	GateNode      Gate = "node"
+	GateAgents    Gate = "agents"
+)
+
+// Gate is the finding's gate (GateOf its check and kind).
+func (f *Finding) Gate() Gate { return GateOf(f.Check, f.Kind) }
+
+// GateOf maps a check, and the kind of object its finding names, to the
+// gate: the RBAC drift checks to rbac, the audit checks (audit-*) to audit,
+// the agent check to agents, findings about a Node to node, everything else
+// to namespace.
+func GateOf(check, kind string) Gate {
+	if info, ok := checkInfos[check]; ok && info.gate != "" {
+		return info.gate
+	}
+	switch {
+	case strings.HasPrefix(check, "audit-"):
+		return GateAudit
+	case check == "agent-missing":
+		return GateAgents
+	case kind == "Node":
+		return GateNode
+	}
+	return GateNamespace
+}
+
+// ParseKey splits a dedupe key (Key) into its parts. Checks, kinds and
+// namespaces hold no "/", so only the name may; ok is false for anything
+// that is not a key.
+func ParseKey(key string) (check, kind, namespace, name string, ok bool) {
+	parts := strings.SplitN(key, "/", 4)
+	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[3] == "" {
+		return "", "", "", "", false
+	}
+	return parts[0], parts[1], parts[2], parts[3], true
+}
 
 // incidentURL is the incident link f carries ("" for nil).
 func (f *Finding) incidentURL() string {
@@ -121,6 +193,8 @@ func (f Finding) Clone() Finding {
 	f.SilencedUntil = cloneTime(f.SilencedUntil)
 	f.LastNotified = cloneTime(f.LastNotified)
 	f.ResolvedAt = cloneTime(f.ResolvedAt)
+	f.AckAt = cloneTime(f.AckAt)
+	f.SilencedAt = cloneTime(f.SilencedAt)
 	return f
 }
 

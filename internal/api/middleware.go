@@ -8,7 +8,7 @@ package api
 // A sensible order, outermost first:
 //
 //	WithRequestID, WithAccessLog, WithSecurityHeaders, WithAuthentication,
-//	WithRateLimit, WithMaxInflight
+//	WithCrossOrigin, WithRateLimit, WithMaxInflight
 //
 // around the mux, and per route:
 //
@@ -285,6 +285,30 @@ func WithAuthentication(authn auth.Authenticator, open ...string) func(http.Hand
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// WithCrossOrigin refuses cross-origin browser requests that change state
+// (every method but GET, HEAD and OPTIONS), with net/http's
+// CrossOriginProtection: a request whose Sec-Fetch-Site is cross-site or
+// same-site, or whose Origin does not match its Host, is answered 403
+// {"error":"cross-origin request refused"} unless its origin is one of
+// trusted ("scheme://host[:port]": the origin of -external-url and
+// -allowed-origins). Requests without Sec-Fetch-Site and Origin, such as
+// curl with the API token, pass: they are not from a browser, so no other
+// site can have sent them with the user's credentials. An origin that is not
+// valid is logged and skipped (cmd/server validates the flags).
+func WithCrossOrigin(trusted ...string) func(http.Handler) http.Handler {
+	c := http.NewCrossOriginProtection()
+	for _, o := range trusted {
+		if err := c.AddTrustedOrigin(o); err != nil {
+			slog.Warn("cross-origin protection: ignoring an invalid trusted origin", "origin", o, "err", err)
+		}
+	}
+	c.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		metrics.HTTPRejected.With("cross_origin").Inc()
+		writeError(w, http.StatusForbidden, "cross-origin request refused")
+	}))
+	return c.Handler
 }
 
 // rateKey identifies the caller for rate limiting: the authenticated user,

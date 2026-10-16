@@ -2,6 +2,8 @@ package alerts
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"sync"
@@ -12,46 +14,68 @@ import (
 // maintenance loop deletes older ones, and the memory store drops them.
 const Retention = 30 * 24 * time.Hour
 
-// Store keeps findings and the baselines of the change-based checks. The
-// memory store and internal/pgstore's Postgres store behave the same
+// Store keeps findings, the baselines of the change-based checks, the
+// actions log and the standing digests' last runs. The memory store and
+// internal/pgstore's Postgres store behave the same
 // (TestPGAlertsMatchMemory).
 type Store interface {
 	// Load returns every finding not resolved, and those resolved at or
-	// after resolvedSince, sorted by key.
+	// after resolvedSince, sorted by key. The acknowledgement and silence
+	// details (AckBy, SilencedBy, ...) are not stored: applyMarks derives
+	// them from the actions.
 	Load(ctx context.Context, resolvedSince time.Time) ([]Finding, error)
 	// Baselines returns the recorded key set of each change-based check. A
 	// check with no entry has no baseline yet; one with an empty slice has
 	// recorded that nothing was there.
 	Baselines(ctx context.Context) (map[string][]string, error)
-	// Commit upserts the findings (by key) and replaces the baselines it
-	// names, in one transaction.
+	// Commit upserts the findings (by key), replaces the baselines it
+	// names and records the digest runs, in one transaction. Only the
+	// leader commits.
 	Commit(ctx context.Context, c Commit) error
-	// Prune deletes findings resolved before before, and reports how many.
+	// Prune deletes findings resolved before before, and actions taken a
+	// day or more before that (so with before = now - Retention, actions
+	// are kept Retention plus a day); it reports how many rows it deleted.
 	Prune(ctx context.Context, before time.Time) (int, error)
+
+	// AddAction appends a to the actions log and returns it as stored, with
+	// its ID (and At, when a left it zero: now). Any replica may add, not
+	// only the leader; on Postgres it goes through the pool.
+	AddAction(ctx context.Context, a Action) (Action, error)
+	// Actions returns the actions with an ID above afterID, in ID order.
+	Actions(ctx context.Context, afterID int64) ([]Action, error)
+	// DigestRuns returns when each standing digest was last sent.
+	DigestRuns(ctx context.Context) (map[string]time.Time, error)
 }
 
 // Commit is one evaluation's writes.
 type Commit struct {
 	Findings  []Finding
 	Baselines map[string][]string // check → keys, sorted
+	// DigestRuns records when a standing digest (by name) was last sent.
+	DigestRuns map[string]time.Time
 }
 
 // Empty reports whether there is nothing to write.
-func (c Commit) Empty() bool { return len(c.Findings) == 0 && len(c.Baselines) == 0 }
+func (c Commit) Empty() bool {
+	return len(c.Findings) == 0 && len(c.Baselines) == 0 && len(c.DigestRuns) == 0
+}
 
 // MemoryStore is a Store in memory: for a single replica, or tests. Its
 // contents are lost on restart, so the first evaluation afterwards records
 // the change-based baselines again (without notifying) and finds the
 // standing problems anew; Alertmanager deduplicates what it still holds.
 type MemoryStore struct {
-	mu        sync.Mutex
-	findings  map[string]Finding
-	baselines map[string][]string
+	mu         sync.Mutex
+	findings   map[string]Finding
+	baselines  map[string][]string
+	actions    []Action // in ID order
+	lastID     int64
+	digestRuns map[string]time.Time
 }
 
 // NewMemoryStore returns an empty store.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{findings: map[string]Finding{}, baselines: map[string][]string{}}
+	return &MemoryStore{findings: map[string]Finding{}, baselines: map[string][]string{}, digestRuns: map[string]time.Time{}}
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -106,6 +130,9 @@ func (m *MemoryStore) Commit(ctx context.Context, c Commit) error {
 		sort.Strings(keys)
 		m.baselines[k] = slices.Compact(keys)
 	}
+	for k, t := range c.DigestRuns {
+		m.digestRuns[k] = NormalTime(t)
+	}
 	return nil
 }
 
@@ -123,11 +150,69 @@ func (m *MemoryStore) Prune(ctx context.Context, before time.Time) (int, error) 
 			n++
 		}
 	}
+	cutoff := before.Add(-24 * time.Hour)
+	kept := m.actions[:0]
+	for _, a := range m.actions {
+		if a.At.Before(cutoff) {
+			n++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	clear(m.actions[len(kept):])
+	m.actions = kept
 	return n, nil
 }
 
+// AddAction implements Store.
+func (m *MemoryStore) AddAction(ctx context.Context, a Action) (Action, error) {
+	if err := ctx.Err(); err != nil {
+		return Action{}, err
+	}
+	if !a.Action.Valid() {
+		return Action{}, fmt.Errorf("alerts: unknown action %q", a.Action)
+	}
+	if a.At.IsZero() {
+		a.At = time.Now()
+	}
+	a.FirstSeen, a.At, a.Until = NormalTime(a.FirstSeen), NormalTime(a.At), normalPtr(a.Until)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastID++
+	a.ID = m.lastID
+	m.actions = append(m.actions, a)
+	return a, nil
+}
+
+// Actions implements Store.
+func (m *MemoryStore) Actions(ctx context.Context, afterID int64) ([]Action, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	i := sort.Search(len(m.actions), func(i int) bool { return m.actions[i].ID > afterID })
+	out := make([]Action, 0, len(m.actions)-i)
+	for _, a := range m.actions[i:] {
+		a.Until = cloneTime(a.Until)
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// DigestRuns implements Store.
+func (m *MemoryStore) DigestRuns(ctx context.Context) (map[string]time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return maps.Clone(m.digestRuns), nil
+}
+
 // normalize gives a finding the shape a round trip through Postgres gives
-// it: empty maps rather than nil, times in UTC truncated to microseconds.
+// it: empty maps rather than nil, times in UTC truncated to microseconds,
+// and no acknowledgement or silence details (they come from the actions).
 func normalize(f Finding) Finding {
 	if f.Labels == nil {
 		f.Labels = map[string]string{}
@@ -140,6 +225,7 @@ func normalize(f Finding) Finding {
 	f.SilencedUntil = normalPtr(f.SilencedUntil)
 	f.LastNotified = normalPtr(f.LastNotified)
 	f.ResolvedAt = normalPtr(f.ResolvedAt)
+	f.AckBy, f.AckAt, f.SilencedBy, f.SilencedAt, f.SilenceReason = "", nil, "", nil, ""
 	return f
 }
 

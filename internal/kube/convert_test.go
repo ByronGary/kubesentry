@@ -89,11 +89,11 @@ func TestConvertPodStateFields(t *testing.T) {
 
 func TestConvertWorkloadIdentity(t *testing.T) {
 	apps := newAppLabelFilter(nil)
-	job := convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps)
+	job := convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps, "")
 	if job.UID != "job-backup" || len(job.Owners) != 1 || job.Owners[0].Kind != "CronJob" || job.Owners[0].Name != "backup" || !job.Owners[0].Controller {
 		t.Errorf("job: %+v", job)
 	}
-	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps)
+	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps, "")
 	if dep.UID != "dep-web" || dep.Owners != nil || len(dep.Conditions[0].Message) > maxMessage {
 		t.Errorf("deployment: %+v", dep)
 	}
@@ -106,41 +106,41 @@ func TestConvertWorkloadIdentity(t *testing.T) {
 // every rollout.
 func TestConvertWorkloadTagsAndRevision(t *testing.T) {
 	apps := newAppLabelFilter(nil)
-	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps)
+	dep := convertDeployment(fixture[*appsv1.Deployment](t, "web"), apps, "")
 	if want := map[string]string{"app": "web", "app.kubernetes.io/name": "web", "app.kubernetes.io/part-of": "shop"}; !reflect.DeepEqual(dep.Labels, want) {
 		t.Errorf("deployment labels: %v", dep.Labels)
 	}
 	if dep.Revision != "7" {
 		t.Errorf("deployment revision: %q", dep.Revision)
 	}
-	sts := convertStatefulSet(fixture[*appsv1.StatefulSet](t, "crash"), apps)
+	sts := convertStatefulSet(fixture[*appsv1.StatefulSet](t, "crash"), apps, "")
 	if sts.Revision != "crash-6d4f" || !reflect.DeepEqual(sts.Labels, map[string]string{"app": "crash"}) {
 		t.Errorf("statefulset: revision %q labels %v", sts.Revision, sts.Labels)
 	}
-	ds := convertDaemonSet(fixture[*appsv1.DaemonSet](t, "agent"), apps)
+	ds := convertDaemonSet(fixture[*appsv1.DaemonSet](t, "agent"), apps, "")
 	if ds.Revision != "4" || !reflect.DeepEqual(ds.Labels, map[string]string{"app": "agent", "k8s-app": "agent"}) {
 		t.Errorf("daemonset: revision %q labels %v", ds.Revision, ds.Labels)
 	}
 	for _, w := range []model.Workload{
-		convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps),
-		convertCronJob(fixture[*batchv1.CronJob](t, "backup"), apps),
+		convertJob(fixture[*batchv1.Job](t, "backup-29000"), apps, ""),
+		convertCronJob(fixture[*batchv1.CronJob](t, "backup"), apps, ""),
 	} {
 		if w.Revision != "" {
 			t.Errorf("%s revision: %q", w.Kind, w.Revision)
 		}
 	}
 	// The custom tag key (-incident-app-label) is kept as well; "prefix*" matches by prefix.
-	custom := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{" team ", ""}))
+	custom := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{" team ", ""}), "")
 	if custom.Labels["team"] != "payments" || len(custom.Labels) != 4 {
 		t.Errorf("custom tag: %v", custom.Labels)
 	}
-	if p := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{"te*"})); p.Labels["team"] != "payments" {
+	if p := convertDeployment(fixture[*appsv1.Deployment](t, "web"), newAppLabelFilter([]string{"te*"}), ""); p.Labels["team"] != "payments" {
 		t.Errorf("custom tag prefix: %v", p.Labels)
 	}
 	// No tag labels at all: nil, not an empty map.
 	bare := fixture[*appsv1.Deployment](t, "web").DeepCopy()
 	bare.Labels = map[string]string{"team": "payments"}
-	if l := convertDeployment(bare, apps).Labels; l != nil {
+	if l := convertDeployment(bare, apps, "").Labels; l != nil {
 		t.Errorf("untagged labels: %#v", l)
 	}
 }
@@ -176,7 +176,7 @@ func TestConvertEndpointSlice(t *testing.T) {
 }
 
 func TestConvertServiceAndIngressAnnotations(t *testing.T) {
-	svc := convertService(fixture[*corev1.Service](t, "web"))
+	svc := convertService(fixture[*corev1.Service](t, "web"), "")
 	wantAnn := map[string]string{
 		"service.beta.kubernetes.io/aws-load-balancer-scheme":          "internal",
 		"service.beta.kubernetes.io/aws-load-balancer-type":            "external",
@@ -188,10 +188,10 @@ func TestConvertServiceAndIngressAnnotations(t *testing.T) {
 		svc.LoadBalancerIngress[0] != "k8s-app-web-123.elb.us-east-1.amazonaws.com" {
 		t.Errorf("service: %+v", svc)
 	}
-	if h := convertService(fixture[*corev1.Service](t, "web-headless")); h.Annotations != nil || h.LoadBalancerClass != "" || h.PublishNotReady {
+	if h := convertService(fixture[*corev1.Service](t, "web-headless"), ""); h.Annotations != nil || h.LoadBalancerClass != "" || h.PublishNotReady {
 		t.Errorf("headless: %+v", h)
 	}
-	ing := convertIngress(fixture[*networkingv1.Ingress](t, "web"))
+	ing := convertIngress(fixture[*networkingv1.Ingress](t, "web"), "")
 	wantIng := map[string]string{
 		"alb.ingress.kubernetes.io/scheme":             "internet-facing",
 		"alb.ingress.kubernetes.io/certificate-arn":    "arn:aws:acm:us-east-1:123:certificate/abc",
@@ -273,13 +273,13 @@ func TestConvertPVDriverAndClassParameters(t *testing.T) {
 
 func TestConvertCertificateDurations(t *testing.T) {
 	cert := certObjects()[0].(*unstructured.Unstructured)
-	c := convertCertificate(cert)
+	c := convertCertificate(cert, "")
 	if c.Duration != 2160*time.Hour || c.RenewBefore != 360*time.Hour || len(c.Message) != maxMessage || c.IssuerKind != "ClusterIssuer" {
 		t.Errorf("certificate: %+v", c)
 	}
 	_ = unstructured.SetNestedField(cert.Object, "90d", "spec", "duration") // not a Go duration
 	unstructured.RemoveNestedField(cert.Object, "spec", "renewBefore")
-	if c := convertCertificate(cert); c.Duration != 0 || c.RenewBefore != 0 {
+	if c := convertCertificate(cert, ""); c.Duration != 0 || c.RenewBefore != 0 {
 		t.Errorf("malformed durations: %v %v", c.Duration, c.RenewBefore)
 	}
 }

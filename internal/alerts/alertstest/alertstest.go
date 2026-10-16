@@ -47,7 +47,34 @@ func Commit(rng *rand.Rand, step int) alerts.Commit {
 			c.Baselines[ch] = keys // nil sometimes: an empty baseline
 		}
 	}
+	if rng.Intn(5) == 0 {
+		c.DigestRuns = map[string]time.Time{digests[rng.Intn(len(digests))]: at}
+	}
 	return c
+}
+
+var (
+	digests = []string{"rbac-posture", "unused-volumes", "certificates"}
+	actions = []alerts.ActionKind{alerts.ActionAck, alerts.ActionUnack, alerts.ActionSilence, alerts.ActionUnsilence}
+	actors  = []string{"alice@example.com", "bob", "system:serviceaccount:ops:bot", "zoë"}
+	reasons = []string{"", "deploying", "ünïcode \"quoted\"\nsecond line"}
+)
+
+// Action returns a random action taken at about at (sub-microsecond noise
+// included, which the stores must drop alike).
+func Action(rng *rand.Rand, at time.Time) alerts.Action {
+	ch, kind, ns, name := checks[rng.Intn(len(checks))], kinds[rng.Intn(len(kinds))], namespaces[rng.Intn(len(namespaces))], names[rng.Intn(len(names))]
+	a := alerts.Action{
+		Key: alerts.Key(ch, kind, ns, name), FirstSeen: at.Add(-time.Duration(rng.Intn(3600_000_000)) * time.Microsecond),
+		Action: actions[rng.Intn(len(actions))], Actor: actors[rng.Intn(len(actors))],
+		Severity: []string{alerts.SeverityWarning, alerts.SeverityCritical}[rng.Intn(2)],
+		At:       at.Add(time.Duration(rng.Intn(1000))),
+	}
+	if a.Action == alerts.ActionSilence {
+		u := at.Add(time.Duration(1+rng.Intn(48)) * time.Hour).Add(time.Duration(rng.Intn(1000)))
+		a.Until, a.Reason = &u, reasons[1+rng.Intn(len(reasons)-1)]
+	}
+	return a
 }
 
 // Finding returns a random finding seen at at.
@@ -57,8 +84,11 @@ func Finding(rng *rand.Rand, at time.Time) alerts.Finding {
 		Key: alerts.Key(ch, kind, ns, name), Alert: "Kubesentry" + kind, Check: ch, Kind: kind, Namespace: ns, Name: name,
 		Severity: []string{alerts.SeverityWarning, alerts.SeverityCritical}[rng.Intn(2)],
 		Title:    fmt.Sprintf("%s %s/%s", kind, ns, name), Owner: owners[rng.Intn(len(owners))], Production: rng.Intn(3) == 0,
-		State: states[rng.Intn(len(states))], Digest: rng.Intn(5) == 0,
+		State: states[rng.Intn(len(states))], Digest: rng.Intn(5) == 0, Quiet: rng.Intn(6) == 0,
 		FirstSeen: at.Add(-time.Duration(rng.Intn(3600)) * time.Second), LastSeen: at,
+	}
+	if rng.Intn(3) > 0 {
+		f.Link = "#/workloads?namespace=" + ns + "&q=" + name
 	}
 	if rng.Intn(4) > 0 {
 		f.Labels = map[string]string{"alertname": f.Alert, "severity": f.Severity, "owner": f.Owner}

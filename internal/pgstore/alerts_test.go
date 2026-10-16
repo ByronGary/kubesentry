@@ -15,8 +15,9 @@ import (
 )
 
 // TestPGAlertsMatchMemory is the alert store's parity test: the same random
-// commits against alerts.MemoryStore and the Postgres store load the same
-// findings and baselines, and prune the same rows.
+// commits and actions against alerts.MemoryStore and the Postgres store load
+// the same findings (link and quiet included), baselines, actions and
+// digest runs, and prune the same rows.
 func TestPGAlertsMatchMemory(t *testing.T) {
 	testDSN(t)
 	ctx := context.Background()
@@ -33,11 +34,26 @@ func TestPGAlertsMatchMemory(t *testing.T) {
 				if err := pg.Commit(ctx, c); err != nil {
 					t.Fatalf("step %d: %v", step, err)
 				}
+				for n := rng.Intn(3); n > 0; n-- {
+					a := alertstest.Action(rng, alertstest.Base.Add(time.Duration(step)*time.Minute))
+					ma, err := mem.AddAction(ctx, a)
+					if err != nil {
+						t.Fatal(err)
+					}
+					pa, err := pg.AddAction(ctx, a)
+					if err != nil {
+						t.Fatalf("step %d: add action: %v", step, err)
+					}
+					if !reflect.DeepEqual(pa, ma) {
+						t.Fatalf("step %d: added\npostgres %+v\nmemory   %+v", step, pa, ma)
+					}
+				}
 				if step%10 != 9 {
 					continue
 				}
 				since := alertstest.Base.Add(time.Duration(step-rng.Intn(48*60)) * time.Minute)
 				compareAlerts(t, mem, pg, since)
+				compareActions(t, mem, pg, int64(rng.Intn(step+1)))
 				if step%50 == 49 {
 					before := alertstest.Base.Add(time.Duration(step-rng.Intn(24*60)) * time.Minute)
 					mn, _ := mem.Prune(ctx, before)
@@ -48,7 +64,55 @@ func TestPGAlertsMatchMemory(t *testing.T) {
 				}
 			}
 			compareAlerts(t, mem, pg, time.Time{})
+			compareActions(t, mem, pg, 0)
 		})
+	}
+}
+
+func compareActions(t *testing.T, mem, pg alerts.Store, after int64) {
+	t.Helper()
+	ctx := context.Background()
+	want, _ := mem.Actions(ctx, after)
+	got, err := pg.Actions(ctx, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("actions after %d:\npostgres %+v\nmemory   %+v", after, got, want)
+	}
+	wr, _ := mem.DigestRuns(ctx)
+	gr, err := pg.DigestRuns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gr, wr) {
+		t.Fatalf("digest runs:\npostgres %v\nmemory   %v", gr, wr)
+	}
+}
+
+// Actions go through the pool, whoever holds the alerts lock: the leader's
+// store adds them without the lock's connection, and a store without the
+// lock adds them while another session holds it.
+func TestPGAlertActionsAnyReplica(t *testing.T) {
+	ctx := context.Background()
+	s := openTest(t, Options{})
+	l, ok, err := s.TryLead(ctx, "alerts")
+	if err != nil || !ok {
+		t.Fatalf("lead: %v %v", ok, err)
+	}
+	defer l.Release(ctx)
+	if _, err := l.Alerts().AddAction(ctx, alerts.Action{Key: "a/b/c/d", Action: alerts.ActionAck, Actor: "x", Severity: "warning", At: alertstest.Base}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Alerts().AddAction(ctx, alerts.Action{Key: "a/b/c/d", Action: alerts.ActionUnack, Actor: "y", Severity: "warning"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Alerts().AddAction(ctx, alerts.Action{Key: "a/b/c/d", Action: "delete"}); err == nil {
+		t.Fatal("an unknown action was stored")
+	}
+	got, err := s.Alerts().Actions(ctx, 0)
+	if err != nil || len(got) != 2 || got[0].Actor != "x" || got[1].Actor != "y" || got[1].At.IsZero() || got[0].ID >= got[1].ID {
+		t.Fatalf("actions = %+v, %v", got, err)
 	}
 }
 
@@ -149,12 +213,21 @@ func TestPGMaintainPrunesResolvedAlerts(t *testing.T) {
 	if err := s.Alerts().Commit(ctx, alerts.Commit{Findings: fs}); err != nil {
 		t.Fatal(err)
 	}
+	// Actions are kept a day longer than resolved findings.
+	for _, at := range []time.Time{now.Add(-alerts.Retention - 25*time.Hour), now.Add(-alerts.Retention - 23*time.Hour)} {
+		if _, err := s.Alerts().AddAction(ctx, alerts.Action{Key: "open", Action: alerts.ActionAck, Actor: "a", Severity: "warning", At: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	res, err := s.MaintainReport(ctx)
-	if err != nil || res.AlertsPruned != 1 {
-		t.Fatalf("maintain = %+v, %v; want 1 alert pruned", res, err)
+	if err != nil || res.AlertsPruned != 2 {
+		t.Fatalf("maintain = %+v, %v; want 1 finding and 1 action pruned", res, err)
 	}
 	got, _ := s.Alerts().Load(ctx, time.Time{})
 	if len(got) != 2 || got[0].Key != "open" || got[1].Key != "recent" {
 		t.Fatalf("left %+v", got)
+	}
+	if acts, _ := s.Alerts().Actions(ctx, 0); len(acts) != 1 || acts[0].ID != 2 {
+		t.Fatalf("actions left %+v", acts)
 	}
 }

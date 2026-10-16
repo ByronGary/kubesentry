@@ -186,19 +186,63 @@ func newAppLabelFilter(add []string) labelFilter {
 }
 
 // filters are the configurable allowlists the transform and the conversions
-// apply: node labels, namespace annotations and workload (app tag) labels.
+// apply: node labels, namespace annotations, workload (app tag) labels, and
+// the owner annotation objects may carry.
 type filters struct {
 	nodeLabels    labelFilter
 	nsAnnotations labelFilter
 	appLabels     labelFilter
+	// owner is the owner annotation key (-owner-annotation); "" keeps none.
+	owner string
+	allow annotationAllow
+}
+
+// annotationAllow are the per-kind annotation allowlists, with the owner
+// annotation added where an object may name its own owner: workloads,
+// Services, Ingresses, cert-manager Certificates and RBAC objects. Pods and
+// everything else keep no owner annotation.
+type annotationAllow struct {
+	workload, deployment, daemonSet, service, ingress, rbac, certificate map[string]bool
 }
 
 func newFilters(nodeLabelKeysAdd, namespaceAnnotationKeysAdd, appLabelKeys []string) filters {
-	return filters{
+	f := filters{
 		nodeLabels:    newNodeLabelFilter(nodeLabelKeysAdd),
 		nsAnnotations: newNamespaceAnnotationFilter(namespaceAnnotationKeysAdd),
 		appLabels:     newAppLabelFilter(appLabelKeys),
 	}
+	return f.withOwner("")
+}
+
+// withOwner returns f keeping the owner annotation key on the kinds that
+// may name their own owner ("" keeps it nowhere).
+func (f filters) withOwner(key string) filters {
+	key = strings.TrimSpace(key)
+	plus := func(base map[string]bool) map[string]bool {
+		if key == "" {
+			return base
+		}
+		m := make(map[string]bool, len(base)+1)
+		for k := range base {
+			m[k] = true
+		}
+		m[key] = true
+		return m
+	}
+	f.owner = key
+	f.allow = annotationAllow{
+		workload: plus(nil), deployment: plus(revisionAnnotations), daemonSet: plus(daemonSetAnnotations),
+		service: plus(serviceAnnotations), ingress: plus(ingressAnnotations), rbac: plus(nil), certificate: plus(certAnnotations),
+	}
+	return f
+}
+
+// ownerOf reads the owner annotation key from ann, trimmed; "" without one.
+func ownerOf(ann map[string]string, key string) string {
+	if key == "" {
+		return ""
+	}
+	return strings.TrimSpace(ann[key])
 }
 
 func (f labelFilter) keep(k string) bool {
@@ -272,14 +316,14 @@ func transformObject(obj any, f filters) {
 		o.Spec = corev1.NamespaceSpec{}
 		o.Status.Conditions = nil
 	case *corev1.Service:
-		transformService(o)
+		transformService(o, f.allow.service)
 	case *discoveryv1.EndpointSlice:
 		transformEndpointSlice(o)
 	case *networkingv1.Ingress:
-		stripMeta(&o.ObjectMeta, ingressAnnotations)
+		stripMeta(&o.ObjectMeta, f.allow.ingress)
 		o.Status = networkingv1.IngressStatus{}
 	case *appsv1.Deployment:
-		stripWorkloadMeta(&o.ObjectMeta, revisionAnnotations, f.appLabels)
+		stripWorkloadMeta(&o.ObjectMeta, f.allow.deployment, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.DeploymentCondition) *string { return &c.Message })
 	case *appsv1.ReplicaSet:
@@ -287,22 +331,22 @@ func transformObject(obj any, f filters) {
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.ReplicaSetCondition) *string { return &c.Message })
 	case *appsv1.StatefulSet:
-		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
+		stripWorkloadMeta(&o.ObjectMeta, f.allow.workload, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		o.Spec.VolumeClaimTemplates = nil
 		trimMessages(o.Status.Conditions, func(c *appsv1.StatefulSetCondition) *string { return &c.Message })
 	case *appsv1.DaemonSet:
-		stripWorkloadMeta(&o.ObjectMeta, daemonSetAnnotations, f.appLabels)
+		stripWorkloadMeta(&o.ObjectMeta, f.allow.daemonSet, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		trimMessages(o.Status.Conditions, func(c *appsv1.DaemonSetCondition) *string { return &c.Message })
 	case *batchv1.Job:
-		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
+		stripWorkloadMeta(&o.ObjectMeta, f.allow.workload, f.appLabels)
 		trimTemplate(&o.Spec.Template)
 		o.Spec.PodFailurePolicy, o.Spec.SuccessPolicy = nil, nil
 		o.Status.UncountedTerminatedPods = nil
 		trimMessages(o.Status.Conditions, func(c *batchv1.JobCondition) *string { return &c.Message })
 	case *batchv1.CronJob:
-		stripWorkloadMeta(&o.ObjectMeta, nil, f.appLabels)
+		stripWorkloadMeta(&o.ObjectMeta, f.allow.workload, f.appLabels)
 		o.Spec.JobTemplate.ObjectMeta = metav1.ObjectMeta{}
 		trimTemplate(&o.Spec.JobTemplate.Spec.Template)
 		o.Spec.JobTemplate.Spec.PodFailurePolicy, o.Spec.JobTemplate.Spec.SuccessPolicy = nil, nil
@@ -311,23 +355,26 @@ func transformObject(obj any, f filters) {
 			*a = corev1.ObjectReference{Kind: a.Kind, Namespace: a.Namespace, Name: a.Name, UID: a.UID}
 		}
 	case *rbacv1.Role:
-		stripMeta(&o.ObjectMeta, nil)
+		stripMeta(&o.ObjectMeta, f.allow.rbac)
 	case *rbacv1.ClusterRole:
-		stripMeta(&o.ObjectMeta, nil)
+		stripMeta(&o.ObjectMeta, f.allow.rbac)
 		o.AggregationRule = nil // the rules are already aggregated
 	case *rbacv1.RoleBinding:
-		stripMeta(&o.ObjectMeta, nil)
+		stripMeta(&o.ObjectMeta, f.allow.rbac)
 	case *rbacv1.ClusterRoleBinding:
-		stripMeta(&o.ObjectMeta, nil)
+		stripMeta(&o.ObjectMeta, f.allow.rbac)
 	case *corev1.ServiceAccount:
 		transformServiceAccount(o)
 	case *corev1.ConfigMap:
 		transformConfigMap(o)
 	case *unstructured.Unstructured:
-		if isTargetGroupBinding(o) {
+		switch {
+		case isTargetGroupBinding(o):
 			transformTargetGroupBinding(o)
-		} else {
-			transformCertManager(o)
+		case o.GetKind() == "Certificate":
+			transformCertManager(o, f.allow.certificate)
+		default:
+			transformCertManager(o, certAnnotations)
 		}
 	}
 }
@@ -580,8 +627,8 @@ func transformPV(pv *corev1.PersistentVolume) {
 	pv.Status.Message = truncate(pv.Status.Message)
 }
 
-func transformService(s *corev1.Service) {
-	stripMeta(&s.ObjectMeta, serviceAnnotations)
+func transformService(s *corev1.Service, allow map[string]bool) {
+	stripMeta(&s.ObjectMeta, allow)
 	ing := s.Status.LoadBalancer.Ingress
 	s.Status = corev1.ServiceStatus{}
 	for _, in := range ing {
@@ -620,11 +667,11 @@ func transformConfigMap(c *corev1.ConfigMap) {
 }
 
 // transformCertManager strips cert-manager objects: the CSR and issued
-// certificate PEMs, ACME solver configs and every annotation except the
-// owning Certificate's name.
-func transformCertManager(u *unstructured.Unstructured) {
+// certificate PEMs, ACME solver configs and every annotation outside allow
+// (the owning Certificate's name, and on Certificates the owner annotation).
+func transformCertManager(u *unstructured.Unstructured, allow map[string]bool) {
 	unstructured.RemoveNestedField(u.Object, "metadata", "managedFields")
-	if a := filterKeys(u.GetAnnotations(), certAnnotations); a != nil {
+	if a := filterKeys(u.GetAnnotations(), allow); a != nil {
 		u.SetAnnotations(a)
 	} else {
 		unstructured.RemoveNestedField(u.Object, "metadata", "annotations")

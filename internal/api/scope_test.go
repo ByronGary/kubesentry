@@ -173,7 +173,7 @@ func tenantServer(t *testing.T) *Server {
 		Authenticator: auth.HeaderAuthenticator{UserHeader: "X-Forwarded-Email", GroupsHeader: "X-Forwarded-Groups",
 			TrustedProxies: []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}},
 		Authorizer: &auth.SARAuthorizer{Reviewer: tenantGrants(), Candidates: v.RBAC()},
-		Alerts:     &staticAlerts{board: tenantBoard()},
+		Alerts:     newStaticAlerts(tenantFindings()),
 	}
 }
 
@@ -260,7 +260,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 		"/api/v1/map", "/api/v1/map?namespace=team-a", "/api/v1/certificates", "/api/v1/pvcs/unused", "/api/v1/audit/events",
 		"/api/v1/nodes", "/api/v1/nodes?summary=true", "/api/v1/nodes/n1", "/api/v1/oom", "/api/v1/audit/summary",
 		"/api/v1/overview", "/api/v1/overview?namespace=team-a", "/api/v1/overview?owner=team-alpha",
-		"/api/v1/alerts", "/api/v1/alerts?state=open", "/api/v1/alerts?owner=team-alpha",
+		"/api/v1/alerts", "/api/v1/alerts?state=open", "/api/v1/alerts?owner=team-alpha", "/api/v1/alerts/actions",
 		"/api/v1/incidents", "/api/v1/incidents?state=open", "/api/v1/incidents?state=resolved", "/api/v1/incidents?owner=team-alpha",
 		"/api/v1/incidents?namespace=team-a", "/api/v1/incidents?type=oom-kill", "/api/v1/incidents?type=eviction",
 		"/api/v1/incidents?window=1h&severity=critical",

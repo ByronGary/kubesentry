@@ -41,6 +41,9 @@ type alertsConfig struct {
 	resend        time.Duration
 	resolveGrace  time.Duration
 	maxNew        int
+	ownerMaxNew   int
+	ownerWindow   time.Duration
+	maxSilence    time.Duration
 	defaultOwner  string
 	leakCritHours float64
 	runbookURL    string
@@ -59,10 +62,13 @@ func (a *alertsConfig) register(fs *flag.FlagSet, dur durFlag) {
 	dur(&a.resend, "alerts-resend", time.Minute, "open alerts are posted again this often, with endsAt 4x this ahead")
 	dur(&a.resolveGrace, "alerts-resolve-grace", 5*time.Minute, "a finding gone this long resolves (and Alertmanager gets endsAt=now)")
 	fs.IntVar(&a.maxNew, "alerts-max-new", 50, "more new alerts than this in one evaluation go out as one digest per owner (kubesentry_digest=\"true\")")
+	fs.IntVar(&a.ownerMaxNew, "alerts-owner-max-new", 20, "one owner gets at most this many new alerts on their own per -alerts-owner-window; more join that owner's digest")
+	dur(&a.ownerWindow, "alerts-owner-window", 15*time.Minute, "the sliding window of -alerts-owner-max-new")
+	dur(&a.maxSilence, "alerts-max-silence", alerts.DefaultMaxSilence, "the longest silence a user may set on a finding (at most 30d)")
 	fs.StringVar(&a.defaultOwner, "alerts-default-owner", "platform", "owner of findings whose namespace has no owner annotation, and of cluster-scoped findings")
 	fs.Float64Var(&a.leakCritHours, "alerts-leak-crit-hours", 0, "a memory leak alert is critical when the limit is closer than this many hours (0: -leak-crit-hours)")
 	fs.StringVar(&a.runbookURL, "alerts-runbook-url", alerts.DefaultRunbookURL, "each alert's runbook_url is this plus #<alert name in lower case>")
-	fs.StringVar(&a.externalURL, "external-url", "", "kubesentry's URL as users reach it (e.g. https://kubesentry.example.com); alerts link to their finding there (kubesentry_url), and with -incidents to their incident (incident_url)")
+	fs.StringVar(&a.externalURL, "external-url", "", "kubesentry's URL as users reach it (e.g. https://kubesentry.example.com); alerts link to their finding there (kubesentry_url), and with -incidents to their incident (incident_url); browsers may send write requests from its origin")
 }
 
 // endpoints parses -alertmanager-url.
@@ -99,6 +105,9 @@ func (a *alertsConfig) validate(c *config) error {
 	if err != nil {
 		return fmt.Errorf("-alertmanager-url: %w", err)
 	}
+	if _, err := externalOrigin(a.externalURL); err != nil {
+		return err
+	}
 	if !a.enabled {
 		if len(urls) > 0 {
 			return errors.New("-alertmanager-url needs -alerts")
@@ -125,21 +134,35 @@ func (a *alertsConfig) validate(c *config) error {
 		return errors.New("-alerts-resolve-grace must not be negative")
 	case a.maxNew < 1:
 		return errors.New("-alerts-max-new must be at least 1")
+	case a.ownerMaxNew < 1:
+		return errors.New("-alerts-owner-max-new must be at least 1")
+	case a.ownerWindow <= 0:
+		return errors.New("-alerts-owner-window must be positive")
+	case a.maxSilence < alerts.MinSilence || a.maxSilence > alerts.MaxSilenceCap:
+		return fmt.Errorf("-alerts-max-silence must be from %s to 30d", alerts.MinSilence)
 	case strings.TrimSpace(a.defaultOwner) == "":
 		return errors.New("-alerts-default-owner must not be empty")
 	case a.leakCritHours < 0:
 		return errors.New("-alerts-leak-crit-hours must not be negative")
 	}
-	if a.externalURL != "" {
-		u, err := url.Parse(a.externalURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("-external-url %q: want http(s)://host[:port][/path]", a.externalURL)
-		}
-	}
 	if u, err := url.Parse(a.runbookURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("-alerts-runbook-url %q: want an http(s) URL", a.runbookURL)
 	}
 	return nil
+}
+
+// externalOrigin checks -external-url and returns its origin
+// (scheme://host[:port]), which browsers may send write requests from; ""
+// when it is not set.
+func externalOrigin(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("-external-url %q: want http(s)://host[:port][/path]", raw)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // alertsSetup is what setupAlerts wires together.
@@ -163,6 +186,7 @@ func (s alertsSetup) start(ctx context.Context, srv *api.Server) (*alerts.Runner
 		Sink: sink, Kick: s.kick, Interval: a.interval,
 		Options: alerts.Options{
 			Resend: a.resend, ResolveGrace: a.resolveGrace, MaxNew: a.maxNew, DefaultOwner: strings.TrimSpace(a.defaultOwner),
+			OwnerMaxNew: a.ownerMaxNew, OwnerWindow: a.ownerWindow, MaxSilence: a.maxSilence,
 			LeakCritHours: a.leakCritHours, ExternalURL: a.externalURL, RunbookURL: a.runbookURL, Cluster: s.cfg.clusterName,
 		},
 		Input: func() (alerts.Input, bool) {
@@ -193,6 +217,9 @@ func (s alertsSetup) start(ctx context.Context, srv *api.Server) (*alerts.Runner
 		r.Store = alerts.NewMemoryStore()
 	}
 	observeLeader(false)
+	for _, reason := range []string{alerts.DigestMaxNew, alerts.DigestOwnerBudget} {
+		metrics.AlertsDigested.With(reason).Add(0)
+	}
 	go r.Run(ctx)
 	srv.Alerts = r
 	store := "memory (this replica alone; state is lost on restart)"
@@ -200,7 +227,8 @@ func (s alertsSetup) start(ctx context.Context, srv *api.Server) (*alerts.Runner
 		store = "postgres (the replica holding the alerts lock evaluates)"
 	}
 	slog.Info("alerting on", "sink", sink.Status().Name, "store", store, "interval", a.interval, "resend", a.resend,
-		"resolveGrace", a.resolveGrace, "maxNew", a.maxNew, "defaultOwner", a.defaultOwner, "externalURL", a.externalURL)
+		"resolveGrace", a.resolveGrace, "maxNew", a.maxNew, "ownerMaxNew", a.ownerMaxNew, "ownerWindow", a.ownerWindow,
+		"maxSilence", a.maxSilence, "defaultOwner", a.defaultOwner, "externalURL", a.externalURL)
 	return r, nil
 }
 
@@ -279,12 +307,16 @@ func (l pgLease) Store() alerts.Store { return l.Alerts() }
 
 var _ alerts.Lease = pgLease{}
 
-// observeEvaluation feeds kubesentry_alerts_evaluation_seconds and
-// kubesentry_findings{check,severity}.
+// observeEvaluation feeds kubesentry_alerts_evaluation_seconds,
+// kubesentry_findings{check,severity} and
+// kubesentry_alerts_digested_total{reason}.
 func observeEvaluation(res alerts.Result, took time.Duration, err error) {
 	metrics.AlertsEvaluation.Observe(took.Seconds())
 	if err != nil {
 		return
+	}
+	for reason, n := range res.Digested {
+		metrics.AlertsDigested.With(reason).Add(float64(n))
 	}
 	for _, check := range alerts.Checks() {
 		for _, sev := range []string{alerts.SeverityWarning, alerts.SeverityCritical} {

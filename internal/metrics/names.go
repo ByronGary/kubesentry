@@ -51,7 +51,8 @@ var (
 	AgentNodesReporting = NewGauge("kubesentry_agent_nodes_reporting", "Nodes whose process agent reported recently.")
 
 	// HTTPRejected counts /api/ requests turned away before a route is
-	// known. Label: reason ("rate_limit", "max_inflight", "unauthenticated").
+	// known. Label: reason ("rate_limit", "max_inflight", "unauthenticated",
+	// "cross_origin").
 	HTTPRejected = NewCounterVec("kubesentry_http_rejected_total", "API requests rejected before routing, by reason.", "reason")
 	// DependencyUp is 1 while a configured dependency works, from the logic
 	// behind /readyz. Label: dependency ("snapshot", "prometheus",
@@ -80,6 +81,15 @@ var (
 		[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
 	// AlertsLeader is 1 on the replica that evaluates and notifies.
 	AlertsLeader = NewGauge("kubesentry_alerts_leader", "1 on the replica that evaluates alerts and notifies.")
+	// AlertsDigested counts new findings storm protection put in their
+	// owner's digest instead of alerting on them alone. Label: reason
+	// ("max_new": more than -alerts-max-new at once; "owner_budget": the
+	// owner's -alerts-owner-max-new per -alerts-owner-window was spent).
+	AlertsDigested = NewCounterVec("kubesentry_alerts_digested_total", "New alert findings sent in a per-owner digest instead of alone, by reason.", "reason")
+	// AlertActions counts acknowledgements and silences, per finding.
+	// Labels: action ("ack", "unack", "silence", "unsilence"), result ("ok",
+	// "forbidden", "not_found", "invalid", "resolved").
+	AlertActions = NewCounterVec("kubesentry_alert_actions_total", "Actions taken on alert findings by action and result.", "action", "result")
 
 	// Incidents counts open incidents on the replica that runs the
 	// incidents engine; the others report 0. Label: severity ("warning",

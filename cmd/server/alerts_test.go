@@ -29,8 +29,12 @@ func TestAlertsFlags(t *testing.T) {
 	}
 	a := c.alerts
 	if a.enabled || a.urls != "" || a.interval != 30*time.Second || a.resend != time.Minute || a.resolveGrace != 5*time.Minute ||
-		a.maxNew != 50 || a.defaultOwner != "platform" || a.leakCritHours != 0 || a.externalURL != "" || a.runbookURL != alerts.DefaultRunbookURL {
+		a.maxNew != 50 || a.defaultOwner != "platform" || a.leakCritHours != 0 || a.externalURL != "" || a.runbookURL != alerts.DefaultRunbookURL ||
+		a.ownerMaxNew != 20 || a.ownerWindow != 15*time.Minute || a.maxSilence != 7*24*time.Hour {
 		t.Errorf("defaults = %+v", a)
+	}
+	if o, _ := c.trustedOrigins(); len(o) != 0 {
+		t.Errorf("trusted origins by default: %v", o)
 	}
 	bad := [][]string{
 		{"-alertmanager-url=http://am:9093"}, // without -alerts
@@ -46,7 +50,15 @@ func TestAlertsFlags(t *testing.T) {
 		{"-alerts", "-alerts-leak-crit-hours=-1"},
 		{"-alerts", "-external-url=kubesentry.example.com"},
 		{"-alerts", "-external-url=https://ks.example.com/#/x"},
+		{"-external-url=ks.example.com"}, // checked without -alerts too: it is a trusted origin
 		{"-alerts", "-alerts-runbook-url=docs/alerts.md"},
+		{"-alerts", "-alerts-owner-max-new=0"},
+		{"-alerts", "-alerts-owner-window=0s"},
+		{"-alerts", "-alerts-max-silence=1m"},
+		{"-alerts", "-alerts-max-silence=31d"},
+		{"-allowed-origins=portal.example.com"},
+		{"-allowed-origins=https://portal.example.com/path"},
+		{"-allowed-origins=ftp://portal.example.com"},
 	}
 	for _, args := range bad {
 		if _, err := parseFlags(args, io.Discard); err == nil {
@@ -61,11 +73,19 @@ func TestAlertsFlags(t *testing.T) {
 		{"-alerts", "-alertmanager-url=https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/alertmanager"},
 		{"-alerts", "-alertmanager-url=http://am:9093,https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-1/alertmanager", "-alertmanager-sigv4"},
 		{"-alerts", "-alerts-interval=1m", "-alerts-resend=1m", "-alerts-resolve-grace=0s", "-alerts-max-new=1", "-alerts-leak-crit-hours=12"},
+		{"-alerts", "-alerts-owner-max-new=5", "-alerts-owner-window=1h", "-alerts-max-silence=30d"},
 	}
 	for _, args := range good {
 		if _, err := parseFlags(args, io.Discard); err != nil {
 			t.Errorf("%v: %v", args, err)
 		}
+	}
+	c, err = parseFlags([]string{"-external-url=https://ks.example.com/kubesentry/", "-allowed-origins=https://portal.example.com, http://localhost:5173"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := c.trustedOrigins(); strings.Join(o, " ") != "https://ks.example.com https://portal.example.com http://localhost:5173" {
+		t.Errorf("trusted origins = %v", o)
 	}
 }
 

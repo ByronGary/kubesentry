@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -49,6 +51,7 @@ type config struct {
 	authTrustedProxyCIDRs            string
 	authAllowAnyProxy                bool
 	allowedHosts                     string
+	allowedOrigins                   string
 	signOutURL                       string
 	authzQPS                         float64
 	authzCacheTTL, authzDenyTTL      time.Duration
@@ -123,6 +126,7 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 	// Listeners.
 	fs.StringVar(&c.addr, "addr", "127.0.0.1:8080", "UI and API listen address (use :8080 to listen on all interfaces), or unix:///path for a Unix socket shared with the SSO proxy sidecar (proxy mode)")
 	fs.StringVar(&c.allowedHosts, "allowed-hosts", "", "Host header patterns the web listener answers, comma-separated host[:port], *.domain or *; others get 403. Default: localhost,127.0.0.1,[::1] when every local caller is trusted (-auth-mode=none, or token mode without -api-token), else any")
+	fs.StringVar(&c.allowedOrigins, "allowed-origins", "", "origins (scheme://host[:port], comma-separated) besides the page's own and -external-url's from which browsers may send /api/ requests that change state (POST); others get 403")
 	fs.StringVar(&c.ingestAddr, "ingest-addr", "", "listen address for POST /agent/report and POST /audit/webhook; empty serves them on -addr")
 	fs.StringVar(&c.opsAddr, "ops-addr", "", "listen address for /healthz, /readyz, /metrics (and /debug/pprof/ with -pprof); empty serves the probes on -addr and no metrics")
 	fs.BoolVar(&c.pprof, "pprof", false, "serve /debug/pprof/ on -ops-addr")
@@ -270,6 +274,9 @@ func (c *config) validate() error {
 	if _, err := api.ParseAllowedHosts(c.allowedHosts); err != nil {
 		return fmt.Errorf("-allowed-hosts: %w", err)
 	}
+	if _, err := c.trustedOrigins(); err != nil {
+		return err
+	}
 	if c.authMode == "proxy" {
 		if _, err := c.trustedProxies(); err != nil {
 			return err
@@ -387,6 +394,32 @@ func (c *config) trustedProxies() ([]netip.Prefix, error) {
 		}
 	}
 	return cidrs, nil
+}
+
+// trustedOrigins are the origins besides a request's own from which
+// browsers may send /api/ requests that change state: -external-url's
+// origin and -allowed-origins (each scheme://host[:port]).
+func (c *config) trustedOrigins() ([]string, error) {
+	var out []string
+	ext, err := externalOrigin(c.alerts.externalURL)
+	if err != nil {
+		return nil, err
+	}
+	if ext != "" {
+		out = append(out, ext)
+	}
+	check := http.NewCrossOriginProtection()
+	for _, o := range strings.Split(c.allowedOrigins, ",") {
+		if o = strings.TrimSpace(o); o == "" {
+			continue
+		}
+		u, err := url.Parse(o)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || check.AddTrustedOrigin(o) != nil {
+			return nil, fmt.Errorf("-allowed-origins %q: want scheme://host[:port], e.g. https://portal.example.com", o)
+		}
+		out = append(out, o)
+	}
+	return out, nil
 }
 
 // webAllowedHosts is the Host allowlist for the web listener: -allowed-hosts,

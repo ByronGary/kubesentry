@@ -47,6 +47,60 @@ func TestMemoryStoreLifecycle(t *testing.T) {
 	}
 }
 
+// The actions log: IDs in order, times as Postgres keeps them, reads after
+// an ID, pruning a day past the findings' cutoff; digest runs by name.
+func TestMemoryStoreActionsAndDigestRuns(t *testing.T) {
+	ctx := context.Background()
+	s := alerts.NewMemoryStore()
+	at := alertstest.Base.Add(123 * time.Nanosecond)
+	until := at.Add(time.Hour)
+	first, err := s.AddAction(ctx, alerts.Action{Key: "k1", FirstSeen: at, Action: alerts.ActionSilence, Actor: "bob", Reason: "r", Until: &until, Severity: "warning", At: at})
+	if err != nil || first.ID != 1 || !first.At.Equal(alertstest.Base) || !first.Until.Equal(alertstest.Base.Add(time.Hour)) || !first.FirstSeen.Equal(alertstest.Base) {
+		t.Fatalf("first = %+v, %v", first, err)
+	}
+	if _, err := s.AddAction(ctx, alerts.Action{Key: "k1", Action: "delete"}); err == nil {
+		t.Fatal("an unknown action was stored")
+	}
+	second, _ := s.AddAction(ctx, alerts.Action{Key: "k2", Action: alerts.ActionAck, Actor: "alice", Severity: "critical"})
+	if second.ID != 2 || second.At.IsZero() {
+		t.Fatalf("second = %+v", second)
+	}
+	if got, _ := s.Actions(ctx, 1); len(got) != 1 || got[0].Key != "k2" {
+		t.Fatalf("after 1 = %+v", got)
+	}
+	got, _ := s.Actions(ctx, 0)
+	*got[0].Until = time.Time{} // a copy: the store keeps its own
+	if again, _ := s.Actions(ctx, 0); len(again) != 2 || !again[0].Until.Equal(alertstest.Base.Add(time.Hour)) {
+		t.Fatalf("all = %+v", again)
+	}
+	// Prune(before) deletes actions taken a day before before.
+	if n, _ := s.Prune(ctx, alertstest.Base.Add(24*time.Hour)); n != 0 {
+		t.Fatalf("pruned %d within the day", n)
+	}
+	if n, _ := s.Prune(ctx, second.At.Add(25*time.Hour)); n != 2 {
+		t.Fatalf("pruned %d, want 2", n)
+	}
+	if got, _ := s.Actions(ctx, 0); len(got) != 0 {
+		t.Fatalf("left %+v", got)
+	}
+	if third, _ := s.AddAction(ctx, alerts.Action{Key: "k3", Action: alerts.ActionAck}); third.ID != 3 {
+		t.Fatalf("IDs are reused: %+v", third)
+	}
+
+	if runs, _ := s.DigestRuns(ctx); len(runs) != 0 {
+		t.Fatalf("runs = %v", runs)
+	}
+	if err := s.Commit(ctx, alerts.Commit{DigestRuns: map[string]time.Time{"certificates": at}}); err != nil {
+		t.Fatal(err)
+	}
+	if runs, _ := s.DigestRuns(ctx); !runs["certificates"].Equal(alertstest.Base) || len(runs) != 1 {
+		t.Fatalf("runs = %v", runs)
+	}
+	if (alerts.Commit{DigestRuns: map[string]time.Time{"x": at}}).Empty() {
+		t.Error("a commit with digest runs is not empty")
+	}
+}
+
 // The random operations the Postgres parity test uses run cleanly on the
 // memory store, and two memory stores agree (the generator is deterministic).
 func TestMemoryStoreRandomOps(t *testing.T) {

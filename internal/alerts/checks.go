@@ -28,6 +28,9 @@ type Candidate struct {
 	Node  string
 	Link  string            // the UI hash route that explains it
 	Extra map[string]string // further annotations (pods, reasons, predicted_oom, ...)
+	// Quiet: report it only in a standing digest, never on its own (a
+	// certificate far from expiry).
+	Quiet bool
 }
 
 // Key is the candidate's dedupe key.
@@ -45,6 +48,9 @@ type checkInfo struct {
 	// pending is how long a candidate must be seen before it fires (as
 	// Prometheus's for:), so a problem that clears by itself stays quiet.
 	pending time.Duration
+	// gate decides who may see its findings besides the namespace (Gate);
+	// "" is GateOf's default.
+	gate Gate
 }
 
 // Pending durations.
@@ -60,10 +66,10 @@ var checkInfos = map[string]checkInfo{
 	CheckWorkloadUnhealthy:   {alert: AlertWorkloadUnhealthy, pending: workloadPending},
 	CheckPodEvicted:          {alert: AlertPodEvicted},
 	CheckPodStuckTerminating: {alert: AlertPodStuckTerminating},
-	CheckClusterAdmin:        {alert: AlertRBACDrift, object: true, changeBased: true},
-	CheckAnonymousBinding:    {alert: AlertRBACDrift, object: true, changeBased: true},
-	CheckWildcardRBAC:        {alert: AlertRBACDrift, object: true, changeBased: true},
-	CheckAWSAuthMasters:      {alert: AlertRBACDrift, object: true, changeBased: true},
+	CheckClusterAdmin:        {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
+	CheckAnonymousBinding:    {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
+	CheckWildcardRBAC:        {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
+	CheckAWSAuthMasters:      {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
 }
 
 // Checks lists every check, sorted.

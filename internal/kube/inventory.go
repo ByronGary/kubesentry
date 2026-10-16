@@ -37,58 +37,58 @@ func paginate(what string, list func(opts metav1.ListOptions) (string, error)) e
 }
 
 func (s *Source) listDeployments(ctx context.Context) ([]model.Workload, error) {
-	apps := s.appLabels()
+	apps, owner := s.appLabels(), s.ownerKey()
 	return collect("deployments", func(o metav1.ListOptions) ([]appsv1.Deployment, string, error) {
 		l, err := s.cs.AppsV1().Deployments(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps) })
+	}, func(o *appsv1.Deployment) model.Workload { return convertDeployment(o, apps, owner) })
 }
 
 func (s *Source) listStatefulSets(ctx context.Context) ([]model.Workload, error) {
-	apps := s.appLabels()
+	apps, owner := s.appLabels(), s.ownerKey()
 	return collect("statefulsets", func(o metav1.ListOptions) ([]appsv1.StatefulSet, string, error) {
 		l, err := s.cs.AppsV1().StatefulSets(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps) })
+	}, func(o *appsv1.StatefulSet) model.Workload { return convertStatefulSet(o, apps, owner) })
 }
 
 func (s *Source) listDaemonSets(ctx context.Context) ([]model.Workload, error) {
-	apps := s.appLabels()
+	apps, owner := s.appLabels(), s.ownerKey()
 	return collect("daemonsets", func(o metav1.ListOptions) ([]appsv1.DaemonSet, string, error) {
 		l, err := s.cs.AppsV1().DaemonSets(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps) })
+	}, func(o *appsv1.DaemonSet) model.Workload { return convertDaemonSet(o, apps, owner) })
 }
 
 func (s *Source) listJobs(ctx context.Context) ([]model.Workload, error) {
-	apps := s.appLabels()
+	apps, owner := s.appLabels(), s.ownerKey()
 	return collect("jobs", func(o metav1.ListOptions) ([]batchv1.Job, string, error) {
 		l, err := s.cs.BatchV1().Jobs(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, func(o *batchv1.Job) model.Workload { return convertJob(o, apps) })
+	}, func(o *batchv1.Job) model.Workload { return convertJob(o, apps, owner) })
 }
 
 func (s *Source) listCronJobs(ctx context.Context) ([]model.Workload, error) {
-	apps := s.appLabels()
+	apps, owner := s.appLabels(), s.ownerKey()
 	return collect("cronjobs", func(o metav1.ListOptions) ([]batchv1.CronJob, string, error) {
 		l, err := s.cs.BatchV1().CronJobs(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps) })
+	}, func(o *batchv1.CronJob) model.Workload { return convertCronJob(o, apps, owner) })
 }
 
 // ListWorkloads lists Deployments, StatefulSets, DaemonSets, Jobs and CronJobs.
@@ -129,11 +129,12 @@ func (s *Source) ListEndpointSlices(ctx context.Context) ([]model.EndpointSlice,
 }
 
 // baseWorkload reads what every workload kind has; apps picks the labels
-// kept (the app tags).
-func baseWorkload(kind string, m metav1.ObjectMeta, sel *metav1.LabelSelector, tpl *corev1.PodTemplateSpec, apps labelFilter) model.Workload {
+// kept (the app tags), owner is the owner annotation key ("" reads none).
+func baseWorkload(kind string, m metav1.ObjectMeta, sel *metav1.LabelSelector, tpl *corev1.PodTemplateSpec, apps labelFilter, owner string) model.Workload {
 	w := model.Workload{
 		Kind: kind, Namespace: m.Namespace, Name: m.Name, UID: string(m.UID), Owners: convertOwners(m.OwnerReferences),
 		Created: m.CreationTimestamp.Time, Selector: convertSelector(sel), Labels: apps.filter(m.Labels),
+		Owner: ownerOf(m.Annotations, owner),
 	}
 	if tpl != nil {
 		w.Images = templateImages(tpl.Spec)
@@ -176,8 +177,8 @@ func replicas(p *int32) int32 {
 	return *p
 }
 
-func convertDeployment(d *appsv1.Deployment, apps labelFilter) model.Workload {
-	w := baseWorkload("Deployment", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps)
+func convertDeployment(d *appsv1.Deployment, apps labelFilter, owner string) model.Workload {
+	w := baseWorkload("Deployment", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps, owner)
 	w.Revision = d.Annotations[revisionAnnotation]
 	w.Desired = replicas(d.Spec.Replicas)
 	w.Ready, w.Updated, w.Available = d.Status.ReadyReplicas, d.Status.UpdatedReplicas, d.Status.AvailableReplicas
@@ -188,8 +189,8 @@ func convertDeployment(d *appsv1.Deployment, apps labelFilter) model.Workload {
 	return w
 }
 
-func convertStatefulSet(s *appsv1.StatefulSet, apps labelFilter) model.Workload {
-	w := baseWorkload("StatefulSet", s.ObjectMeta, s.Spec.Selector, &s.Spec.Template, apps)
+func convertStatefulSet(s *appsv1.StatefulSet, apps labelFilter, owner string) model.Workload {
+	w := baseWorkload("StatefulSet", s.ObjectMeta, s.Spec.Selector, &s.Spec.Template, apps, owner)
 	w.Revision = s.Status.UpdateRevision
 	w.Desired = replicas(s.Spec.Replicas)
 	w.Ready, w.Updated, w.Available = s.Status.ReadyReplicas, s.Status.UpdatedReplicas, s.Status.AvailableReplicas
@@ -202,8 +203,8 @@ func convertStatefulSet(s *appsv1.StatefulSet, apps labelFilter) model.Workload 
 // convertDaemonSet takes Revision from the template generation annotation:
 // DaemonSetStatus has no updateRevision, and the generation the API server
 // keeps there changes exactly when the pod template does.
-func convertDaemonSet(d *appsv1.DaemonSet, apps labelFilter) model.Workload {
-	w := baseWorkload("DaemonSet", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps)
+func convertDaemonSet(d *appsv1.DaemonSet, apps labelFilter, owner string) model.Workload {
+	w := baseWorkload("DaemonSet", d.ObjectMeta, d.Spec.Selector, &d.Spec.Template, apps, owner)
 	w.Revision = d.Annotations[daemonSetGenerationAnnotation]
 	w.Desired, w.Ready = d.Status.DesiredNumberScheduled, d.Status.NumberReady
 	w.Updated, w.Available = d.Status.UpdatedNumberScheduled, d.Status.NumberAvailable
@@ -213,8 +214,8 @@ func convertDaemonSet(d *appsv1.DaemonSet, apps labelFilter) model.Workload {
 	return w
 }
 
-func convertJob(j *batchv1.Job, apps labelFilter) model.Workload {
-	w := baseWorkload("Job", j.ObjectMeta, j.Spec.Selector, &j.Spec.Template, apps)
+func convertJob(j *batchv1.Job, apps labelFilter, owner string) model.Workload {
+	w := baseWorkload("Job", j.ObjectMeta, j.Spec.Selector, &j.Spec.Template, apps, owner)
 	w.Desired = replicas(j.Spec.Completions)
 	w.Succeeded, w.Failed, w.Active = j.Status.Succeeded, j.Status.Failed, j.Status.Active
 	if j.Status.Ready != nil {
@@ -226,8 +227,8 @@ func convertJob(j *batchv1.Job, apps labelFilter) model.Workload {
 	return w
 }
 
-func convertCronJob(c *batchv1.CronJob, apps labelFilter) model.Workload {
-	w := baseWorkload("CronJob", c.ObjectMeta, nil, &c.Spec.JobTemplate.Spec.Template, apps)
+func convertCronJob(c *batchv1.CronJob, apps labelFilter, owner string) model.Workload {
+	w := baseWorkload("CronJob", c.ObjectMeta, nil, &c.Spec.JobTemplate.Spec.Template, apps, owner)
 	w.Schedule = c.Spec.Schedule
 	w.Suspended = c.Spec.Suspend != nil && *c.Spec.Suspend
 	w.Active = int32(len(c.Status.Active))
@@ -279,21 +280,23 @@ func convertEndpointSlice(e *discoveryv1.EndpointSlice) model.EndpointSlice {
 }
 
 func (s *Source) ListServices(ctx context.Context) ([]model.Service, error) {
+	owner := s.ownerKey()
 	return collect("services", func(o metav1.ListOptions) ([]corev1.Service, string, error) {
 		l, err := s.cs.CoreV1().Services(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertService)
+	}, func(o *corev1.Service) model.Service { return convertService(o, owner) })
 }
 
-func convertService(s *corev1.Service) model.Service {
+// convertService reads a Service; owner is the owner annotation key.
+func convertService(s *corev1.Service, owner string) model.Service {
 	out := model.Service{
 		Namespace: s.Namespace, Name: s.Name, Type: string(s.Spec.Type), ClusterIP: s.Spec.ClusterIP,
 		Selector: s.Spec.Selector, ExternalIPs: s.Spec.ExternalIPs, Created: s.CreationTimestamp.Time,
 		SourceRanges: s.Spec.LoadBalancerSourceRanges, PublishNotReady: s.Spec.PublishNotReadyAddresses,
-		Annotations: filterKeys(s.Annotations, serviceAnnotations),
+		Annotations: filterKeys(s.Annotations, serviceAnnotations), Owner: ownerOf(s.Annotations, owner),
 	}
 	if c := s.Spec.LoadBalancerClass; c != nil {
 		out.LoadBalancerClass = *c
@@ -314,19 +317,21 @@ func convertService(s *corev1.Service) model.Service {
 }
 
 func (s *Source) ListIngresses(ctx context.Context) ([]model.Ingress, error) {
+	owner := s.ownerKey()
 	return collect("ingresses", func(o metav1.ListOptions) ([]networkingv1.Ingress, string, error) {
 		l, err := s.cs.NetworkingV1().Ingresses(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertIngress)
+	}, func(o *networkingv1.Ingress) model.Ingress { return convertIngress(o, owner) })
 }
 
-func convertIngress(in *networkingv1.Ingress) model.Ingress {
+// convertIngress reads an Ingress; owner is the owner annotation key.
+func convertIngress(in *networkingv1.Ingress, owner string) model.Ingress {
 	out := model.Ingress{
 		Namespace: in.Namespace, Name: in.Name, Created: in.CreationTimestamp.Time,
-		Annotations: filterKeys(in.Annotations, ingressAnnotations),
+		Annotations: filterKeys(in.Annotations, ingressAnnotations), Owner: ownerOf(in.Annotations, owner),
 	}
 	if in.Spec.IngressClassName != nil {
 		out.Class = *in.Spec.IngressClassName
@@ -526,43 +531,47 @@ func convertNamespace(n *corev1.Namespace, ann labelFilter) model.Namespace {
 }
 
 func (s *Source) listRoles(ctx context.Context) ([]model.Role, error) {
+	owner := s.ownerKey()
 	return collect("roles", func(o metav1.ListOptions) ([]rbacv1.Role, string, error) {
 		l, err := s.cs.RbacV1().Roles(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertRole)
+	}, func(o *rbacv1.Role) model.Role { return convertRole(o, owner) })
 }
 
 func (s *Source) listClusterRoles(ctx context.Context) ([]model.Role, error) {
+	owner := s.ownerKey()
 	return collect("clusterroles", func(o metav1.ListOptions) ([]rbacv1.ClusterRole, string, error) {
 		l, err := s.cs.RbacV1().ClusterRoles().List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertClusterRole)
+	}, func(o *rbacv1.ClusterRole) model.Role { return convertClusterRole(o, owner) })
 }
 
 func (s *Source) listRoleBindings(ctx context.Context) ([]model.RoleBinding, error) {
+	owner := s.ownerKey()
 	return collect("rolebindings", func(o metav1.ListOptions) ([]rbacv1.RoleBinding, string, error) {
 		l, err := s.cs.RbacV1().RoleBindings(metav1.NamespaceAll).List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertRoleBinding)
+	}, func(o *rbacv1.RoleBinding) model.RoleBinding { return convertRoleBinding(o, owner) })
 }
 
 func (s *Source) listClusterRoleBindings(ctx context.Context) ([]model.RoleBinding, error) {
+	owner := s.ownerKey()
 	return collect("clusterrolebindings", func(o metav1.ListOptions) ([]rbacv1.ClusterRoleBinding, string, error) {
 		l, err := s.cs.RbacV1().ClusterRoleBindings().List(ctx, o)
 		if err != nil {
 			return nil, "", err
 		}
 		return l.Items, l.Continue, nil
-	}, convertClusterRoleBinding)
+	}, func(o *rbacv1.ClusterRoleBinding) model.RoleBinding { return convertClusterRoleBinding(o, owner) })
 }
 
 // ListRBAC lists Roles, ClusterRoles, RoleBindings and ClusterRoleBindings.
@@ -585,25 +594,29 @@ func (s *Source) ListRBAC(ctx context.Context) (model.RBAC, error) {
 	return out, nil
 }
 
-func convertRole(x *rbacv1.Role) model.Role {
-	return model.Role{Kind: "Role", Namespace: x.Namespace, Name: x.Name, Rules: convertRules(x.Rules)}
+// The RBAC conversions take the owner annotation key as owner.
+
+func convertRole(x *rbacv1.Role, owner string) model.Role {
+	return model.Role{Kind: "Role", Namespace: x.Namespace, Name: x.Name, Rules: convertRules(x.Rules), Owner: ownerOf(x.Annotations, owner)}
 }
 
-func convertClusterRole(x *rbacv1.ClusterRole) model.Role {
-	return model.Role{Kind: "ClusterRole", Name: x.Name, Rules: convertRules(x.Rules)}
+func convertClusterRole(x *rbacv1.ClusterRole, owner string) model.Role {
+	return model.Role{Kind: "ClusterRole", Name: x.Name, Rules: convertRules(x.Rules), Owner: ownerOf(x.Annotations, owner)}
 }
 
-func convertRoleBinding(x *rbacv1.RoleBinding) model.RoleBinding {
+func convertRoleBinding(x *rbacv1.RoleBinding, owner string) model.RoleBinding {
 	return model.RoleBinding{
 		Kind: "RoleBinding", Namespace: x.Namespace, Name: x.Name,
 		RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
+		Owner: ownerOf(x.Annotations, owner),
 	}
 }
 
-func convertClusterRoleBinding(x *rbacv1.ClusterRoleBinding) model.RoleBinding {
+func convertClusterRoleBinding(x *rbacv1.ClusterRoleBinding, owner string) model.RoleBinding {
 	return model.RoleBinding{
 		Kind: "ClusterRoleBinding", Name: x.Name,
 		RoleKind: x.RoleRef.Kind, RoleName: x.RoleRef.Name, Subjects: convertSubjects(x.Subjects),
+		Owner: ownerOf(x.Annotations, owner),
 	}
 }
 

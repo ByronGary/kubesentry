@@ -63,6 +63,10 @@ type Workload struct {
 	Suspended        bool
 	LastScheduleTime time.Time
 	LastSuccessTime  time.Time
+	// Owner is the team the workload names as its owner (the owner
+	// annotation, -owner-annotation, trimmed); "" when it names none and its
+	// namespace's owner applies.
+	Owner string
 }
 
 // Service is a core/v1 Service.
@@ -82,6 +86,7 @@ type Service struct {
 	// and type); see internal/kube for the allowlist.
 	Annotations map[string]string
 	Created     time.Time
+	Owner       string // the owner annotation, as on Workload
 }
 
 // ServicePort is one port of a Service.
@@ -105,6 +110,7 @@ type Ingress struct {
 	// ARN, listen ports); see internal/kube for the allowlist.
 	Annotations map[string]string
 	Created     time.Time
+	Owner       string // the owner annotation, as on Workload
 }
 
 // IngressRule is one host/path routed to a service.
@@ -198,6 +204,7 @@ type Role struct {
 	Namespace string // "" for ClusterRole
 	Name      string
 	Rules     []PolicyRule
+	Owner     string // the owner annotation, as on Workload
 }
 
 // PolicyRule is one rule of a Role or ClusterRole.
@@ -217,6 +224,7 @@ type RoleBinding struct {
 	RoleKind  string // "Role" or "ClusterRole"
 	RoleName  string
 	Subjects  []Subject
+	Owner     string // the owner annotation, as on Workload
 }
 
 // Subject is who a binding grants a role to.
@@ -252,6 +260,7 @@ type Certificate struct {
 	Duration    time.Duration // spec.duration; 0 means cert-manager's default (90 days)
 	RenewBefore time.Duration // spec.renewBefore; 0 means the default (a third of the duration)
 	Created     time.Time
+	Owner       string // the owner annotation, as on Workload
 }
 
 // Issuer is a cert-manager Issuer or ClusterIssuer.

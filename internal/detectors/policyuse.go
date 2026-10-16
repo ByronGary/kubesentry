@@ -80,6 +80,57 @@ func (p Policy) OwnerOf(ns model.Namespace) string {
 	return strings.TrimSpace(ns.Annotations[key])
 }
 
+// ObjectOwner is the team that owns an object: the owner it names itself
+// (object: its owner annotation, which internal/kube keeps in the model's
+// Owner field), else its namespace's (OwnerOf; ns is nil for a cluster-scoped
+// object), else "" (the caller's default applies).
+func (p Policy) ObjectOwner(object string, ns *model.Namespace) string {
+	if o := strings.TrimSpace(object); o != "" {
+		return o
+	}
+	if ns == nil {
+		return ""
+	}
+	return p.OwnerOf(*ns)
+}
+
+// ObjectRef names one object: its kind (Deployment, Certificate,
+// ClusterRoleBinding, ...), namespace ("" when cluster-scoped) and name.
+type ObjectRef struct{ Kind, Namespace, Name string }
+
+// ObjectOwners maps every object in inv that names its own owner (the
+// owner annotation on Deployments, StatefulSets, DaemonSets, Jobs,
+// CronJobs, Services, Ingresses, cert-manager Certificates, Roles,
+// RoleBindings, ClusterRoles and ClusterRoleBindings) to that owner. Pods
+// carry no annotations: a pod's owner is its workload's or namespace's.
+func ObjectOwners(inv *model.Inventory) map[ObjectRef]string {
+	out := map[ObjectRef]string{}
+	add := func(kind, ns, name, owner string) {
+		if o := strings.TrimSpace(owner); o != "" {
+			out[ObjectRef{kind, ns, name}] = o
+		}
+	}
+	for _, w := range inv.Workloads {
+		add(w.Kind, w.Namespace, w.Name, w.Owner)
+	}
+	for _, s := range inv.Services {
+		add("Service", s.Namespace, s.Name, s.Owner)
+	}
+	for _, in := range inv.Ingresses {
+		add("Ingress", in.Namespace, in.Name, in.Owner)
+	}
+	for _, c := range inv.Certs.Certificates {
+		add("Certificate", c.Namespace, c.Name, c.Owner)
+	}
+	for _, r := range inv.RBAC.Roles {
+		add(r.Kind, r.Namespace, r.Name, r.Owner)
+	}
+	for _, b := range inv.RBAC.Bindings {
+		add(b.Kind, b.Namespace, b.Name, b.Owner)
+	}
+	return out
+}
+
 // IsProduction reports whether ns carries the ProductionLabel.
 func (p Policy) IsProduction(ns model.Namespace) bool {
 	m := p.ProductionLabel

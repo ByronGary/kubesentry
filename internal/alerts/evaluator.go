@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ByronGary/kubesentry/internal/detectors"
+	"github.com/ByronGary/kubesentry/internal/snapshot"
 	"github.com/ByronGary/kubesentry/internal/uilink"
 )
 
@@ -32,8 +34,19 @@ type Options struct {
 	// single view from flapping. Default 5m.
 	ResolveGrace time.Duration
 	// MaxNew: when more new alerts than this would fire in one evaluation,
-	// they go out as one digest alert per owner instead. Default 50.
+	// they go out as one digest alert per owner instead. Default 50. It also
+	// bounds how many digested findings that turned critical leave their
+	// digest in one evaluation.
 	MaxNew int
+	// OwnerMaxNew and OwnerWindow: one owner gets at most OwnerMaxNew new
+	// alerts on their own in any OwnerWindow (a sliding window, in the
+	// leader's memory); further new findings join that owner's digest.
+	// Defaults 20 and 15m.
+	OwnerMaxNew int
+	OwnerWindow time.Duration
+	// MaxSilence is the longest silence Runner.Act sets. Default
+	// DefaultMaxSilence; never more than MaxSilenceCap.
+	MaxSilence time.Duration
 	// DefaultOwner owns findings whose namespace names no owner, and
 	// cluster-scoped ones. Default "platform".
 	DefaultOwner string
@@ -66,6 +79,23 @@ type Options struct {
 // would retire the alert in Alertmanager.
 const AnnotationIncidentURL = "incident_url"
 
+// Annotations an acknowledged or silenced finding's alerts carry (added when
+// sent, never stored with the finding).
+const (
+	AnnotationAckBy         = "acknowledged_by"
+	AnnotationAckAt         = "acknowledged_at"
+	AnnotationSilencedBy    = "silenced_by"
+	AnnotationSilencedUntil = "silenced_until"
+	AnnotationSilenceReason = "silence_reason"
+)
+
+// Why storm protection put a finding in its owner's digest
+// (Result.Digested, kubesentry_alerts_digested_total{reason}).
+const (
+	DigestMaxNew      = "max_new"      // more than MaxNew new alerts at once
+	DigestOwnerBudget = "owner_budget" // the owner's OwnerMaxNew per OwnerWindow is spent
+)
+
 func (o *Options) defaults() {
 	if o.Resend <= 0 {
 		o.Resend = time.Minute
@@ -78,6 +108,16 @@ func (o *Options) defaults() {
 	if o.MaxNew <= 0 {
 		o.MaxNew = 50
 	}
+	if o.OwnerMaxNew <= 0 {
+		o.OwnerMaxNew = 20
+	}
+	if o.OwnerWindow <= 0 {
+		o.OwnerWindow = 15 * time.Minute
+	}
+	if o.MaxSilence <= 0 {
+		o.MaxSilence = DefaultMaxSilence
+	}
+	o.MaxSilence = min(o.MaxSilence, MaxSilenceCap)
 	if o.DefaultOwner == "" {
 		o.DefaultOwner = "platform"
 	}
@@ -134,7 +174,12 @@ type Result struct {
 	Resolved   int
 	Open       int // findings not resolved after the evaluation
 	Sent       int // alerts handed to the sink
-	Digest     bool
+	// Digest is set when storm protection put new findings in a digest;
+	// Digested counts them by reason (DigestMaxNew, DigestOwnerBudget), and
+	// Promoted the digested findings that turned critical and left it.
+	Digest   bool
+	Digested map[string]int
+	Promoted int
 	// Baselined lists the change-based checks that recorded their first
 	// baseline (and so notified nothing).
 	Baselined []string
@@ -157,6 +202,15 @@ type Evaluator struct {
 	baselines map[string]map[string]bool
 	pending   map[string]time.Time   // candidates waiting out their check's pending time
 	digests   map[string]digestState // by owner: the digests firing
+	// log is the actions log, read from the store at every evaluation (the
+	// runner shares its own, so Act and the API see the same).
+	log *actionLog
+	// fired holds, per owner, when each new alert went out on its own
+	// within OwnerWindow (the per-owner budget).
+	fired map[string][]time.Time
+	// promote holds digested findings that turned critical, waiting to
+	// leave their digest (at most MaxNew per evaluation).
+	promote map[string]bool
 }
 
 // digestState is one owner's digest while it fires.
@@ -168,7 +222,8 @@ func NewEvaluator(store Store, sink Sink, o Options) *Evaluator {
 	if sink == nil {
 		sink = NopSink{}
 	}
-	return &Evaluator{o: o, store: store, sink: sink, pending: map[string]time.Time{}, digests: map[string]digestState{}}
+	return &Evaluator{o: o, store: store, sink: sink, pending: map[string]time.Time{}, digests: map[string]digestState{},
+		log: newActionLog(), fired: map[string][]time.Time{}, promote: map[string]bool{}}
 }
 
 // Load reads the stored findings and baselines. Evaluate calls it when
@@ -204,23 +259,50 @@ func (e *Evaluator) Load(ctx context.Context) error {
 
 // Evaluate runs the checks over in and moves every finding along its
 // lifecycle: new ones open and fire (or go into a digest when there are
-// more than MaxNew), open ones are posted again every Resend, gone ones
-// resolve after ResolveGrace. Writes are committed before anything is
-// sent, so a replica whose commit fails (it lost the lock) notifies
-// nothing.
+// more than MaxNew, or their owner's budget is spent), open and
+// acknowledged ones are posted again every Resend, silenced ones are ended
+// once and then left alone until the silence ends, gone ones resolve after
+// ResolveGrace. The actions log is read first, so an action any replica
+// recorded applies here. Writes are committed before anything is sent, so a
+// replica whose commit fails (it lost the lock) notifies nothing.
 func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	if in.Now.IsZero() {
 		in.Now = e.o.Now()
 	}
 	now := in.Now
+	loaded := false
 	if !e.loaded {
 		if err := e.Load(ctx); err != nil {
 			return Result{}, fmt.Errorf("alerts: load: %w", err)
 		}
+		loaded = true
+	}
+	if err := e.log.sync(ctx, e.store, now); err != nil {
+		return Result{}, fmt.Errorf("alerts: read actions: %w", err)
+	}
+	if loaded {
+		// The store keeps states, not who acknowledged: take the
+		// acknowledgements as they stand, so a new leader does not re-post
+		// every acknowledged alert at once. Transitions into and out of a
+		// silence still compare with the stored state.
+		for k, f := range e.state {
+			g := *f
+			applyMarks(&g, e.log.mark(k), now)
+			f.AckBy, f.AckAt = g.AckBy, g.AckAt
+		}
 	}
 	found := Run(in, e.o.LeakCritHours)
 	nss := namespaceInfo(in.View)
-	res := Result{Candidates: len(found.Candidates), OpenBy: map[[2]string]int{}}
+	owners := objectOwners(in.View)
+	res := Result{Candidates: len(found.Candidates), OpenBy: map[[2]string]int{}, Digested: map[string]int{}}
+
+	// What every finding was before this evaluation: transitions into and
+	// out of a silence, and acknowledgements, notify.
+	prevState := make(map[string]State, len(e.state))
+	prevAck := make(map[string]string, len(e.state))
+	for k, f := range e.state {
+		prevState[k], prevAck[k] = f.State, ackSig(f)
+	}
 
 	// Change-based checks: only what is not in the baseline fires; what
 	// fired stays open for DriftHold while it exists.
@@ -309,7 +391,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	for _, c := range active {
 		k := c.Key()
 		activeKeys[k] = true
-		nf := e.build(c, nss)
+		nf := e.build(c, nss, owners, in.View)
 		f := e.state[k]
 		if f == nil || f.Resolved() {
 			nf.State, nf.FirstSeen, nf.LastSeen = StateOpen, firstSeen[k], now
@@ -323,21 +405,25 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		// change.
 		nf.FirstSeen = f.FirstSeen
 		e.linkIncident(&nf, f)
-		if f.State == StateSilenced && f.SilencedUntil != nil && !now.Before(*f.SilencedUntil) {
-			f.State, f.SilencedUntil = StateOpen, nil
-			dirty[k], fireNow[k] = true, true
+		if f.Digest && f.Severity != SeverityCritical && nf.Severity == SeverityCritical {
+			e.promote[k] = true // turned critical: it leaves the digest (below)
 		}
+		// Is it firing on its own in Alertmanager now?
+		alone := f.LastNotified != nil && !f.Digest && !f.Quiet && f.State != StateSilenced
 		if !maps.Equal(f.Labels, nf.Labels) {
 			// Alertmanager knows an alert by its labels: retire the old set.
-			if f.LastNotified != nil && !f.Digest {
+			if alone {
 				out = append(out, e.alertOf(f, now))
 			}
 			fireNow[k] = true
+		} else if alone && nf.Quiet {
+			out = append(out, e.alertOf(f, now)) // quiet from now on: end it
 		}
 		if f.Alert != nf.Alert || f.Kind != nf.Kind || f.Severity != nf.Severity || f.Title != nf.Title || f.Owner != nf.Owner ||
-			f.Production != nf.Production || !maps.Equal(f.Labels, nf.Labels) || !maps.Equal(f.Annotations, nf.Annotations) {
+			f.Production != nf.Production || f.Link != nf.Link || f.Quiet != nf.Quiet ||
+			!maps.Equal(f.Labels, nf.Labels) || !maps.Equal(f.Annotations, nf.Annotations) {
 			f.Alert, f.Kind, f.Severity, f.Title, f.Owner, f.Production = nf.Alert, nf.Kind, nf.Severity, nf.Title, nf.Owner, nf.Production
-			f.Labels, f.Annotations = nf.Labels, nf.Annotations
+			f.Labels, f.Annotations, f.Link, f.Quiet = nf.Labels, nf.Annotations, nf.Link, nf.Quiet
 			dirty[k] = true
 		}
 		f.LastSeen = now
@@ -358,18 +444,92 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	}
 	res.New, res.Resolved = len(opened), len(resolved)
 
-	// Storm protection: too many new alerts at once go out as digests.
-	newDigest := map[string]bool{}
-	if len(opened) > e.o.MaxNew {
-		res.Digest = true
-		for _, f := range opened {
-			f.Digest = true
-			newDigest[f.Owner] = true
+	// Acknowledgements and silences, from the actions log. A finding that
+	// is silenced now but fired before is ended once (with who silenced it,
+	// until when and why); one whose silence ended fires again at once; an
+	// ack or unack goes out at once, so the annotations follow.
+	silenceNow := map[string]bool{}
+	for k, f := range e.state {
+		state, until := f.State, f.SilencedUntil
+		applyMarks(f, e.log.mark(k), now)
+		if f.State != state || !sameTime(f.SilencedUntil, until) {
+			dirty[k] = true
+		}
+		if f.Resolved() {
+			continue
+		}
+		was := prevState[k] // "" for a key new to this evaluator
+		switch {
+		case f.State == StateSilenced && was != StateSilenced:
+			if f.LastNotified != nil && !f.Digest && !f.Quiet {
+				silenceNow[k] = true
+			}
+		case f.State != StateSilenced && was == StateSilenced:
+			fireNow[k] = true
+		case was != "" && was != StateResolved && ackSig(f) != prevAck[k]:
+			fireNow[k] = true
 		}
 	}
 
-	// Notify: new and changed alerts now, open ones every Resend, resolved
-	// ones once.
+	// Storm protection, in order: more than MaxNew new alerts at once all go
+	// into their owners' digests; otherwise each owner gets OwnerMaxNew in
+	// any OwnerWindow on their own and the rest join their digest; then
+	// digested findings that turned critical leave it (MaxNew at most).
+	// Quiet and silenced findings never count.
+	newDigest := map[string]bool{}
+	var eligible []*Finding
+	for _, f := range opened {
+		if !f.Quiet && f.State != StateSilenced {
+			eligible = append(eligible, f)
+		}
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		a, b := eligible[i], eligible[j]
+		if severityRank(a.Severity) != severityRank(b.Severity) {
+			return severityRank(a.Severity) < severityRank(b.Severity)
+		}
+		return a.Key < b.Key
+	})
+	toDigest := func(f *Finding, reason string) {
+		f.Digest = true
+		newDigest[f.Owner] = true
+		res.Digested[reason]++
+		res.Digest = true
+	}
+	if len(eligible) > e.o.MaxNew {
+		for _, f := range eligible {
+			toDigest(f, DigestMaxNew)
+		}
+	} else {
+		for _, f := range eligible {
+			if !e.spend(f.Owner, now, false) {
+				toDigest(f, DigestOwnerBudget)
+			}
+		}
+	}
+	promote := make([]string, 0, len(e.promote))
+	for k := range e.promote {
+		promote = append(promote, k)
+	}
+	sort.Strings(promote)
+	for _, k := range promote {
+		f := e.state[k]
+		switch {
+		case f == nil || f.Resolved() || !f.Digest || f.Quiet || f.Severity != SeverityCritical:
+			delete(e.promote, k)
+			continue
+		case f.State == StateSilenced || res.Promoted == e.o.MaxNew:
+			continue // later: once the silence ends, or at the next evaluation
+		}
+		f.Digest = false
+		fireNow[k], dirty[k] = true, true
+		res.Promoted++
+		delete(e.promote, k)
+		e.spend(f.Owner, now, true)
+	}
+
+	// Notify: new and changed alerts now, open and acknowledged ones every
+	// Resend, newly silenced ones ended once, resolved ones once.
 	ends := now.Add(4 * e.o.Resend)
 	keys := make([]string, 0, len(e.state))
 	for k := range e.state {
@@ -380,12 +540,17 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	for _, k := range keys {
 		f := e.state[k]
 		switch {
-		case f.Resolved():
+		case f.Resolved(), f.Quiet:
+			continue
+		case f.State == StateSilenced:
+			if silenceNow[k] {
+				out = append(out, e.alertOf(f, now))
+				f.LastNotified = timePtr(now)
+				dirty[k] = true
+			}
 			continue
 		case f.Digest:
 			digestOf[f.Owner] = append(digestOf[f.Owner], f)
-			continue
-		case f.State == StateSilenced:
 			continue
 		}
 		if f.LastNotified == nil || fireNow[k] || now.Sub(*f.LastNotified) >= e.o.Resend {
@@ -397,17 +562,18 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	}
 	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Key < resolved[j].Key })
 	for _, f := range resolved {
-		if f.LastNotified != nil && !f.Digest {
+		// A silenced finding's alert already ended when it was silenced.
+		if f.LastNotified != nil && !f.Digest && !f.Quiet && prevState[f.Key] != StateSilenced {
 			out = append(out, e.alertOf(f, now))
 			f.LastNotified = timePtr(now)
 		}
 	}
-	owners := make([]string, 0, len(digestOf))
+	digestOwners := make([]string, 0, len(digestOf))
 	for o := range digestOf {
-		owners = append(owners, o)
+		digestOwners = append(digestOwners, o)
 	}
-	sort.Strings(owners)
-	for _, o := range owners {
+	sort.Strings(digestOwners)
+	for _, o := range digestOwners {
 		if d, ok := e.digests[o]; !ok || newDigest[o] || now.Sub(d.sent) >= e.o.Resend {
 			a := e.digestAlert(o, digestOf[o], ends)
 			out = append(out, a)
@@ -490,17 +656,28 @@ func (e *Evaluator) Findings() []Finding {
 }
 
 // build turns a candidate into a finding's descriptive fields: owner,
-// labels and annotations. The lifecycle fields are left zero.
-func (e *Evaluator) build(c Candidate, nss map[string]nsInfo) Finding {
+// labels, annotations and link. The lifecycle fields are left zero.
+//
+// The owner is the object's own (its owner annotation), else its
+// namespace's, else DefaultOwner. The namespace's routing hints
+// (kubesentry_* labels) are copied only when the namespace's owner is the
+// finding's: they route that team's alerts.
+func (e *Evaluator) build(c Candidate, nss map[string]nsInfo, owners map[detectors.ObjectRef]string, v *snapshot.View) Finding {
 	info := checkInfos[c.Check]
 	ns := nss[c.Namespace]
-	owner := ns.owner
+	own := owners[detectors.ObjectRef{Kind: c.Kind, Namespace: c.Namespace, Name: c.Name}]
+	owner := v.Policy.ObjectOwner(own, ns.ns)
+	hints := ns.hints
+	if own != "" && own != ns.owner {
+		hints = nil
+	}
 	if owner == "" {
 		owner = e.o.DefaultOwner
 	}
 	f := Finding{
 		Key: c.Key(), Alert: info.alert, Check: c.Check, Kind: c.Kind, Namespace: c.Namespace, Name: c.Name,
 		Severity: c.Severity, Title: clean(c.Title), Owner: owner, Production: ns.production,
+		Link: c.Link, Quiet: c.Quiet,
 	}
 	l := map[string]string{
 		"alertname": info.alert, "severity": c.Severity, "check": c.Check, "owner": owner,
@@ -520,7 +697,7 @@ func (e *Evaluator) build(c Candidate, nss map[string]nsInfo) Finding {
 	if e.o.Cluster != "" {
 		l["cluster"] = e.o.Cluster
 	}
-	for _, h := range ns.hints {
+	for _, h := range hints {
 		if _, taken := l[h[0]]; !taken {
 			l[h[0]] = h[1]
 		}
@@ -563,12 +740,61 @@ func (e *Evaluator) linkIncident(nf, prev *Finding) {
 	}
 }
 
-// alertOf is f as Alertmanager takes it, ending at ends.
+// alertOf is f as Alertmanager takes it, ending at ends: with who
+// acknowledged it and when, and who silenced it, until when and why.
 func (e *Evaluator) alertOf(f *Finding, ends time.Time) Alert {
+	ann := maps.Clone(f.Annotations)
+	if ann == nil {
+		ann = map[string]string{}
+	}
+	if f.AckBy != "" && f.AckAt != nil {
+		ann[AnnotationAckBy] = clean(f.AckBy)
+		ann[AnnotationAckAt] = f.AckAt.UTC().Format(time.RFC3339)
+	}
+	if f.SilencedBy != "" && f.SilencedUntil != nil {
+		ann[AnnotationSilencedBy] = clean(f.SilencedBy)
+		ann[AnnotationSilencedUntil] = f.SilencedUntil.UTC().Format(time.RFC3339)
+		ann[AnnotationSilenceReason] = clean(f.SilenceReason)
+	}
 	return Alert{
-		Labels: maps.Clone(f.Labels), Annotations: maps.Clone(f.Annotations),
+		Labels: maps.Clone(f.Labels), Annotations: ann,
 		StartsAt: f.FirstSeen, EndsAt: ends, GeneratorURL: f.Annotations["kubesentry_url"],
 	}
+}
+
+// spend takes one new alert from owner's budget (OwnerMaxNew per sliding
+// OwnerWindow) and reports whether there was one; force takes it anyway (a
+// promotion: it counts, but is never held back).
+func (e *Evaluator) spend(owner string, now time.Time, force bool) bool {
+	ts := e.fired[owner]
+	cut := now.Add(-e.o.OwnerWindow)
+	i := 0
+	for i < len(ts) && !ts[i].After(cut) {
+		i++
+	}
+	ts = ts[i:]
+	if len(ts) >= e.o.OwnerMaxNew && !force {
+		e.fired[owner] = ts
+		return false
+	}
+	e.fired[owner] = append(ts, now)
+	return true
+}
+
+// ackSig identifies f's acknowledgement, so a change notifies.
+func ackSig(f *Finding) string {
+	if f.AckBy == "" || f.AckAt == nil {
+		return ""
+	}
+	return f.AckBy + "\x00" + f.AckAt.UTC().Format(time.RFC3339Nano)
+}
+
+// sameTime reports whether two optional times are equal.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(*b)
 }
 
 // maxDigestLines bounds the findings a digest names.
@@ -623,7 +849,7 @@ func (e *Evaluator) digestAlert(owner string, fs []*Finding, ends time.Time) Ale
 		counts = append(counts, fmt.Sprintf("%s ×%d", n, byAlert[n]))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "More new findings appeared at once than kubesentry alerts on one by one (-alerts-max-new), so they are summed up here: %s.", strings.Join(counts, ", "))
+	fmt.Fprintf(&b, "More new findings appeared than kubesentry alerts on one by one (-alerts-max-new at once, -alerts-owner-max-new per owner in -alerts-owner-window), so they are summed up here: %s.", strings.Join(counts, ", "))
 	for i, f := range sorted {
 		if i == maxDigestLines {
 			fmt.Fprintf(&b, "\n… and %d more.", len(sorted)-maxDigestLines)

@@ -89,6 +89,7 @@ func run(cfg *config) error {
 		Authenticator:           authn,
 		AllowedHosts:            cfg.webAllowedHosts(),
 	}
+	srv.TrustedOrigins, _ = cfg.trustedOrigins() // validated with the flags
 
 	// Views: the informer cache feeding a debounced snapshot manager, or a
 	// per-request LIST for debugging. Every view built feeds the Overview's
@@ -104,7 +105,7 @@ func run(cfg *config) error {
 	if cfg.cache {
 		cache = kube.NewCache(clients, kube.CacheOptions{AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items,
 			NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(), ClusterName: cfg.clusterName,
-			AppLabelKeys: cfg.incidents.appLabelKeys()})
+			AppLabelKeys: cfg.incidents.appLabelKeys(), OwnerAnnotation: cfg.ownerAnnotation})
 		if err := cache.Start(ctx); err != nil {
 			return fmt.Errorf("start informer cache: %w", err)
 		}
@@ -140,7 +141,7 @@ func run(cfg *config) error {
 	} else {
 		src := kube.NewSourceWithOptions(clients.CS, clients.Dyn, kube.SourceOptions{
 			AWSAuth: cfg.awsAuth, NodeLabelKeysAdd: cfg.nodeLabelKeysAdd.items, NamespaceAnnotationKeysAdd: cfg.namespaceAnnotationKeys(),
-			ClusterName: cfg.clusterName, AppLabelKeys: cfg.incidents.appLabelKeys()})
+			ClusterName: cfg.clusterName, AppLabelKeys: cfg.incidents.appLabelKeys(), OwnerAnnotation: cfg.ownerAnnotation})
 		views := &recordingViews{inner: snapshot.OnDemand{Source: src, Policy: policy}, history: hist}
 		srv.Cluster, srv.Inventory, srv.Certs = src, src, src
 		srv.Views = views

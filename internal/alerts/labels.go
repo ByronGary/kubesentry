@@ -5,6 +5,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/ByronGary/kubesentry/internal/detectors"
+	"github.com/ByronGary/kubesentry/internal/model"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
@@ -26,9 +28,17 @@ var reservedLabels = map[string]bool{"kubesentry_digest": true}
 
 // nsInfo is what a namespace contributes to its findings' labels.
 type nsInfo struct {
+	ns         *model.Namespace // nil for a namespace the view does not hold (and "")
 	owner      string
 	production bool
 	hints      [][2]string // label, value; sorted
+}
+
+// objectOwners maps the objects that name their own owner (the owner
+// annotation internal/kube keeps on workloads, Services, Ingresses,
+// Certificates and RBAC objects) to it, once per view.
+func objectOwners(v *snapshot.View) map[detectors.ObjectRef]string {
+	return v.Memo("alerts/object-owners", func() any { return detectors.ObjectOwners(&v.Inv) }).(map[detectors.ObjectRef]string)
 }
 
 // namespaceInfo reads owners, production labels and routing hints from the
@@ -37,8 +47,9 @@ func namespaceInfo(v *snapshot.View) map[string]nsInfo {
 	return v.Memo("alerts/namespaces", func() any {
 		p := v.Policy
 		out := make(map[string]nsInfo, len(v.Inv.Namespaces))
-		for _, n := range v.Inv.Namespaces {
-			info := nsInfo{owner: p.OwnerOf(n), production: p.IsProduction(n)}
+		for i := range v.Inv.Namespaces {
+			n := v.Inv.Namespaces[i]
+			info := nsInfo{ns: &v.Inv.Namespaces[i], owner: p.OwnerOf(n), production: p.IsProduction(n)}
 			keys := make([]string, 0, len(n.Annotations))
 			for k := range n.Annotations {
 				if strings.HasPrefix(k, HintPrefix) && k != p.OwnerAnnotation {

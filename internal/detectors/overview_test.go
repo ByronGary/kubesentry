@@ -37,6 +37,52 @@ func TestPodState(t *testing.T) {
 	}
 }
 
+// An object's own owner comes first, then its namespace's; ObjectOwners maps
+// the objects that name one.
+func TestObjectOwner(t *testing.T) {
+	p := DefaultPolicy()
+	ns := model.Namespace{Name: "shop", Annotations: map[string]string{"kubesentry.io/owner": "team-shop"}}
+	for _, c := range []struct {
+		object string
+		ns     *model.Namespace
+		want   string
+	}{
+		{" team-cart ", &ns, "team-cart"},
+		{"", &ns, "team-shop"},
+		{"  ", &ns, "team-shop"},
+		{"", &model.Namespace{Name: "bare"}, ""},
+		{"", nil, ""},
+		{"team-rbac", nil, "team-rbac"},
+	} {
+		if got := p.ObjectOwner(c.object, c.ns); got != c.want {
+			t.Errorf("ObjectOwner(%q, %v) = %q, want %q", c.object, c.ns, got, c.want)
+		}
+	}
+	inv := model.Inventory{
+		Workloads: []model.Workload{{Kind: "Deployment", Namespace: "shop", Name: "cart", Owner: " team-cart "}, {Kind: "Deployment", Namespace: "shop", Name: "web"}},
+		Services:  []model.Service{{Namespace: "shop", Name: "cart", Owner: "team-cart"}},
+		Ingresses: []model.Ingress{{Namespace: "shop", Name: "cart", Owner: "team-edge"}},
+		RBAC: model.RBAC{
+			Roles:    []model.Role{{Kind: "ClusterRole", Name: "ops", Owner: "platform-sec"}},
+			Bindings: []model.RoleBinding{{Kind: "RoleBinding", Namespace: "shop", Name: "devs", Owner: "team-shop"}},
+		},
+		Certs: model.CertManager{Certificates: []model.Certificate{{Namespace: "shop", Name: "tls", Owner: "team-edge"}}},
+	}
+	want := map[ObjectRef]string{
+		{"Deployment", "shop", "cart"}: "team-cart", {"Service", "shop", "cart"}: "team-cart", {"Ingress", "shop", "cart"}: "team-edge",
+		{"ClusterRole", "", "ops"}: "platform-sec", {"RoleBinding", "shop", "devs"}: "team-shop", {"Certificate", "shop", "tls"}: "team-edge",
+	}
+	got := ObjectOwners(&inv)
+	if len(got) != len(want) {
+		t.Fatalf("ObjectOwners = %v", got)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%+v: %q, want %q", k, got[k], v)
+		}
+	}
+}
+
 func TestOwnerAndProductionPolicy(t *testing.T) {
 	p := DefaultPolicy()
 	ns := model.Namespace{Name: "shop", Labels: map[string]string{"environment": "production"},

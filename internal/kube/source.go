@@ -37,8 +37,12 @@ type SourceOptions struct {
 	// AppLabelKeys are workload labels kept besides DefaultAppLabelKeys
 	// (the custom app tag, -incident-app-label).
 	AppLabelKeys []string
-	ClusterName  string
-	Now          func() time.Time
+	// OwnerAnnotation is the annotation workloads, Services, Ingresses,
+	// cert-manager Certificates and RBAC objects may name their owning team
+	// in (-owner-annotation); "" reads none.
+	OwnerAnnotation string
+	ClusterName     string
+	Now             func() time.Time
 }
 
 // NewSource wraps a clientset and an optional dynamic client.
@@ -58,6 +62,8 @@ func (s *Source) namespaceAnnotations() labelFilter {
 }
 
 func (s *Source) appLabels() labelFilter { return newAppLabelFilter(s.opts.AppLabelKeys) }
+
+func (s *Source) ownerKey() string { return strings.TrimSpace(s.opts.OwnerAnnotation) }
 
 // collect pages through a list and converts each item.
 func collect[O, T any](what string, list func(metav1.ListOptions) ([]O, string, error), conv func(*O) T) ([]T, error) {

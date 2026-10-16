@@ -93,6 +93,39 @@ func TestRunnerStopsNotifyingWhenLeadershipIsLost(t *testing.T) {
 	}
 }
 
+// An action taken on the leading replica is applied and notified within
+// about a second, however long the evaluation interval.
+func TestRunnerActWakesTheLeader(t *testing.T) {
+	sink := &recordSink{}
+	r := &Runner{
+		Store: NewMemoryStore(), Sink: sink, Interval: time.Hour,
+		Input:   func() (Input, bool) { return Input{View: view(fixture(), t0), Leaks: leakReport(t0), Now: t0}, true },
+		Options: Options{Now: func() time.Time { return t0 }},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { r.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	eventually(t, "the first evaluation", func() bool { b := r.Board(); return b != nil && len(b.Findings) == 4 })
+	sink.take()
+	res, err := r.Act(ctx, Action{Key: keyEvicted, Action: ActionAck, Actor: "alice"})
+	if err != nil || res[0].Err != nil {
+		t.Fatalf("act: %+v %v", res, err)
+	}
+	eventually(t, "the acknowledged alert", func() bool {
+		sink.mu.Lock()
+		defer sink.mu.Unlock()
+		for _, b := range sink.batches {
+			for _, a := range b {
+				if a.Annotations["dedupe_key"] == keyEvicted && a.Annotations[AnnotationAckBy] == "alice" {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
 // Without an elector (the memory store) the runner leads at once, waits for
 // a view, and stops with its context.
 func TestRunnerMemoryModeLeadsAlone(t *testing.T) {

@@ -38,31 +38,31 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 	case *corev1.Namespace:
 		return convertNamespace(o, f.nsAnnotations)
 	case *corev1.Service:
-		return convertService(o)
+		return convertService(o, f.owner)
 	case *discoveryv1.EndpointSlice:
 		return convertEndpointSlice(o)
 	case *networkingv1.Ingress:
-		return convertIngress(o)
+		return convertIngress(o, f.owner)
 	case *appsv1.Deployment:
-		return convertDeployment(o, f.appLabels)
+		return convertDeployment(o, f.appLabels, f.owner)
 	case *appsv1.ReplicaSet:
 		return convertReplicaSet(o)
 	case *appsv1.StatefulSet:
-		return convertStatefulSet(o, f.appLabels)
+		return convertStatefulSet(o, f.appLabels, f.owner)
 	case *appsv1.DaemonSet:
-		return convertDaemonSet(o, f.appLabels)
+		return convertDaemonSet(o, f.appLabels, f.owner)
 	case *batchv1.Job:
-		return convertJob(o, f.appLabels)
+		return convertJob(o, f.appLabels, f.owner)
 	case *batchv1.CronJob:
-		return convertCronJob(o, f.appLabels)
+		return convertCronJob(o, f.appLabels, f.owner)
 	case *rbacv1.Role:
-		return convertRole(o)
+		return convertRole(o, f.owner)
 	case *rbacv1.ClusterRole:
-		return convertClusterRole(o)
+		return convertClusterRole(o, f.owner)
 	case *rbacv1.RoleBinding:
-		return convertRoleBinding(o)
+		return convertRoleBinding(o, f.owner)
 	case *rbacv1.ClusterRoleBinding:
-		return convertClusterRoleBinding(o)
+		return convertClusterRoleBinding(o, f.owner)
 	case *corev1.ConfigMap:
 		a, _ := ParseAWSAuth(o.Data)
 		return a
@@ -73,7 +73,7 @@ func convertAny(t testing.TB, obj runtime.Object, f filters) any {
 		case "TargetGroupBinding":
 			return convertTargetGroupBinding(o)
 		case "Certificate":
-			return convertCertificate(o)
+			return convertCertificate(o, f.owner)
 		case "Issuer", "ClusterIssuer":
 			return convertIssuer(o, o.GetKind())
 		case "CertificateRequest":
@@ -110,6 +110,7 @@ func TestTransformPreservesConvert(t *testing.T) {
 		newFilters(nil, nil, nil),
 		newFilters([]string{"example.com/*"}, []string{"example.com/owner"}, []string{"team"}),
 		newFilters(nil, nil, []string{"te*"}),
+		newFilters(nil, nil, nil).withOwner("example.com/note"), // meta's dropped annotation, kept as the owner
 	} {
 		for _, obj := range allFixtures() {
 			want := convertAny(t, obj, labels)

@@ -63,7 +63,8 @@ type MaintainResult struct {
 	Partitions  int      // daily partitions after the run
 	DefaultRows int64    // rows left in the default partition (should be 0)
 	// AlertsPruned counts alert findings deleted because they resolved
-	// more than alerts.Retention ago.
+	// more than alerts.Retention ago, and alert actions taken more than
+	// alerts.Retention plus a day ago.
 	AlertsPruned int
 	// KubeEvents describes the k8s_events partitions.
 	KubeEvents PartitionResult
@@ -80,7 +81,8 @@ type MaintainResult struct {
 // partition (a backfill of old events, clock skew), moving those rows into
 // it; drops partitions entirely older than their retention and purges such
 // rows from the default partition; deletes alert findings resolved more
-// than alerts.Retention ago, Kubernetes events last seen before
+// than alerts.Retention ago (and alert actions a day older), Kubernetes
+// events last seen before
 // EventsRetention and incidents resolved before IncidentRetention; then
 // ANALYZEs what it created. It is idempotent and serializes itself across
 // replicas with a transaction-level advisory lock, so any replica may run

@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -11,31 +13,46 @@ import (
 	"github.com/ByronGary/kubesentry/internal/auth"
 )
 
-// staticAlerts serves a fixed board.
+// staticAlerts serves the board of an alerts runner that is not run: its
+// findings are committed to a memory store and read with Reload, as a
+// replica that does not lead reads them; actions go through the runner.
 type staticAlerts struct {
-	mu     sync.Mutex
-	board  *alerts.Board
+	*alerts.Runner
 	status alerts.Status
-}
-
-func (s *staticAlerts) Board() *alerts.Board {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.board
 }
 
 func (s *staticAlerts) Status() alerts.Status { return s.status }
 
-func (s *staticAlerts) set(b *alerts.Board) {
-	s.mu.Lock()
-	s.board = b
-	s.mu.Unlock()
+func newStaticAlerts(fs []alerts.Finding) *staticAlerts {
+	s := &staticAlerts{Runner: &alerts.Runner{Options: alerts.Options{Now: func() time.Time { return now }},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	s.set(fs)
+	return s
 }
 
-// tenantBoard has, in every tenant namespace, an unhealthy workload (open),
-// an eviction resolved an hour ago, one resolved 30 hours ago (off the
-// list) and namespaced RBAC drift; plus cluster-scoped RBAC drift.
-func tenantBoard() *alerts.Board {
+// set replaces the stored findings and refreshes the board (a new version).
+// Each finding comes with an action on a past episode (an ack that no
+// longer applies), so the actions list has something in every namespace.
+func (s *staticAlerts) set(fs []alerts.Finding) {
+	ctx := context.Background()
+	st := alerts.NewMemoryStore()
+	if err := st.Commit(ctx, alerts.Commit{Findings: fs}); err != nil {
+		panic(err)
+	}
+	for _, f := range fs {
+		if _, err := st.AddAction(ctx, alerts.Action{Key: f.Key, FirstSeen: f.FirstSeen.Add(-24 * time.Hour), Action: alerts.ActionAck,
+			Actor: "previous-oncall", Severity: f.Severity, At: now.Add(-3 * time.Hour)}); err != nil {
+			panic(err)
+		}
+	}
+	s.Store = st
+	s.Reload(ctx)
+}
+
+// tenantFindings has, in every tenant namespace, an unhealthy workload
+// (open), an eviction resolved an hour ago, one resolved 30 hours ago (off
+// the list) and namespaced RBAC drift; plus cluster-scoped RBAC drift.
+func tenantFindings() []alerts.Finding {
 	owners := map[string]string{"team-a": "team-alpha", "team-b": "team-beta"}
 	mk := func(check, alert, kind, ns, name, sev string, state alerts.State, first time.Time) alerts.Finding {
 		owner := owners[ns]
@@ -64,9 +81,7 @@ func tenantBoard() *alerts.Board {
 		)
 	}
 	fs = append(fs, mk(alerts.CheckClusterAdmin, alerts.AlertRBACDrift, "ClusterRoleBinding", "", "erin-admin", alerts.SeverityCritical, alerts.StateOpen, now.Add(-2*time.Hour)))
-	b := alerts.NewBoard(fs, now)
-	b.Version = 1
-	return b
+	return fs
 }
 
 func alertKeys(r alertsResponse) []string {
@@ -162,9 +177,7 @@ func TestAlertsCacheFollowsTheBoard(t *testing.T) {
 	if rec := getAs(t, h, "alice", "/api/v1/alerts", nil); rec.Header().Get("X-Kubesentry-Cache") != "hit" {
 		t.Errorf("second = %s", rec.Header().Get("X-Kubesentry-Cache"))
 	}
-	b := tenantBoard()
-	b.Findings, b.Keys, b.Version = b.Findings[:0], b.Keys[:0], 2
-	src.set(b)
+	src.set(nil)
 	var after alertsResponse
 	if rec := getAs(t, h, "alice", "/api/v1/alerts", &after); rec.Header().Get("X-Kubesentry-Cache") != "miss" || after.Count != 0 {
 		t.Errorf("after a new board: %s, %d items", rec.Header().Get("X-Kubesentry-Cache"), after.Count)

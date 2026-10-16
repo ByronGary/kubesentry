@@ -96,6 +96,11 @@ type Server struct {
 	// flight at once on the expensive routes (/oom, pod diagnostics, audit
 	// summary); more get 429 with Retry-After. Zero disables it.
 	LongInflightPerIdentity int
+	// TrustedOrigins are the origins ("scheme://host[:port]") besides the
+	// request's own from which browsers may send /api/ requests that change
+	// state: the origin of -external-url and -allowed-origins
+	// (WithCrossOrigin).
+	TrustedOrigins []string
 
 	// ClusterInfo overrides what /info says about the cluster: a non-empty
 	// Name always wins, the rest fills in when the view knows nothing.
@@ -202,9 +207,9 @@ func (s *Server) Handler() http.Handler {
 // Serve returns the handler for a listener serving parts.
 //
 // Web requests pass request ids, the access log and security headers; /api/
-// requests then authentication, the per-identity rate limit and the
-// in-flight cap, and each route its metrics, timeout, ETag, response cache
-// and gzip. The UI's static files stay unauthenticated. Ingest routes keep
+// requests then authentication, the cross-origin check (methods that change
+// state), the per-identity rate limit and the in-flight cap, and each route
+// its metrics, timeout, ETag, response cache and gzip. The UI's static files stay unauthenticated. Ingest routes keep
 // their own token guards and body limits and are not rate limited per user;
 // probes and metrics are plain.
 func (s *Server) Serve(p Parts) http.Handler {
@@ -237,6 +242,7 @@ func (s *Server) Serve(p Parts) http.Handler {
 		web := http.NewServeMux()
 		web.Handle("/api/", Compose(
 			WithAuthentication(s.authenticator()),
+			WithCrossOrigin(s.TrustedOrigins...),
 			WithRateLimit(s.RateLimit, s.RateBurst),
 			WithMaxInflight(s.MaxInflight),
 		)(s.apiRoutes()))
@@ -388,6 +394,8 @@ func (s *Server) apiRoutes() http.Handler {
 	}
 	if s.Alerts != nil {
 		s.route(mux, alertsRoute, "alerts", t, s.alertsList)
+		s.route(mux, "GET /api/v1/alerts/actions", "alert_actions_list", t, s.alertActionsList)
+		mux.Handle("POST /api/v1/alerts/actions", Compose(WithMetrics("alert_actions"), WithTimeout(t))(http.HandlerFunc(s.alertActions)))
 	}
 	if s.Incidents != nil {
 		s.route(mux, incidentsRoute, "incidents", t, s.incidentsList)
