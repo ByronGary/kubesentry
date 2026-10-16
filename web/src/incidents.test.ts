@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest'
 import {
   atLeast,
   bundlePath,
+  chartLines,
   chartMarks,
+  chartThresholds,
   clampSpan,
   clampWindow,
   filterQuery,
@@ -15,6 +17,7 @@ import {
   laneItems,
   LANES,
   levelGlyph,
+  logSources,
   logsPath,
   logVolume,
   maxRangeHours,
@@ -25,6 +28,7 @@ import {
   rangeQuery,
   readIncidentFilter,
   readRange,
+  sectionAccess,
   severityGlyph,
   shortSpan,
   SIGNAL_META,
@@ -261,6 +265,43 @@ describe('sources', () => {
     expect(sourceUp(s, 'requests')).toBe(true)
     expect(sourceUp(s, 'logs')).toBe(false)
     expect(sourceUp(s, 'cloudtrail')).toBeUndefined()
+  })
+})
+
+describe('per-incident access', () => {
+  const all = { audit: true, cloudtrail: true, podLogs: true }
+  it('lets the incident say forbidden even when the capability allows some namespace', () => {
+    expect(sectionAccess({ audit: 'forbidden', cloudtrail: 'ok', 'logs:kubernetes': 'forbidden' }, all)).toEqual({ audit: 'forbidden', cloudtrail: 'ok', logs: 'forbidden' })
+  })
+  it('falls back to the capability, then to whether the source exists', () => {
+    expect(sectionAccess({ audit: 'ok', cloudtrail: 'absent', logs: 'absent' }, { audit: false, cloudtrail: true, podLogs: true })).toEqual({ audit: 'forbidden', cloudtrail: 'absent', logs: 'absent' })
+    expect(sectionAccess(undefined, { audit: true, cloudtrail: true, podLogs: false })).toEqual({ audit: 'ok', cloudtrail: 'ok', logs: 'forbidden' })
+  })
+  it('offers only the log sources the incident lists as working', () => {
+    expect(logSources({ 'logs:kubernetes': 'ok', 'logs:cloudwatch': 'absent' })).toEqual({ kubernetes: true, cloudwatch: false })
+    expect(logSources({ 'logs:cloudwatch': 'error: throttled' })).toEqual({ kubernetes: false, cloudwatch: true })
+    expect(logSources(undefined)).toEqual({ kubernetes: false, cloudwatch: false })
+  })
+})
+
+describe('chart lines', () => {
+  const s = (label: string, peak: number, metric: 'memory' | 'requests' = 'memory') => ({ metric, label, unit: 'bytes' as const, points: [[0, 1], [1, peak]] as [number, number][] })
+  it('gives the three highest peaks a slot and greys the rest and the folded others', () => {
+    const lines = chartLines([s('a', 5), s('others', 99), s('b', 9), s('c', 7), s('d', 1), s('x', 50, 'requests')], 'memory')
+    expect(lines.map((l) => [l.label, l.slot])).toEqual([['b', 1], ['c', 2], ['a', 3], ['d', 0], ['others', 0]])
+    expect(chartLines(undefined, 'memory')).toEqual([])
+  })
+  it('keeps one threshold per value, highest first', () => {
+    const t = chartThresholds(
+      [
+        { metric: 'memory', label: 'api-1/app', value: 512 },
+        { metric: 'memory', label: 'api-2/app', value: 512 },
+        { metric: 'memory', label: 'worker/app', value: 1024 },
+        { metric: 'requests', label: 'api', value: 30 },
+      ],
+      'memory',
+    )
+    expect(t).toEqual([{ label: 'worker/app', value: 1024 }, { label: 'api-1/app', value: 512 }])
   })
 })
 

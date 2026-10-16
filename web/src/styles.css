@@ -14,18 +14,22 @@
   --sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
   --serif: Charter, 'Bitstream Charter', 'Sitka Text', Cambria, 'Iowan Old Style', serif;
   --mono: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  /* Chart series: blue, orange, aqua; validated all-pairs for colour-blind readers on these surfaces. */
+  --s1: #0a5c8f; --s2: #eb6834; --s3: #1baf7a;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
     --page: #0d1520; --surface: #101b29; --ink: #e4ecf5; --pencil: #9db0c6; --rule: #22344a;
     --trace: #62b4ea; --wash: rgba(98, 180, 234, 0.12); --crit-text: #f08a8a; --focus: #62b4ea;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
     color-scheme: dark;
   }
 }
 :root[data-theme='dark'] {
   --page: #0d1520; --surface: #101b29; --ink: #e4ecf5; --pencil: #9db0c6; --rule: #22344a;
   --trace: #62b4ea; --wash: rgba(98, 180, 234, 0.12); --crit-text: #f08a8a; --focus: #62b4ea;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70;
   color-scheme: dark;
 }
 
@@ -237,6 +241,30 @@ td.bad { color: var(--crit-text); font-weight: 600; }
 .tip strong { color: var(--ink); font-size: 14px; }
 .chart-note { margin: 4px 0 0; color: var(--pencil); font-size: 13px; max-width: 70ch; }
 .chart-table { max-height: 260px; overflow-y: auto; }
+/* Several lines on one chart: three hues (validated for colour-blind and dark), each with its own dash and an end label. */
+.chart .s-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.s-line.s1 { stroke: var(--s1); } .s-line.s2 { stroke: var(--s2); } .s-line.s3 { stroke: var(--s3); }
+.s-line.s0 { stroke: var(--pencil); stroke-width: 1.2; opacity: 0.55; }
+.chart .end-label { fill: var(--ink); font-size: 12px; font-family: var(--mono); }
+.chart-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 0 0 4px; padding: 0; font-size: 12.5px; color: var(--pencil); }
+.chart-legend li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.chart-legend svg { flex: none; overflow: visible; }
+.chart-legend .s-line { fill: none; stroke-width: 2; }
+.chart .spike-span { fill: var(--wash); stroke: none; }
+.chart .spike-span.sev-crit { fill: rgba(208, 59, 59, 0.1); }
+.chart .spike-span.sev-warn { fill: rgba(250, 178, 25, 0.13); }
+.chart .brush rect, .tstrip .brush rect { fill: var(--trace); opacity: 0.12; }
+.chart .brush line, .tstrip .brush line { stroke: var(--trace); stroke-width: 1.5; }
+.chart .brush.pending line, .tstrip .brush.pending line { stroke-dasharray: 3 3; }
+.chart svg.brushable, .tstrip svg.brushable { cursor: crosshair; }
+.chart .mk { color: var(--ink); }
+.chart .mk-oom { color: var(--crit-text); }
+.chart .mk-rule { stroke: var(--pencil); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.6; }
+.chart .mk-count { fill: var(--pencil); font-size: 10px; font-variant-numeric: tabular-nums; }
+.tip-row { display: flex; justify-content: space-between; gap: 10px; color: var(--pencil); }
+.tip-row strong { font-size: 12px; }
+.sig-mark { display: inline-block; flex: none; vertical-align: -1px; color: var(--pencil); overflow: visible; }
+.sig-mark.sev-crit { color: var(--critical); } .sig-mark.sev-warn { color: var(--warning); } .sig-mark.sev-ok { color: var(--good); }
 
 /* Small shared bits */
 .plain { list-style: none; margin: 0; padding: 0; }

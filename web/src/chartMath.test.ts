@@ -9,6 +9,7 @@ import {
   medianStep,
   nearestIndex,
   niceTicks,
+  plotGeometry,
   projectToLimit,
   rateTicks,
   sharedDomain,
@@ -246,6 +247,20 @@ describe('linePath and medianStep', () => {
   it('finds the usual sample spacing', () => {
     expect(medianStep([[0, 1], [10, 1], [20, 1], [90, 1]])).toBe(10)
     expect(medianStep([[0, 1]])).toBeUndefined()
+  })
+  it('lays out a plot: margins, a y scale with headroom to a round tick, the shared x', () => {
+    const g = plotGeometry({ width: 400, height: 200, margin: { top: 10, right: 40, bottom: 30, left: 60 }, domain: [0, 100], values: [37, 12, NaN], ticks: (m) => rateTicks(m) })
+    expect([g.iw, g.ih]).toEqual([300, 160])
+    expect(g.yTicks).toEqual([0, 10, 20, 30, 40])
+    expect(g.yTop).toBe(40)
+    expect(g.y(0)).toBe(170)
+    expect(g.y(40)).toBe(10)
+    expect(g.x(0)).toBe(60)
+    expect(g.x(100)).toBe(360)
+    // Nothing to fit still gives a usable scale.
+    const flat = plotGeometry({ width: 400, height: 200, margin: { top: 0, right: 0, bottom: 0, left: 0 }, domain: [0, 1], values: [], ticks: (m) => byteTicks(m) })
+    expect(flat.yTop).toBe(1)
+    expect(Number.isFinite(flat.y(0))).toBe(true)
   })
   it('reads a value near a time, within a tolerance', () => {
     const s: Point[] = [[0, 1], [10, 2]]

@@ -401,7 +401,10 @@ const SOURCE_LABEL: Record<string, string> = {
   'logs:cloudwatch': 'Logs (CloudWatch)',
   'logs:kubernetes': 'Logs (Kubernetes)',
   cloudtrail: 'CloudTrail',
+  'logs:demo': 'Logs (demo)',
+  logs: 'Logs',
   memory: 'Memory (Prometheus)',
+  series: 'Chart series',
   prometheus: 'Prometheus',
   events: 'Kubernetes events',
   audit: 'Audit log',
@@ -433,6 +436,34 @@ export function sourceRows(sources: Record<string, string> | undefined): SourceR
       return { key, label: sourceLabel(key), status, text }
     })
     .sort((a, b) => Number(b.status === 'ok') - Number(a.status === 'ok') || a.label.localeCompare(b.label))
+}
+
+export type Access = 'ok' | 'forbidden' | 'absent'
+
+/**
+ * Whether this caller sees a section of this incident. The incident's own
+ * sources decide first: `audit`, `cloudtrail` and `logs:*` read "forbidden"
+ * where the caller may not see them here (the capabilities only say "in some
+ * namespace"); then the capability; then whether the source exists at all.
+ */
+export function sectionAccess(sources: Record<string, string> | undefined, caps: { audit: boolean; cloudtrail: boolean; podLogs: boolean }): Record<'audit' | 'cloudtrail' | 'logs', Access> {
+  const s = sources ?? {}
+  const one = (key: string, allowed: boolean): Access => {
+    if (s[key] === 'forbidden' || !allowed) return 'forbidden'
+    return s[key] === 'absent' ? 'absent' : 'ok'
+  }
+  const logKeys = Object.keys(s).filter((k) => k === 'logs' || k.startsWith('logs:'))
+  let logs: Access = 'ok'
+  if (!caps.podLogs || logKeys.some((k) => s[k] === 'forbidden')) logs = 'forbidden'
+  else if (logKeys.length > 0 && logKeys.every((k) => s[k] === 'absent')) logs = 'absent'
+  return { audit: one('audit', caps.audit), cloudtrail: one('cloudtrail', caps.cloudtrail), logs }
+}
+
+/** The log sources the switch can ask for by name: those the incident lists as working. */
+export function logSources(sources: Record<string, string> | undefined): { kubernetes: boolean; cloudwatch: boolean } {
+  const s = sources ?? {}
+  const up = (k: string) => s[k] !== undefined && s[k] !== 'absent' && s[k] !== 'forbidden'
+  return { kubernetes: up('logs:kubernetes'), cloudwatch: up('logs:cloudwatch') }
 }
 
 /** Whether any source of a kind ("requests", "logs") answers; false when all are absent or failing, undefined when none is listed. */
@@ -596,6 +627,49 @@ export function spikeSpans(signals: readonly IncidentSignal[] | undefined, metri
     out.push({ from, to: Math.max(from, to), label: s.title || signalMeta(s.type).label, severity: severityGlyph(s.severity) })
   }
   return out
+}
+
+// ---- Chart series ----
+
+/** The label the server gives the folded remainder of a metric's series. */
+export const OTHERS = 'others'
+
+export interface ChartLine {
+  key: string
+  label: string
+  points: [number, number][]
+  /** 1–3: a coloured, dashed, end-labelled line; 0: a thin grey context line. */
+  slot: 0 | 1 | 2 | 3
+}
+
+/**
+ * One metric's series as chart lines: the three with the highest peak get a
+ * hue, a dash pattern and an end label (colour never alone); the rest, and
+ * the server's folded "others", are thin grey context lines.
+ */
+export function chartLines(series: readonly IncidentSeries[] | undefined, metric: IncidentSeries['metric']): ChartLine[] {
+  const peak = (s: IncidentSeries) => s.points.reduce((m, p) => (Number.isFinite(p[1]) && p[1] > m ? p[1] : m), -Infinity)
+  const mine = (series ?? []).filter((s) => s.metric === metric && s.points.length > 0)
+  const named = mine.filter((s) => s.label !== OTHERS).sort((a, b) => peak(b) - peak(a) || a.label.localeCompare(b.label))
+  const rest = mine.filter((s) => s.label === OTHERS)
+  return [...named, ...rest].map((s, i) => ({
+    key: `${s.metric}:${s.label}:${i}`,
+    label: s.label,
+    points: s.points,
+    slot: s.label !== OTHERS && i < 3 ? ((i + 1) as 1 | 2 | 3) : 0,
+  }))
+}
+
+/** The distinct thresholds for one metric (one per value), at most `max`. */
+export function chartThresholds(t: IncidentDetail['thresholds'], metric: IncidentSeries['metric'], max = 3): { label: string; value: number }[] {
+  const seen = new Set<number>()
+  const out: { label: string; value: number }[] = []
+  for (const x of t ?? []) {
+    if (x.metric !== metric || !Number.isFinite(x.value) || seen.has(x.value)) continue
+    seen.add(x.value)
+    out.push({ label: x.label, value: x.value })
+  }
+  return out.sort((a, b) => b.value - a.value).slice(0, max)
 }
 
 // ---- Logs ----

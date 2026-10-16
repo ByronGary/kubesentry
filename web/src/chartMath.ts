@@ -392,6 +392,50 @@ export function medianStep(points: readonly Point[]): number | undefined {
   return gaps[Math.floor(gaps.length / 2)]
 }
 
+export interface Margin {
+  top: number
+  right: number
+  bottom: number
+  left: number
+}
+
+export interface PlotGeometry {
+  /** Inner width and height: the plot inside the margins. */
+  iw: number
+  ih: number
+  yTop: number
+  yTicks: number[]
+  xTicks: number[]
+  x: (t: number) => number
+  y: (v: number) => number
+}
+
+/**
+ * Where everything goes in a time chart `width` x `height`: the y scale fits
+ * every value in `values` (the lines, thresholds, a projection) with 6%
+ * headroom and reaches a round tick; the x scale is the shared domain.
+ */
+export function plotGeometry(o: { width: number; height: number; margin: Margin; domain: Range; values: readonly number[]; ticks: (max: number) => number[] }): PlotGeometry {
+  const { width, height, margin: m, domain } = o
+  const iw = Math.max(1, width - m.left - m.right)
+  const ih = Math.max(1, height - m.top - m.bottom)
+  let max = 0
+  for (const v of o.values) if (finite(v) && v > max) max = v
+  const yMax = max * 1.06
+  const yTicks = o.ticks(yMax)
+  const top = Math.max(yMax, yTicks[yTicks.length - 1] ?? 0)
+  const yTop = top > 0 ? top : 1
+  return {
+    iw,
+    ih,
+    yTop,
+    yTicks,
+    xTicks: timeTicks(domain[0], domain[1], Math.max(3, Math.floor(width / 110))),
+    x: (t) => xOf(t, domain, m.left, iw),
+    y: (v) => m.top + ih - (v / yTop) * ih,
+  }
+}
+
 /** The value of a series at time t: the nearest sample within `tolerance` ms, else undefined. */
 export function valueAt(points: readonly Point[], t: number, tolerance: number): number | undefined {
   if (!points.length) return undefined
