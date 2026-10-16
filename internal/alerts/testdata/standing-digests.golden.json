@@ -1,0 +1,109 @@
+[
+  {
+    "labels": {
+      "alertname": "KubesentryStandingDigest",
+      "cluster": "prod-eks",
+      "digest": "certificates",
+      "kubesentry_digest": "true",
+      "owner": "payments",
+      "severity": "info"
+    },
+    "annotations": {
+      "count": "1",
+      "description": "Certificates owned by payments that cert-manager has not renewed on schedule, with more than 14 days left. Each fires on its own as KubesentryCertificateExpiring once fewer days are left.",
+      "findings": "- Certificate payments/far-tls: Renewal is overdue by 3 days; expires in 79 days.",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=payments",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrystandingdigest",
+      "summary": "Certificates for payments: 1 expiring, more than 14 days left"
+    },
+    "startsAt": "2026-10-13T09:00:01Z",
+    "endsAt": "2026-10-13T10:00:01Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=payments"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryStandingDigest",
+      "cluster": "prod-eks",
+      "digest": "rbac-posture",
+      "kubesentry_digest": "true",
+      "owner": "payments",
+      "severity": "info"
+    },
+    "annotations": {
+      "count": "1",
+      "description": "Standing RBAC findings owned by payments, cluster plumbing left out: 0 critical, 1 warning, 0 info. They are standing state, so they come in this digest; a binding that newly appears fires on its own as KubesentryRBACDrift.",
+      "findings": "- [warning] RoleBinding payments/pat-admin: cluster-admin granted. Grants cluster-admin in namespace payments to User pat.",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=payments",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrystandingdigest",
+      "summary": "RBAC posture for payments: 1 standing finding"
+    },
+    "startsAt": "2026-10-13T09:00:01Z",
+    "endsAt": "2026-10-13T10:00:01Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=payments"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryStandingDigest",
+      "cluster": "prod-eks",
+      "digest": "rbac-posture",
+      "kubesentry_digest": "true",
+      "owner": "platform",
+      "severity": "info"
+    },
+    "annotations": {
+      "count": "1",
+      "description": "Standing RBAC findings owned by platform, cluster plumbing left out: 1 critical, 0 warning, 0 info. They are standing state, so they come in this digest; a binding that newly appears fires on its own as KubesentryRBACDrift.",
+      "findings": "- [critical] ClusterRoleBinding erin-admin: cluster-admin granted. Grants cluster-admin cluster-wide to User erin.",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=platform",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrystandingdigest",
+      "summary": "RBAC posture for platform: 1 standing finding"
+    },
+    "startsAt": "2026-10-13T09:00:01Z",
+    "endsAt": "2026-10-13T10:00:01Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=platform"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryStandingDigest",
+      "cluster": "prod-eks",
+      "digest": "unused-volumes",
+      "kubesentry_digest": "true",
+      "owner": "payments",
+      "severity": "info"
+    },
+    "annotations": {
+      "count": "2",
+      "description": "PersistentVolumeClaims owned by payments that no pod mounts, at least 24 hours old, most expensive first: about $8.80 a month together. A StatefulSet scaled to zero leaves its claims unmounted on purpose.",
+      "findings": "- PersistentVolumeClaim payments/old-data: 100 GiB, class gp3, unused for 30 days, about $8.00 a month\n- PersistentVolumeClaim payments/small: 10 GiB, class gp3, unused for 30 days, about $0.80 a month",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=payments",
+      "monthly_cost_usd": "8.80",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrystandingdigest",
+      "summary": "Unused volumes for payments: 2 claims, about $8.80 a month"
+    },
+    "startsAt": "2026-10-13T09:00:01Z",
+    "endsAt": "2026-10-13T10:00:01Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=payments"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryStandingDigest",
+      "cluster": "prod-eks",
+      "digest": "unused-volumes",
+      "kubesentry_digest": "true",
+      "owner": "platform",
+      "severity": "info"
+    },
+    "annotations": {
+      "count": "1",
+      "description": "PersistentVolumeClaims owned by platform that no pod mounts, at least 24 hours old, most expensive first: about $0.00 a month together, not counting 1 whose storage class has no price. A StatefulSet scaled to zero leaves its claims unmounted on purpose.",
+      "findings": "- PersistentVolumeClaim team-a/scratch: 512 MiB, class standard, unused for 3 days, cost unknown",
+      "kubesentry_url": "https://kubesentry.example.com/#/?owner=platform",
+      "monthly_cost_usd": "0.00",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentrystandingdigest",
+      "summary": "Unused volumes for platform: 1 claim, cost unknown"
+    },
+    "startsAt": "2026-10-13T09:00:01Z",
+    "endsAt": "2026-10-13T10:00:01Z",
+    "generatorURL": "https://kubesentry.example.com/#/?owner=platform"
+  }
+]

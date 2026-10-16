@@ -37,6 +37,25 @@ func Incident(id string) string {
 	return "#/incidents/" + url.PathEscape(id)
 }
 
+// Activity is the Activity page (the audit log) filtered to one tag and one
+// user; either may be "".
+func Activity(tag, user string) string {
+	q := url.Values{}
+	if tag != "" {
+		q.Set("tag", tag)
+	}
+	if user != "" {
+		q.Set("user", user)
+	}
+	if len(q) == 0 {
+		return "#/activity"
+	}
+	return "#/activity?" + q.Encode()
+}
+
+// Agents is the node agents page.
+func Agents() string { return "#/agents" }
+
 // Owner is the Overview filtered to one owner's namespaces.
 func Owner(owner string) string {
 	return "#/?" + url.Values{"owner": {owner}}.Encode()

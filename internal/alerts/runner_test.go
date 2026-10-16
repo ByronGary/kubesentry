@@ -159,3 +159,26 @@ func TestRunnerMemoryModeLeadsAlone(t *testing.T) {
 		t.Error("still leading after stop")
 	}
 }
+
+// /info's lastDigestAt and nextDigestAt: the next scheduled time on any
+// replica, the last run as the store (a follower) or the evaluator (the
+// leader) knows it; none while digests are off.
+func TestRunnerDigestStatus(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	clk := &clock{t: t0}
+	r := &Runner{Store: store, Options: Options{Now: clk.now, Digests: DigestOptions{Schedule: mustSchedule(t, "Mon 09:00", "")}}}
+	if s := r.Status(); !s.LastDigestAt.IsZero() || !s.NextDigestAt.Equal(t0.Add(7*24*time.Hour-3*time.Hour)) {
+		t.Fatalf("status %+v", s)
+	}
+	if err := store.Commit(ctx, Commit{DigestRuns: map[string]time.Time{DigestCertificates: t0.Add(-3 * time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	r.Reload(ctx)
+	if s := r.Status(); !s.LastDigestAt.Equal(t0.Add(-3 * time.Hour)) {
+		t.Errorf("after a read, last digest %s", s.LastDigestAt)
+	}
+	if s := (&Runner{Store: store}).Status(); !s.NextDigestAt.IsZero() || !s.LastDigestAt.IsZero() {
+		t.Errorf("digests off: %+v", s)
+	}
+}

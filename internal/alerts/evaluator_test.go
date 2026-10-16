@@ -29,6 +29,9 @@ type harness struct {
 	ev    *Evaluator
 	inv   model.Inventory
 	leaks bool
+	// audit and agents go into each Input as they are.
+	audit  AuditQuerier
+	agents *AgentReports
 }
 
 func newHarness(t *testing.T, o Options) *harness {
@@ -42,7 +45,7 @@ func newHarness(t *testing.T, o Options) *harness {
 func (h *harness) at(d time.Duration) (Result, []Alert) {
 	h.t.Helper()
 	h.clk.t = t0.Add(d)
-	in := Input{View: view(h.inv, h.clk.t), Now: h.clk.t}
+	in := Input{View: view(h.inv, h.clk.t), Now: h.clk.t, Audit: h.audit, Agents: h.agents}
 	if h.leaks {
 		in.Leaks = leakReport(h.clk.t)
 	}
@@ -70,7 +73,7 @@ func TestEvaluatorLifecycleTiming(t *testing.T) {
 	h := newHarness(t, Options{ExternalURL: "https://ks.example.com", Cluster: "prod-eks"})
 
 	res, sent := h.at(0)
-	if strings.Join(res.Baselined, ",") != "anonymous-binding,cluster-admin,wildcard-rbac" {
+	if strings.Join(res.Baselined, ",") != "anonymous-binding,cluster-admin,external-ip,host-namespaces,ingress-no-tls,loadbalancer,nodeport,privileged,wildcard-rbac" {
 		t.Errorf("baselined = %v", res.Baselined)
 	}
 	want := []string{

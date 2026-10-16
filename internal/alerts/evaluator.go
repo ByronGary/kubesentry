@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +71,19 @@ type Options struct {
 	// the alert then links to it (the incident_url annotation). Nil links
 	// nothing; Runner.SetIncidentLookup sets it late.
 	IncidentOf func(f *Finding) string
+	// Disabled checks are not run (-alerts-disable-checks; cmd/server adds
+	// the audit checks -alerts-audit leaves out, and agent-missing when it is
+	// off): their findings resolve, and a change-based check keeps its
+	// baseline as it was.
+	Disabled map[string]bool
+	// Audit configures the audit checks (Input.Audit reads the store).
+	Audit AuditOptions
+	// AgentDaemonSet is the agent DaemonSet, "namespace/name"
+	// (-agent-daemonset), whose nodes the agent-missing check expects
+	// reports from (Input.Agents); "" runs no agent check.
+	AgentDaemonSet string
+	// Digests schedules the standing-state digests; off by default.
+	Digests DigestOptions
 	// Now is the clock; default time.Now.
 	Now func() time.Time
 }
@@ -127,6 +141,8 @@ func (o *Options) defaults() {
 	if o.DriftHold <= 0 {
 		o.DriftHold = 24 * time.Hour
 	}
+	o.Audit.defaults()
+	o.Digests.defaults()
 	if o.Now == nil {
 		o.Now = time.Now
 	}
@@ -185,6 +201,12 @@ type Result struct {
 	Baselined []string
 	// OpenBy counts the findings not resolved by check and severity.
 	OpenBy map[[2]string]int
+	// StandingDigests counts the standing digest alerts sent, by kind (one
+	// per owner).
+	StandingDigests map[string]int
+	// Warnings are problems that did not stop the evaluation (an audit read
+	// failed: those checks were skipped).
+	Warnings []string
 }
 
 // Evaluator diffs each view's findings against the stored ones and
@@ -211,6 +233,13 @@ type Evaluator struct {
 	// promote holds digested findings that turned critical, waiting to
 	// leave their digest (at most MaxNew per evaluation).
 	promote map[string]bool
+	// audit runs the audit checks for this leadership term.
+	audit *AuditWatch
+	// digestRuns is when each standing digest was last sent (the store's);
+	// digestSince is when this evaluator first loaded: a digest never sent
+	// waits for the first scheduled time after it.
+	digestRuns  map[string]time.Time
+	digestSince time.Time
 }
 
 // digestState is one owner's digest while it fires.
@@ -223,7 +252,61 @@ func NewEvaluator(store Store, sink Sink, o Options) *Evaluator {
 		sink = NopSink{}
 	}
 	return &Evaluator{o: o, store: store, sink: sink, pending: map[string]time.Time{}, digests: map[string]digestState{},
-		log: newActionLog(), fired: map[string][]time.Time{}, promote: map[string]bool{}}
+		log: newActionLog(), fired: map[string][]time.Time{}, promote: map[string]bool{}, audit: NewAuditWatch(o.Audit),
+		digestRuns: map[string]time.Time{}}
+}
+
+// enabledAudit is the audit checks this evaluator runs.
+func (e *Evaluator) enabledAudit() map[string]bool {
+	out := map[string]bool{}
+	for _, c := range AuditChecks() {
+		if !e.o.Disabled[c] {
+			out[c] = true
+		}
+	}
+	return out
+}
+
+// runChecks runs every check over in: the view's (run), then the audit
+// checks, whose events the evaluator's AuditWatch remembers; disabled
+// checks are left out.
+func (e *Evaluator) runChecks(ctx context.Context, in Input, res *Result) Found {
+	ro := runOptions{leakCritHours: e.o.LeakCritHours, agentDaemonSet: e.o.AgentDaemonSet}
+	if e.o.Digests.has(DigestCertificates) {
+		ro.quietCertDays = e.o.Digests.CertDays
+	}
+	if e.o.Disabled[CheckAgentMissing] {
+		ro.agentDaemonSet = ""
+	}
+	found := run(in, ro)
+	if enabled := e.enabledAudit(); len(enabled) > 0 {
+		if in.Audit == nil {
+			for c := range enabled {
+				found.Skipped[c] = true
+			}
+		} else {
+			nss := namespaceInfo(in.View)
+			failed, err := e.audit.Poll(ctx, in.Audit, enabled, func(ns string) bool { return nss[ns].production }, in.Now)
+			if err != nil {
+				res.Warnings = append(res.Warnings, err.Error())
+			}
+			for c := range failed {
+				found.Skipped[c] = true
+			}
+			found.Candidates = append(found.Candidates, e.audit.Candidates(in.Now, failed)...)
+		}
+	}
+	if len(e.o.Disabled) > 0 {
+		kept := found.Candidates[:0]
+		for _, c := range found.Candidates {
+			if !e.o.Disabled[c.Check] {
+				kept = append(kept, c)
+			}
+		}
+		found.Candidates = kept
+	}
+	sortCandidates(found.Candidates)
+	return found
 }
 
 // Load reads the stored findings and baselines. Evaluate calls it when
@@ -236,6 +319,14 @@ func (e *Evaluator) Load(ctx context.Context) error {
 	bl, err := e.store.Baselines(ctx)
 	if err != nil {
 		return err
+	}
+	runs, err := e.store.DigestRuns(ctx)
+	if err != nil {
+		return err
+	}
+	e.digestRuns = runs
+	if e.digestRuns == nil {
+		e.digestRuns = map[string]time.Time{}
 	}
 	e.state = make(map[string]*Finding, len(fs))
 	e.persisted = make(map[string]time.Time, len(fs))
@@ -277,6 +368,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		}
 		loaded = true
 	}
+	if e.digestSince.IsZero() {
+		e.digestSince = now
+	}
 	if err := e.log.sync(ctx, e.store, now); err != nil {
 		return Result{}, fmt.Errorf("alerts: read actions: %w", err)
 	}
@@ -291,10 +385,11 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 			f.AckBy, f.AckAt = g.AckBy, g.AckAt
 		}
 	}
-	found := Run(in, e.o.LeakCritHours)
+	res := Result{OpenBy: map[[2]string]int{}, Digested: map[string]int{}, StandingDigests: map[string]int{}}
+	found := e.runChecks(ctx, in, &res)
 	nss := namespaceInfo(in.View)
 	owners := objectOwners(in.View)
-	res := Result{Candidates: len(found.Candidates), OpenBy: map[[2]string]int{}, Digested: map[string]int{}}
+	res.Candidates = len(found.Candidates)
 
 	// What every finding was before this evaluation: transitions into and
 	// out of a silence, and acknowledgements, notify.
@@ -308,7 +403,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	// fired stays open for DriftHold while it exists.
 	current := map[string]map[string]bool{}
 	for check, info := range checkInfos {
-		if info.changeBased && !found.Skipped[check] {
+		if info.changeBased && !found.Skipped[check] && !e.o.Disabled[check] {
 			current[check] = map[string]bool{}
 		}
 	}
@@ -386,7 +481,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	dirty := map[string]bool{}
 	fireNow := map[string]bool{}
 	var out []Alert
-	var opened []*Finding
+	var opened, unquiet []*Finding
 	activeKeys := make(map[string]bool, len(active))
 	for _, c := range active {
 		k := c.Key()
@@ -407,6 +502,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		e.linkIncident(&nf, f)
 		if f.Digest && f.Severity != SeverityCritical && nf.Severity == SeverityCritical {
 			e.promote[k] = true // turned critical: it leaves the digest (below)
+		}
+		if f.Quiet && !nf.Quiet && f.LastNotified == nil && !f.Digest {
+			unquiet = append(unquiet, f) // crossed the threshold: new to Alertmanager, so storm protection counts it
 		}
 		// Is it firing on its own in Alertmanager now?
 		alone := f.LastNotified != nil && !f.Digest && !f.Quiet && f.State != StateSilenced
@@ -478,7 +576,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	// Quiet and silenced findings never count.
 	newDigest := map[string]bool{}
 	var eligible []*Finding
-	for _, f := range opened {
+	for _, f := range slices.Concat(opened, unquiet) {
 		if !f.Quiet && f.State != StateSilenced {
 			eligible = append(eligible, f)
 		}
@@ -594,8 +692,13 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 		delete(e.digests, o)
 	}
 
+	// The standing digests due now: sent once, after the commit that
+	// records their run.
+	standing, runs := e.dueDigests(in, found, now, &res)
+	out = append(out, standing...)
+
 	// Commit, then send.
-	c := Commit{Baselines: newBaselines}
+	c := Commit{Baselines: newBaselines, DigestRuns: runs}
 	for _, k := range keys {
 		if dirty[k] {
 			c.Findings = append(c.Findings, e.state[k].Clone())
@@ -615,6 +718,9 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	}
 	for _, f := range c.Findings {
 		e.persisted[f.Key] = f.LastSeen
+	}
+	for kind, t := range runs {
+		e.digestRuns[kind] = NormalTime(t)
 	}
 	for check, keys := range newBaselines {
 		set := make(map[string]bool, len(keys))
@@ -645,6 +751,19 @@ func (e *Evaluator) Evaluate(ctx context.Context, in Input) (Result, error) {
 	return res, nil
 }
 
+// LastDigest is when a standing digest was last sent (zero for never).
+func (e *Evaluator) LastDigest() time.Time { return latestRun(e.digestRuns) }
+
+func latestRun(runs map[string]time.Time) time.Time {
+	var last time.Time
+	for _, t := range runs {
+		if t.After(last) {
+			last = t
+		}
+	}
+	return last
+}
+
 // Findings returns a copy of the findings the evaluator holds: every one
 // not resolved, and those resolved within BoardWindow.
 func (e *Evaluator) Findings() []Finding {
@@ -666,13 +785,10 @@ func (e *Evaluator) build(c Candidate, nss map[string]nsInfo, owners map[detecto
 	info := checkInfos[c.Check]
 	ns := nss[c.Namespace]
 	own := owners[detectors.ObjectRef{Kind: c.Kind, Namespace: c.Namespace, Name: c.Name}]
-	owner := v.Policy.ObjectOwner(own, ns.ns)
+	owner := e.ownerOf(c.Kind, c.Namespace, c.Name, nss, owners, v)
 	hints := ns.hints
 	if own != "" && own != ns.owner {
 		hints = nil
-	}
-	if owner == "" {
-		owner = e.o.DefaultOwner
 	}
 	f := Finding{
 		Key: c.Key(), Alert: info.alert, Check: c.Check, Kind: c.Kind, Namespace: c.Namespace, Name: c.Name,
@@ -718,6 +834,16 @@ func (e *Evaluator) build(c Candidate, nss map[string]nsInfo, owners map[detecto
 	}
 	f.Labels, f.Annotations = l, a
 	return f
+}
+
+// ownerOf is the owner of an object: its own owner annotation, else its
+// namespace's, else DefaultOwner.
+func (e *Evaluator) ownerOf(kind, ns, name string, nss map[string]nsInfo, owners map[detectors.ObjectRef]string, v *snapshot.View) string {
+	own := owners[detectors.ObjectRef{Kind: kind, Namespace: ns, Name: name}]
+	if owner := v.Policy.ObjectOwner(own, nss[ns].ns); owner != "" {
+		return owner
+	}
+	return e.o.DefaultOwner
 }
 
 // linkIncident sets nf's incident_url annotation when there is an external

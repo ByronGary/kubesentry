@@ -57,6 +57,7 @@ type checkInfo struct {
 const (
 	certNotReadyPending = 10 * time.Minute // issuance takes a moment
 	workloadPending     = 5 * time.Minute  // a crash or pull failure during a rollout may clear
+	agentMissingPending = 10 * time.Minute // an agent restarting, or a node just joining, catches up
 )
 
 var checkInfos = map[string]checkInfo{
@@ -70,6 +71,19 @@ var checkInfos = map[string]checkInfo{
 	CheckAnonymousBinding:    {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
 	CheckWildcardRBAC:        {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
 	CheckAWSAuthMasters:      {alert: AlertRBACDrift, object: true, changeBased: true, gate: GateRBAC},
+	CheckLoadBalancer:        {alert: AlertExposureChange, object: true, changeBased: true},
+	CheckNodePort:            {alert: AlertExposureChange, object: true, changeBased: true},
+	CheckExternalIP:          {alert: AlertExposureChange, object: true, changeBased: true},
+	CheckIngressNoTLS:        {alert: AlertExposureChange, object: true, changeBased: true},
+	CheckPrivileged:          {alert: AlertPrivilegedWorkload, changeBased: true},
+	CheckHostNamespaces:      {alert: AlertPrivilegedWorkload, changeBased: true},
+	CheckAuditExec:           {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAuditSecretRead:     {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAuditRBACChange:     {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAuditImpersonation:  {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAuditDeniedBurst:    {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAuditAnonymous:      {alert: AlertAuditActivity, object: true, gate: GateAudit},
+	CheckAgentMissing:        {alert: AlertAgentMissing, object: true, pending: agentMissingPending, gate: GateAgents},
 }
 
 // Checks lists every check, sorted.
@@ -89,7 +103,14 @@ type Input struct {
 	// Prometheus, or no scan finished yet): the memory-leak check is then
 	// skipped and its findings stay as they are.
 	Leaks *detectors.LeakReport
-	Now   time.Time
+	// Audit reads the audit store for the audit checks; nil while it cannot
+	// be read (Postgres is down): the audit checks are then skipped, and
+	// their findings stay as they are.
+	Audit AuditQuerier
+	// Agents is what the node agents reported, nil when unknown: the
+	// agent-missing check is then skipped.
+	Agents *AgentReports
+	Now    time.Time
 }
 
 // Found is what the checks see in one view.
@@ -101,20 +122,46 @@ type Found struct {
 	Skipped map[string]bool
 }
 
-// Run runs every check over in. leakCritHours is the time to the memory
-// limit below which a leak is critical (0: the view's policy).
+// runOptions configures run.
+type runOptions struct {
+	// leakCritHours is the time to the memory limit below which a leak is
+	// critical (0: the view's policy).
+	leakCritHours float64
+	// quietCertDays: an expiring certificate with more days than this left
+	// is quiet (listed in the certificates digest only); 0 makes none quiet.
+	quietCertDays int
+	// agentDaemonSet is the agent DaemonSet ("namespace/name") whose nodes
+	// must report; "" runs no agent check.
+	agentDaemonSet string
+}
+
+// Run runs every check that needs only the view and what in carries; the
+// audit checks also need a memory of the events they read, which an
+// Evaluator keeps. leakCritHours is the time to the memory limit below
+// which a leak is critical (0: the view's policy).
 func Run(in Input, leakCritHours float64) Found {
+	return run(in, runOptions{leakCritHours: leakCritHours})
+}
+
+func run(in Input, o runOptions) Found {
 	f := Found{Skipped: map[string]bool{}}
 	v := in.View
-	if leakCritHours <= 0 {
-		leakCritHours = v.Policy.Thresholds.LeakCritHours
+	if o.leakCritHours <= 0 {
+		o.leakCritHours = v.Policy.Thresholds.LeakCritHours
 	}
-	certChecks(v, in.Now, &f)
+	certChecks(v, in.Now, o.quietCertDays, &f)
 	podChecks(v, in.Now, &f)
-	leakCheck(v, in.Leaks, leakCritHours, &f)
+	leakCheck(v, in.Leaks, o.leakCritHours, &f)
 	rbacChecks(v, &f)
-	sort.Slice(f.Candidates, func(i, j int) bool { return f.Candidates[i].Key() < f.Candidates[j].Key() })
+	exposureChecks(v, &f)
+	privilegedChecks(v, &f)
+	agentCheck(v, in.Agents, o.agentDaemonSet, in.Now, &f)
+	sortCandidates(f.Candidates)
 	return f
+}
+
+func sortCandidates(cs []Candidate) {
+	sort.Slice(cs, func(i, j int) bool { return cs[i].Key() < cs[j].Key() })
 }
 
 // unavailable reports whether any of the sources could not be read for the
@@ -133,7 +180,11 @@ func unavailable(v *snapshot.View, sources ...string) bool {
 
 // ---- certificates ----
 
-func certChecks(v *snapshot.View, now time.Time, f *Found) {
+// certChecks: certificates expiring and not renewing on schedule, and
+// certificates not ready. With quietDays, an expiring one with more days
+// than that left is quiet: the certificates digest lists it, and it fires
+// on its own once it crosses the threshold.
+func certChecks(v *snapshot.View, now time.Time, quietDays int, f *Found) {
 	if unavailable(v, "certificates", "issuers", "clusterissuers") {
 		f.Skipped[CheckCertExpiring], f.Skipped[CheckCertNotReady] = true, true
 		return
@@ -174,6 +225,7 @@ func certChecks(v *snapshot.View, now time.Time, f *Found) {
 					continue // cert-manager renews it before it matters
 				}
 				cand.Check = CheckCertExpiring
+				cand.Quiet = quietDays > 0 && c.NotAfter != nil && c.NotAfter.Sub(now) > time.Duration(quietDays)*24*time.Hour
 				cand.Title = "Certificate " + obj + ": " + c.Detail
 				cand.Description = fmt.Sprintf("Certificate %s%s (issuer %s, secret %s): %s cert-manager has not renewed it on schedule; check the issuer and the latest CertificateRequest.",
 					obj, names, issuer, c.SecretName, c.Detail)
@@ -577,6 +629,83 @@ func rbacChecks(v *snapshot.View, f *Found) {
 				Description: "kubesentry saw this appear since its last evaluation: " + sf.Detail,
 				Link:        uilink.Security(sf.Check, sf.Subject),
 			})
+		}
+	}
+}
+
+// ---- exposure and privileged workloads (change-based) ----
+
+// exposureWhat says what appeared, per exposure check.
+var exposureWhat = map[string]string{
+	CheckLoadBalancer: "new internet-facing load balancer",
+	CheckNodePort:     "new NodePort service",
+	CheckExternalIP:   "new external IP",
+	CheckIngressNoTLS: "new ingress without TLS",
+}
+
+// exposureChecks lists every standing exposure finding the security
+// detector reports at warn (an internet-facing load balancer or ALB, a
+// NodePort, an external IP, an ingress serving plain HTTP); internal load
+// balancers and internal ALBs are info there and left out, as is cluster
+// plumbing. The evaluator alerts only on those missing from the baseline.
+func exposureChecks(v *snapshot.View, f *Found) {
+	if unavailable(v, "services") {
+		f.Skipped[CheckLoadBalancer], f.Skipped[CheckNodePort], f.Skipped[CheckExternalIP] = true, true, true
+	}
+	if unavailable(v, "ingresses") {
+		f.Skipped[CheckIngressNoTLS] = true
+	}
+	for ns, fs := range v.Findings {
+		for i := range fs {
+			sf := &fs[i]
+			if sf.System || sf.Category != "exposure" || exposureWhat[sf.Check] == "" || sf.Severity != detectors.StatusWarn || f.Skipped[sf.Check] {
+				continue
+			}
+			obj := sf.SubjectKind + " " + sf.Subject
+			f.Candidates = append(f.Candidates, Candidate{
+				Check: sf.Check, Kind: sf.SubjectKind, Namespace: ns, Name: strings.TrimPrefix(sf.Subject, ns+"/"), Severity: SeverityWarning,
+				Title:       "Exposure change: " + exposureWhat[sf.Check] + ": " + obj,
+				Description: "kubesentry saw this appear since its last evaluation: " + obj + ": " + sf.Detail,
+				Link:        uilink.Security(sf.Check, sf.Subject),
+			})
+		}
+	}
+}
+
+// privilegedChecks lists every workload (folded per root, as the security
+// detector groups pods) that runs a privileged container, or shares the
+// node's PID, network or IPC namespace, outside the system namespaces.
+// Privileged is critical; host namespaces warning, critical in production.
+// The evaluator alerts only on those missing from the baseline.
+func privilegedChecks(v *snapshot.View, f *Found) {
+	if unavailable(v, "pods") {
+		f.Skipped[CheckPrivileged], f.Skipped[CheckHostNamespaces] = true, true
+		return
+	}
+	nss := namespaceInfo(v)
+	for ns, fs := range v.Findings {
+		for i := range fs {
+			sf := &fs[i]
+			if sf.System || sf.Category != "pod" || (sf.Check != CheckPrivileged && sf.Check != CheckHostNamespaces) {
+				continue
+			}
+			name := strings.TrimPrefix(sf.Subject, ns+"/")
+			obj := sf.SubjectKind + " " + sf.Subject
+			c := Candidate{Check: sf.Check, Kind: sf.SubjectKind, Namespace: ns, Name: name, Severity: SeverityCritical,
+				Description: "kubesentry saw this appear since its last evaluation: " + obj + ": " + sf.Detail,
+				Link:        uilink.Security(sf.Check, sf.Subject)}
+			if sf.SubjectKind == "Pod" { // a bare pod
+				c.Link = uilink.Pod(ns, name)
+			}
+			if sf.Check == CheckPrivileged {
+				c.Title = "Privileged workload: new privileged container: " + obj
+			} else {
+				if !nss[ns].production {
+					c.Severity = SeverityWarning
+				}
+				c.Title = "Privileged workload: new use of host namespaces: " + obj
+			}
+			f.Candidates = append(f.Candidates, c)
 		}
 	}
 }

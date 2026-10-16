@@ -49,28 +49,91 @@ func (s *staticAlerts) set(fs []alerts.Finding) {
 	s.Reload(ctx)
 }
 
+// mkFinding is a finding as the leader stores it, owned as the tenants'
+// namespaces are.
+func mkFinding(check, alert, kind, ns, name, sev string, state alerts.State, first time.Time) alerts.Finding {
+	owner := map[string]string{"team-a": "team-alpha", "team-b": "team-beta"}[ns]
+	if owner == "" {
+		owner = "platform"
+	}
+	labels := map[string]string{"alertname": alert, "severity": sev, "check": check, "owner": owner}
+	if ns != "" {
+		labels["namespace"] = ns
+	}
+	f := alerts.Finding{Key: alerts.Key(check, kind, ns, name), Alert: alert, Check: check, Kind: kind, Namespace: ns, Name: name,
+		Severity: sev, Title: kind + " " + name, Owner: owner, Labels: labels, Annotations: map[string]string{"summary": name},
+		State: state, FirstSeen: first, LastSeen: now}
+	if state == alerts.StateResolved {
+		f.ResolvedAt = &first
+	}
+	return f
+}
+
+// gatedFindings are the findings whose visibility needs more than the
+// namespace: audit activity in each tenant namespace (ViewAudit there), a
+// cluster-wide RBAC change in the audit log (ViewClusterAudit), and the
+// agent DaemonSet's missing nodes (ViewAgents).
+func gatedFindings() []alerts.Finding {
+	var fs []alerts.Finding
+	for _, ns := range tenants {
+		fs = append(fs, mkFinding(alerts.CheckAuditExec, alerts.AlertAuditActivity, "User", ns, "dave@example.com", alerts.SeverityWarning,
+			alerts.StateOpen, now.Add(-30*time.Minute)))
+	}
+	return append(fs,
+		mkFinding(alerts.CheckAuditRBACChange, alerts.AlertAuditActivity, "User", "", "dave@example.com", alerts.SeverityWarning, alerts.StateOpen, now.Add(-20*time.Minute)),
+		mkFinding(alerts.CheckAgentMissing, alerts.AlertAgentMissing, "DaemonSet", "", "kubesentry/kubesentry-agent", alerts.SeverityWarning, alerts.StateOpen, now.Add(-10*time.Minute)),
+	)
+}
+
+// The audit and agent findings' gates: namespaced audit findings need
+// ViewAudit there besides the namespace, cluster-scoped ones
+// ViewClusterAudit; the agent finding ViewAgents.
+func TestAlertsAuditAndAgentGates(t *testing.T) {
+	s := tenantServer(t)
+	s.Alerts.(*staticAlerts).set(append(tenantFindings(), gatedFindings()...))
+	g := tenantGrants()
+	g[grant("gina", auth.ViewClusterAudit, "")] = true
+	g[grant("gina", auth.ViewAgents, "")] = true
+	g[grant("hank", auth.ViewNamespace, "team-b")] = true
+	g[grant("hank", auth.ViewAudit, "team-b")] = true
+	s.Authorizer = &auth.SARAuthorizer{Reviewer: g, Candidates: extraCandidates{s.Authorizer.(*auth.SARAuthorizer).Candidates,
+		map[string][]string{"hank": {"team-b"}}}}
+	h := s.Handler()
+	for user, want := range map[string]string{
+		// ViewNamespace and ViewAudit in team-a.
+		"alice": "workload-unhealthy/Deployment/team-a/web audit-exec/User/team-a/dave@example.com pod-evicted/Deployment/team-a/web",
+		// ViewNamespace in team-b, no ViewAudit; ViewNodes.
+		"bob": "workload-unhealthy/Deployment/team-b/web pod-evicted/Deployment/team-b/web",
+		// Cluster audit and agents, no namespace.
+		"gina": "agent-missing/DaemonSet//kubesentry/kubesentry-agent audit-rbac-change/User//dave@example.com",
+		"hank": "workload-unhealthy/Deployment/team-b/web audit-exec/User/team-b/dave@example.com pod-evicted/Deployment/team-b/web",
+	} {
+		var r alertsResponse
+		getAs(t, h, user, "/api/v1/alerts", &r)
+		if got := strings.Join(alertKeys(r), " "); got != want {
+			t.Errorf("%s sees %s\nwant %s", user, got, want)
+		}
+		var acts alertActionsResponse
+		getAs(t, h, user, "/api/v1/alerts/actions?limit=200", &acts)
+		seen := map[string]bool{}
+		for _, k := range alertKeys(r) {
+			seen[k] = true
+		}
+		for _, a := range acts.Items {
+			if strings.Contains(a.Key, "audit-") || strings.Contains(a.Key, "agent-") {
+				if !seen[a.Key] && !strings.HasSuffix(a.Key, "/old") {
+					t.Errorf("%s sees the action on %s", user, a.Key)
+				}
+			}
+		}
+	}
+}
+
 // tenantFindings has, in every tenant namespace, an unhealthy workload
 // (open), an eviction resolved an hour ago, one resolved 30 hours ago (off
 // the list) and namespaced RBAC drift; plus cluster-scoped RBAC drift.
 func tenantFindings() []alerts.Finding {
-	owners := map[string]string{"team-a": "team-alpha", "team-b": "team-beta"}
-	mk := func(check, alert, kind, ns, name, sev string, state alerts.State, first time.Time) alerts.Finding {
-		owner := owners[ns]
-		if owner == "" {
-			owner = "platform"
-		}
-		labels := map[string]string{"alertname": alert, "severity": sev, "check": check, "owner": owner}
-		if ns != "" {
-			labels["namespace"] = ns
-		}
-		f := alerts.Finding{Key: alerts.Key(check, kind, ns, name), Alert: alert, Check: check, Kind: kind, Namespace: ns, Name: name,
-			Severity: sev, Title: kind + " " + name, Owner: owner, Labels: labels, Annotations: map[string]string{"summary": name},
-			State: state, FirstSeen: first, LastSeen: now}
-		if state == alerts.StateResolved {
-			f.ResolvedAt = &first
-		}
-		return f
-	}
+	mk := mkFinding
 	var fs []alerts.Finding
 	for _, ns := range tenants {
 		fs = append(fs,
@@ -192,8 +255,17 @@ func TestInfoAlerts(t *testing.T) {
 	s.Alerts.(*staticAlerts).status = alerts.Status{Sink: "alertmanager", LastSentAt: sent, LastError: "alertmanager 2 of 2: HTTP 503 Service Unavailable", Leader: true}
 	getAs(t, s.Handler(), "", "/api/v1/info", &info)
 	if a := info.Alerts; a == nil || !a.Enabled || a.Sink != "alertmanager" || a.LastSentAt == nil || !a.LastSentAt.Equal(sent) || !a.Leader ||
-		a.LastError != "alertmanager 2 of 2: HTTP 503 Service Unavailable" {
+		a.LastError != "alertmanager 2 of 2: HTTP 503 Service Unavailable" || a.LastDigestAt != nil || a.NextDigestAt != nil {
 		t.Errorf("info.alerts = %+v", info.Alerts)
+	}
+	// Standing digests: when the last went out and the next is due.
+	last, next := now.Add(-3*time.Hour), now.Add(21*time.Hour)
+	s.Alerts.(*staticAlerts).status = alerts.Status{Sink: "alertmanager", LastDigestAt: last, NextDigestAt: next}
+	s.ResponseCache = nil
+	info = infoResponse{}
+	getAs(t, s.Handler(), "", "/api/v1/info", &info)
+	if a := info.Alerts; a == nil || a.LastDigestAt == nil || !a.LastDigestAt.Equal(last) || a.NextDigestAt == nil || !a.NextDigestAt.Equal(next) {
+		t.Errorf("info.alerts with digests = %+v", info.Alerts)
 	}
 	s.Alerts = nil
 	info = infoResponse{}

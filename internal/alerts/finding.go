@@ -20,6 +20,9 @@ import (
 const (
 	SeverityWarning  = "warning"
 	SeverityCritical = "critical"
+	// SeverityInfo is the standing digests' (KubesentryStandingDigest); no
+	// finding has it.
+	SeverityInfo = "info"
 )
 
 // State is where a finding is in its lifecycle.
@@ -44,10 +47,31 @@ const (
 	AlertPodStuckTerminating = "KubesentryPodStuckTerminating"
 	AlertRBACDrift           = "KubesentryRBACDrift"
 	AlertFindingsDigest      = "KubesentryFindingsDigest"
+	AlertExposureChange      = "KubesentryExposureChange"
+	AlertPrivilegedWorkload  = "KubesentryPrivilegedWorkload"
+	AlertAuditActivity       = "KubesentryAuditActivity"
+	AlertAgentMissing        = "KubesentryAgentMissing"
+	AlertStandingDigest      = "KubesentryStandingDigest"
 )
 
-// Checks (the check label). The RBAC drift checks reuse the security
-// detector's check names.
+// Checks (the check label). The RBAC drift, exposure and privileged checks
+// reuse the security detector's check names.
+const (
+	CheckLoadBalancer       = "loadbalancer"
+	CheckNodePort           = "nodeport"
+	CheckExternalIP         = "external-ip"
+	CheckIngressNoTLS       = "ingress-no-tls"
+	CheckPrivileged         = "privileged"
+	CheckHostNamespaces     = "host-namespaces"
+	CheckAuditExec          = "audit-exec"
+	CheckAuditSecretRead    = "audit-secret-read"
+	CheckAuditRBACChange    = "audit-rbac-change"
+	CheckAuditImpersonation = "audit-impersonation"
+	CheckAuditDeniedBurst   = "audit-denied-burst"
+	CheckAuditAnonymous     = "audit-anonymous"
+	CheckAgentMissing       = "agent-missing"
+)
+
 const (
 	CheckCertExpiring        = "cert-expiring"
 	CheckCertNotReady        = "cert-not-ready"
@@ -159,7 +183,7 @@ func GateOf(check, kind string) Gate {
 	switch {
 	case strings.HasPrefix(check, "audit-"):
 		return GateAudit
-	case check == "agent-missing":
+	case check == CheckAgentMissing:
 		return GateAgents
 	case kind == "Node":
 		return GateNode

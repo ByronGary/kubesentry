@@ -278,6 +278,11 @@ type infoAlerts struct {
 	Leader     bool       `json:"leader,omitempty"`
 	LastSentAt *time.Time `json:"lastSentAt,omitempty"`
 	LastError  string     `json:"lastError,omitempty"`
+	// Standing-state digests (-alerts-digest-at): when one was last sent
+	// (absent before the first), and the next scheduled time (absent while
+	// they are off).
+	LastDigestAt *time.Time `json:"lastDigestAt,omitempty"`
+	NextDigestAt *time.Time `json:"nextDigestAt,omitempty"`
 }
 
 func (s *Server) infoAlerts() *infoAlerts {
@@ -292,6 +297,14 @@ func (s *Server) infoAlerts() *infoAlerts {
 	if !st.LastSentAt.IsZero() {
 		t := st.LastSentAt
 		out.LastSentAt = &t
+	}
+	if !st.LastDigestAt.IsZero() {
+		t := st.LastDigestAt
+		out.LastDigestAt = &t
+	}
+	if !st.NextDigestAt.IsZero() {
+		t := st.NextDigestAt
+		out.NextDigestAt = &t
 	}
 	return out
 }

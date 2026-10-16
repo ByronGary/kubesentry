@@ -11,15 +11,20 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
+	_ "time/tzdata" // -alerts-digest-tz works wherever the binary runs (Windows has no zone database)
 
 	"github.com/ByronGary/kubesentry/internal/alerts"
 	"github.com/ByronGary/kubesentry/internal/api"
+	"github.com/ByronGary/kubesentry/internal/audit"
 	"github.com/ByronGary/kubesentry/internal/awsauth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 	"github.com/ByronGary/kubesentry/internal/metrics"
 	"github.com/ByronGary/kubesentry/internal/pgstore"
+	"github.com/ByronGary/kubesentry/internal/procmon"
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
@@ -48,6 +53,22 @@ type alertsConfig struct {
 	leakCritHours float64
 	runbookURL    string
 	externalURL   string
+
+	// The catalog: checks turned off, the audit checks, the agent check.
+	disableChecks     string
+	auditChecks       string
+	auditProdOnly     string
+	auditHold         time.Duration
+	auditDeniedBurst  int
+	auditDeniedWindow time.Duration
+	agents            string
+	agentDaemonSet    string
+	agentFanout       bool
+	// Standing-state digests.
+	digestAt       string
+	digestTZ       string
+	digestKinds    string
+	certDigestDays int
 }
 
 type durFlag func(p *time.Duration, name string, def time.Duration, usage string)
@@ -69,6 +90,69 @@ func (a *alertsConfig) register(fs *flag.FlagSet, dur durFlag) {
 	fs.Float64Var(&a.leakCritHours, "alerts-leak-crit-hours", 0, "a memory leak alert is critical when the limit is closer than this many hours (0: -leak-crit-hours)")
 	fs.StringVar(&a.runbookURL, "alerts-runbook-url", alerts.DefaultRunbookURL, "each alert's runbook_url is this plus #<alert name in lower case>")
 	fs.StringVar(&a.externalURL, "external-url", "", "kubesentry's URL as users reach it (e.g. https://kubesentry.example.com); alerts link to their finding there (kubesentry_url), and with -incidents to their incident (incident_url); browsers may send write requests from its origin")
+
+	fs.StringVar(&a.disableChecks, "alerts-disable-checks", "", "checks that never alert, comma-separated (e.g. nodeport,ingress-no-tls); their open findings resolve")
+	fs.StringVar(&a.auditChecks, "alerts-audit", "all", "audit checks to run when an audit store exists, comma-separated: "+strings.Join(alerts.AuditChecks(), ",")+"; all, or none")
+	fs.StringVar(&a.auditProdOnly, "alerts-audit-production-only", strings.Join(alerts.DefaultAuditProductionOnly, ","), "audit checks that count only events in production namespaces (-production-label), comma-separated; empty for none")
+	dur(&a.auditHold, "alerts-audit-hold", time.Hour, "an audit finding stays open until this long passes without another matching event")
+	fs.IntVar(&a.auditDeniedBurst, "alerts-audit-denied-burst", 20, "audit-denied-burst: this many denied requests by one actor within -alerts-audit-denied-window")
+	dur(&a.auditDeniedWindow, "alerts-audit-denied-window", 10*time.Minute, "the window of -alerts-audit-denied-burst")
+	fs.StringVar(&a.agents, "alerts-agents", "auto", "the agent-missing check: on, off, or auto (on when every agent report reaches this replica: the memory store's single replica, or -agent-fanout)")
+	fs.StringVar(&a.agentDaemonSet, "agent-daemonset", "", "the node agent DaemonSet as namespace/name; nodes running its pod must report (agent-missing). The chart sets it")
+	fs.BoolVar(&a.agentFanout, "agent-fanout", false, "every agent report reaches every replica: agents post to each replica, or there is only one (the chart sets it with agent.fanout or replicas: 1)")
+	fs.StringVar(&a.digestAt, "alerts-digest-at", "", "when the standing-state digests go out: \"Mon 09:00\" weekly, \"09:00\" daily; empty turns them off")
+	fs.StringVar(&a.digestTZ, "alerts-digest-tz", "UTC", "the time zone of -alerts-digest-at (an IANA name such as Europe/Berlin)")
+	fs.StringVar(&a.digestKinds, "alerts-digest-kinds", strings.Join(alerts.DigestKinds(), ","), "standing digests to send, comma-separated: "+strings.Join(alerts.DigestKinds(), ","))
+	fs.IntVar(&a.certDigestDays, "alerts-cert-digest-days", alerts.DefaultCertDigestDays, "with the certificates digest, an expiring certificate with more days left is only listed there; it alerts on its own once fewer are left")
+}
+
+// checkSet reads a comma-separated list of names from allowed into a set.
+func checkSet(flagName, raw string, allowed []string) (map[string]bool, error) {
+	ok := map[string]bool{}
+	for _, c := range allowed {
+		ok[c] = true
+	}
+	out := map[string]bool{}
+	for _, c := range splitList(raw) {
+		if !ok[c] {
+			return nil, fmt.Errorf("-%s: unknown %q; use %s", flagName, c, strings.Join(allowed, ", "))
+		}
+		out[c] = true
+	}
+	return out, nil
+}
+
+// auditEnabled is -alerts-audit as a set.
+func (a *alertsConfig) auditEnabled() (map[string]bool, error) {
+	switch strings.TrimSpace(a.auditChecks) {
+	case "all":
+		return checkSet("alerts-audit", strings.Join(alerts.AuditChecks(), ","), alerts.AuditChecks())
+	case "none", "":
+		return map[string]bool{}, nil
+	}
+	return checkSet("alerts-audit", a.auditChecks, alerts.AuditChecks())
+}
+
+// agentsOn resolves -alerts-agents: auto runs the agent-missing check only
+// where every agent report reaches this replica, so a replica that hears
+// from some agents does not call the others missing.
+func (a *alertsConfig) agentsOn(c *config) bool {
+	switch a.agents {
+	case "on":
+		return true
+	case "auto":
+		return a.agentDaemonSet != "" && c.agentToken != "" && (c.auditStore != "postgres" || a.agentFanout)
+	}
+	return false
+}
+
+// digestSchedule parses -alerts-digest-at in -alerts-digest-tz.
+func (a *alertsConfig) digestSchedule() (alerts.DigestSchedule, error) {
+	s, err := alerts.ParseDigestSchedule(a.digestAt, a.digestTZ)
+	if err != nil {
+		return s, fmt.Errorf("-alerts-digest-at: %w", err)
+	}
+	return s, nil
 }
 
 // endpoints parses -alertmanager-url.
@@ -148,7 +232,85 @@ func (a *alertsConfig) validate(c *config) error {
 	if u, err := url.Parse(a.runbookURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("-alerts-runbook-url %q: want an http(s) URL", a.runbookURL)
 	}
+	return a.validateCatalog(c)
+}
+
+// validateCatalog checks the flags of the checks and the standing digests.
+func (a *alertsConfig) validateCatalog(c *config) error {
+	if _, err := checkSet("alerts-disable-checks", a.disableChecks, alerts.Checks()); err != nil {
+		return err
+	}
+	if _, err := a.auditEnabled(); err != nil {
+		return err
+	}
+	if _, err := checkSet("alerts-audit-production-only", a.auditProdOnly, alerts.AuditChecks()); err != nil {
+		return err
+	}
+	switch {
+	case a.auditHold < 10*time.Minute || a.auditHold > 24*time.Hour:
+		return errors.New("-alerts-audit-hold must be from 10m to 24h")
+	case a.auditDeniedBurst < 2:
+		return errors.New("-alerts-audit-denied-burst must be at least 2")
+	case a.auditDeniedWindow < time.Minute || a.auditDeniedWindow > a.auditHold:
+		return errors.New("-alerts-audit-denied-window must be from 1m to -alerts-audit-hold")
+	case a.certDigestDays < 1 || a.certDigestDays > 365:
+		return errors.New("-alerts-cert-digest-days must be from 1 to 365")
+	}
+	if _, err := a.digestSchedule(); err != nil {
+		return err
+	}
+	if _, err := checkSet("alerts-digest-kinds", a.digestKinds, alerts.DigestKinds()); err != nil {
+		return err
+	}
+	if a.agentDaemonSet != "" {
+		ns, name, ok := alerts.SplitDaemonSet(a.agentDaemonSet)
+		if !ok || !validDNSLabel(ns) || !validDNSSubdomain(name) {
+			return fmt.Errorf("-agent-daemonset %q: want namespace/name", a.agentDaemonSet)
+		}
+	}
+	switch a.agents {
+	case "auto", "off":
+	case "on":
+		if a.agentDaemonSet == "" {
+			return errors.New("-alerts-agents=on needs -agent-daemonset (namespace/name of the node agent DaemonSet)")
+		}
+		if c.agentToken == "" {
+			return errors.New("-alerts-agents=on needs -agent-token: without it no agent reports")
+		}
+	default:
+		return fmt.Errorf("-alerts-agents %q: use auto, on or off", a.agents)
+	}
 	return nil
+}
+
+// validDNSLabel reports whether s is a DNS-1123 label (a namespace name).
+func validDNSLabel(s string) bool {
+	if len(s) == 0 || len(s) > 63 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-' && i > 0 && i < len(s)-1:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validDNSSubdomain reports whether s is a DNS-1123 subdomain (an object
+// name).
+func validDNSSubdomain(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for _, part := range strings.Split(s, ".") {
+		if !validDNSLabel(part) {
+			return false
+		}
+	}
+	return true
 }
 
 // externalOrigin checks -external-url and returns its origin
@@ -172,34 +334,105 @@ type alertsSetup struct {
 	leaks   func() (detectors.LeakReport, time.Duration, bool)
 	pg      *pgstore.Store // nil: the memory store, this replica alone
 	kick    <-chan struct{}
+	// audit is the audit store the audit checks read (nil: none, so they are
+	// off), and auditHealth whether it can be read now (nil: always).
+	audit       audit.Store
+	auditHealth func() error
+	// procs is the node agents' store (nil without -agent-token).
+	procs *procmon.Store
+}
+
+// catalog resolves which checks run and how: the disabled checks (with the
+// audit checks -alerts-audit leaves out or no audit store backs, and
+// agent-missing when it is off), the audit options, the agent DaemonSet
+// and the digests.
+func (s alertsSetup) catalog() (alerts.Options, error) {
+	a := s.cfg.alerts
+	var o alerts.Options
+	disabled, err := checkSet("alerts-disable-checks", a.disableChecks, alerts.Checks())
+	if err != nil {
+		return o, err
+	}
+	enabled, err := a.auditEnabled()
+	if err != nil {
+		return o, err
+	}
+	for _, c := range alerts.AuditChecks() {
+		if !enabled[c] || s.audit == nil {
+			disabled[c] = true
+		}
+	}
+	if a.agentsOn(s.cfg) && s.procs != nil {
+		o.AgentDaemonSet = a.agentDaemonSet
+	} else {
+		disabled[alerts.CheckAgentMissing] = true
+	}
+	o.Disabled = disabled
+	prodOnly, err := checkSet("alerts-audit-production-only", a.auditProdOnly, alerts.AuditChecks())
+	if err != nil {
+		return o, err
+	}
+	red, err := incidents.NewRedactor(s.cfg.incidents.redactPatterns)
+	if err != nil {
+		return o, err
+	}
+	o.Audit = alerts.AuditOptions{ProductionOnly: prodOnly, Hold: a.auditHold, DeniedBurst: a.auditDeniedBurst,
+		DeniedWindow: a.auditDeniedWindow, Redact: red.String}
+	sched, err := a.digestSchedule()
+	if err != nil {
+		return o, err
+	}
+	o.Digests = alerts.DigestOptions{Schedule: sched, Kinds: splitList(a.digestKinds), CertDays: a.certDigestDays, PVCMinAge: s.cfg.pvcMinAge}
+	if o.Digests.Kinds == nil {
+		o.Digests.Kinds = []string{}
+	}
+	return o, nil
+}
+
+// input is what each evaluation judges: the current view, the leak scan,
+// the audit store while it can be read, and the agents' reports.
+func (s alertsSetup) input(agents bool) (alerts.Input, bool) {
+	v := s.current()
+	if v == nil {
+		return alerts.Input{}, false
+	}
+	in := alerts.Input{View: v, Now: time.Now()}
+	if rep, _, ok := s.leaks(); ok && !rep.GeneratedAt.IsZero() {
+		in.Leaks = &rep
+	}
+	if s.audit != nil && (s.auditHealth == nil || s.auditHealth() == nil) {
+		in.Audit = s.audit
+	}
+	if agents && s.procs != nil {
+		as := s.procs.Agents()
+		last := make(map[string]time.Time, len(as))
+		for _, x := range as {
+			last[x.Node] = x.LastReport
+		}
+		in.Agents = &alerts.AgentReports{Interval: s.procs.Options().Interval, Last: last}
+	}
+	return in, true
 }
 
 // start builds the sink and the runner and starts them; the runner serves
 // /alerts, /info's alerts and the Overview's widget.
 func (s alertsSetup) start(ctx context.Context, srv *api.Server) (*alerts.Runner, error) {
 	a := s.cfg.alerts
+	o, err := s.catalog()
+	if err != nil {
+		return nil, err
+	}
 	sink, err := s.sink(ctx)
 	if err != nil {
 		return nil, err
 	}
+	o.Resend, o.ResolveGrace, o.MaxNew, o.DefaultOwner = a.resend, a.resolveGrace, a.maxNew, strings.TrimSpace(a.defaultOwner)
+	o.OwnerMaxNew, o.OwnerWindow, o.MaxSilence = a.ownerMaxNew, a.ownerWindow, a.maxSilence
+	o.LeakCritHours, o.ExternalURL, o.RunbookURL, o.Cluster = a.leakCritHours, a.externalURL, a.runbookURL, s.cfg.clusterName
+	agents := o.AgentDaemonSet != ""
 	r := &alerts.Runner{
-		Sink: sink, Kick: s.kick, Interval: a.interval,
-		Options: alerts.Options{
-			Resend: a.resend, ResolveGrace: a.resolveGrace, MaxNew: a.maxNew, DefaultOwner: strings.TrimSpace(a.defaultOwner),
-			OwnerMaxNew: a.ownerMaxNew, OwnerWindow: a.ownerWindow, MaxSilence: a.maxSilence,
-			LeakCritHours: a.leakCritHours, ExternalURL: a.externalURL, RunbookURL: a.runbookURL, Cluster: s.cfg.clusterName,
-		},
-		Input: func() (alerts.Input, bool) {
-			v := s.current()
-			if v == nil {
-				return alerts.Input{}, false
-			}
-			in := alerts.Input{View: v, Now: time.Now()}
-			if rep, _, ok := s.leaks(); ok && !rep.GeneratedAt.IsZero() {
-				in.Leaks = &rep
-			}
-			return in, true
-		},
+		Sink: sink, Kick: s.kick, Interval: a.interval, Options: o,
+		Input:      func() (alerts.Input, bool) { return s.input(agents) },
 		OnEvaluate: observeEvaluation,
 		OnLeader:   observeLeader,
 		Logger:     slog.Default(),
@@ -220,15 +453,27 @@ func (s alertsSetup) start(ctx context.Context, srv *api.Server) (*alerts.Runner
 	for _, reason := range []string{alerts.DigestMaxNew, alerts.DigestOwnerBudget} {
 		metrics.AlertsDigested.With(reason).Add(0)
 	}
+	for _, kind := range o.Digests.Kinds {
+		metrics.AlertsStandingDigests.With(kind).Add(0)
+	}
 	go r.Run(ctx)
 	srv.Alerts = r
 	store := "memory (this replica alone; state is lost on restart)"
 	if s.pg != nil {
 		store = "postgres (the replica holding the alerts lock evaluates)"
 	}
+	var off []string
+	for c := range o.Disabled {
+		off = append(off, c)
+	}
+	sort.Strings(off)
 	slog.Info("alerting on", "sink", sink.Status().Name, "store", store, "interval", a.interval, "resend", a.resend,
 		"resolveGrace", a.resolveGrace, "maxNew", a.maxNew, "ownerMaxNew", a.ownerMaxNew, "ownerWindow", a.ownerWindow,
-		"maxSilence", a.maxSilence, "defaultOwner", a.defaultOwner, "externalURL", a.externalURL)
+		"maxSilence", a.maxSilence, "defaultOwner", a.defaultOwner, "externalURL", a.externalURL,
+		"checksOff", off, "agentDaemonSet", o.AgentDaemonSet, "digests", o.Digests.Schedule.String(), "digestKinds", o.Digests.Kinds)
+	if a.agents == "auto" && !agents && a.agentDaemonSet != "" && s.procs != nil {
+		slog.Info("alerts: agent-missing is off: with several replicas and no agent fan-out, a replica hears from only some agents (set -agent-fanout or -alerts-agents=on)")
+	}
 	return r, nil
 }
 
@@ -317,6 +562,9 @@ func observeEvaluation(res alerts.Result, took time.Duration, err error) {
 	}
 	for reason, n := range res.Digested {
 		metrics.AlertsDigested.With(reason).Add(float64(n))
+	}
+	for kind, n := range res.StandingDigests {
+		metrics.AlertsStandingDigests.With(kind).Add(float64(n))
 	}
 	for _, check := range alerts.Checks() {
 		for _, sev := range []string{alerts.SeverityWarning, alerts.SeverityCritical} {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ByronGary/kubesentry/internal/alerts"
 	"github.com/ByronGary/kubesentry/internal/audit"
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
@@ -254,6 +255,10 @@ func namespacesIn(raw json.RawMessage) (map[string]int, int) {
 // capability, and carol, who holds nothing, gets empty lists.
 func TestNoAuthorizationLeaks(t *testing.T) {
 	s, _ := withTenantIncidents(t, tenantServer(t))
+	// Audit and agent findings too: alice may see team-a's audit activity
+	// (ViewAudit there), never the cluster's (no ViewClusterAudit) nor the
+	// agents' (no ViewAgents).
+	s.Alerts.(*staticAlerts).set(append(tenantFindings(), gatedFindings()...))
 	h := s.Handler()
 	routes := []string{
 		"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/security?view=summary",
@@ -420,8 +425,9 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	if strings.Join(ov.Namespaces, ",") != "team-a" || ov.Activity == nil || len(ov.Activity.ProductionNamespaces) != 0 {
 		t.Errorf("alice's namespaces %v, production namespaces %+v", ov.Namespaces, ov.Activity)
 	}
-	// Alerts: her namespace's findings (an open one and one resolved within
-	// the day), never RBAC drift (no ViewRBAC in team-a, no ViewClusterRBAC);
+	// Alerts: her namespace's findings (two open, one resolved within the
+	// day) with team-a's audit activity, never RBAC drift (no ViewRBAC in
+	// team-a, no ViewClusterRBAC), cluster audit activity or missing agents;
 	// the Overview's widget counts the same.
 	var al alertsResponse
 	getAs(t, h, "alice", "/api/v1/alerts", &al)
@@ -429,12 +435,19 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	for _, f := range al.Items {
 		keys = append(keys, f.Key)
 	}
-	if strings.Join(keys, " ") != "workload-unhealthy/Deployment/team-a/web pod-evicted/Deployment/team-a/web" ||
-		al.Counts["open"] != 1 || al.Counts["resolved"] != 1 {
+	if strings.Join(keys, " ") != "workload-unhealthy/Deployment/team-a/web audit-exec/User/team-a/dave@example.com pod-evicted/Deployment/team-a/web" ||
+		al.Counts["open"] != 2 || al.Counts["resolved"] != 1 {
 		t.Errorf("alice's alerts = %v, counts %v", keys, al.Counts)
 	}
-	if ov.Alerts == nil || ov.Alerts.Open != 1 || len(ov.Alerts.ByOwner) != 1 || ov.Alerts.ByOwner["team-alpha"] != 1 {
+	if ov.Alerts == nil || ov.Alerts.Open != 2 || len(ov.Alerts.ByOwner) != 1 || ov.Alerts.ByOwner["team-alpha"] != 2 {
 		t.Errorf("alice's overview alerts = %+v", ov.Alerts)
+	}
+	var bobAl alertsResponse
+	getAs(t, h, "bob", "/api/v1/alerts", &bobAl)
+	for _, f := range bobAl.Items {
+		if f.Gate() == alerts.GateAudit || f.Gate() == alerts.GateAgents {
+			t.Errorf("bob (no ViewAudit, ViewClusterAudit or ViewAgents) sees %s", f.Key)
+		}
 	}
 	var carolOv overviewResponse
 	getAs(t, h, "carol", "/api/v1/overview", &carolOv)

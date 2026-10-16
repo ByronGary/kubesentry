@@ -76,6 +76,10 @@ type Status struct {
 	LastSentAt time.Time
 	LastError  string
 	Leader     bool
+	// LastDigestAt is when a standing digest was last sent (zero: never, or
+	// not read yet); NextDigestAt the next scheduled time (zero: digests are
+	// off).
+	LastDigestAt, NextDigestAt time.Time
 }
 
 // Runner keeps the evaluator running on the leader and the board fresh
@@ -111,6 +115,7 @@ type Runner struct {
 	leading    atomic.Bool
 	version    atomic.Uint64
 	incidentOf atomic.Pointer[func(*Finding) string]
+	lastDigest atomic.Int64 // Unix nanoseconds; 0 for never
 
 	initOnce sync.Once
 	log      *actionLog    // the actions log as this replica read it; the leader's evaluator shares it
@@ -181,7 +186,18 @@ func (r *Runner) Status() Status {
 		st := r.Sink.Status()
 		s.Sink, s.LastSentAt, s.LastError = st.Name, st.LastSent, st.LastError
 	}
+	if n := r.lastDigest.Load(); n != 0 {
+		s.LastDigestAt = time.Unix(0, n).UTC()
+	}
+	s.NextDigestAt = r.Options.Digests.Schedule.Next(r.now())
 	return s
+}
+
+// setLastDigest records when a standing digest was last sent.
+func (r *Runner) setLastDigest(t time.Time) {
+	if !t.IsZero() {
+		r.lastDigest.Store(t.UnixNano())
+	}
 }
 
 // Run evaluates (leading) or follows until ctx ends.
@@ -242,6 +258,11 @@ func (r *Runner) refresh(ctx context.Context) {
 	}
 	if err := r.log.sync(ctx, r.Store, r.now()); err != nil && ctx.Err() == nil {
 		r.Logger.Warn("alerts: reading the actions log failed; acknowledgements and silences may lag", "err", err)
+	}
+	if r.Options.Digests.Schedule.Enabled() {
+		if runs, err := r.Store.DigestRuns(ctx); err == nil {
+			r.setLastDigest(latestRun(runs))
+		}
 	}
 	r.publish(fs, false)
 }
@@ -337,9 +358,15 @@ func (r *Runner) lead(ctx context.Context, l Lease) {
 			r.Logger.Warn("alerts: evaluation failed; retrying at the next one", "err", err)
 		case err == nil:
 			r.publish(ev.Findings(), true)
-			if res.New > 0 || res.Resolved > 0 || len(res.Baselined) > 0 {
+			r.setLastDigest(ev.LastDigest())
+			if res.New > 0 || res.Resolved > 0 || len(res.Baselined) > 0 || len(res.StandingDigests) > 0 {
 				r.Logger.Info("alerts evaluated", "new", res.New, "resolved", res.Resolved, "open", res.Open, "sent", res.Sent,
-					"digest", res.Digest, "baselined", res.Baselined)
+					"digest", res.Digest, "baselined", res.Baselined, "standingDigests", res.StandingDigests)
+			}
+		}
+		for _, w := range res.Warnings {
+			if lctx.Err() == nil {
+				r.Logger.Warn("alerts: some checks were skipped", "err", w)
 			}
 		}
 		if now := in.Now; now.Sub(pruned) >= time.Hour {

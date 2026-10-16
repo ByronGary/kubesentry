@@ -1,0 +1,130 @@
+[
+  {
+    "labels": {
+      "alertname": "KubesentryAgentMissing",
+      "check": "agent-missing",
+      "cluster": "prod-eks",
+      "object": "DaemonSet/kubesentry/kubesentry-agent",
+      "owner": "platform",
+      "production": "false",
+      "severity": "warning"
+    },
+    "annotations": {
+      "count": "3",
+      "dedupe_key": "agent-missing/DaemonSet//kubesentry/kubesentry-agent",
+      "description": "The kubesentry agent on nodes n-never, n-silent, n-young has not reported for 45s (3 report intervals), though each runs a pod of DaemonSet kubesentry/kubesentry-agent: process data for their pods is missing or stale. Check the agent pod there (crash loop, OOM kill, network policy, the ingest token).",
+      "kubesentry_url": "https://kubesentry.example.com/#/agents",
+      "nodes": "n-never,n-silent,n-young",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryagentmissing",
+      "summary": "Agent DaemonSet kubesentry/kubesentry-agent: 3 nodes are not reporting"
+    },
+    "startsAt": "2026-10-12T12:00:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/agents"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryAuditActivity",
+      "check": "audit-anonymous",
+      "cluster": "prod-eks",
+      "namespace": "team-a",
+      "object": "User/system:anonymous",
+      "owner": "platform",
+      "production": "false",
+      "severity": "critical"
+    },
+    "annotations": {
+      "actor": "system:anonymous",
+      "actor_kind": "system",
+      "count": "1",
+      "dedupe_key": "audit-anonymous/User/team-a/system:anonymous",
+      "description": "system:anonymous (system) made requests without credentials that the API server allowed in namespace team-a, 1 time between 2026-10-12T12:01:00Z and 2026-10-12T12:01:00Z (list pods). The finding stays open until 1 hour passes without another such request. Requests without credentials should be refused: look for a binding to system:anonymous or system:unauthenticated.",
+      "examples": "2026-10-12T12:01:00Z list pods in team-a",
+      "first_at": "2026-10-12T12:01:00Z",
+      "kubesentry_url": "https://kubesentry.example.com/#/activity?tag=anonymous\u0026user=system%3Aanonymous",
+      "last_at": "2026-10-12T12:01:00Z",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryauditactivity",
+      "summary": "Audit: system:anonymous made requests without credentials that the API server allowed in namespace team-a (1 time)",
+      "verbs": "list pods"
+    },
+    "startsAt": "2026-10-12T12:05:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/activity?tag=anonymous\u0026user=system%3Aanonymous"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryAuditActivity",
+      "check": "audit-exec",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "object": "User/alice@example.com",
+      "owner": "payments",
+      "production": "true",
+      "severity": "warning"
+    },
+    "annotations": {
+      "actor": "alice@example.com",
+      "actor_kind": "user",
+      "count": "1",
+      "dedupe_key": "audit-exec/User/payments/alice@example.com",
+      "description": "alice@example.com (user) used exec, attach, port-forward or a debug container in namespace payments, 1 time between 2026-10-12T12:01:00Z and 2026-10-12T12:01:00Z (create pods/exec). The finding stays open until 1 hour passes without another such request.",
+      "examples": "2026-10-12T12:01:00Z create pods/exec payments/api-0: env PASSWORD=[REDACTED]",
+      "first_at": "2026-10-12T12:01:00Z",
+      "kubesentry_url": "https://kubesentry.example.com/#/activity?user=alice%40example.com",
+      "last_at": "2026-10-12T12:01:00Z",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryauditactivity",
+      "summary": "Audit: alice@example.com used exec, attach, port-forward or a debug container in namespace payments (1 time)",
+      "verbs": "create pods/exec"
+    },
+    "startsAt": "2026-10-12T12:05:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/activity?user=alice%40example.com"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryPrivilegedWorkload",
+      "check": "host-namespaces",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "owner": "payments",
+      "production": "true",
+      "severity": "critical",
+      "workload": "Deployment/hostnet"
+    },
+    "annotations": {
+      "dedupe_key": "host-namespaces/Deployment/payments/hostnet",
+      "description": "kubesentry saw this appear since its last evaluation: Deployment payments/hostnet: Shares the node's namespaces: hostNetwork.",
+      "kubesentry_url": "https://kubesentry.example.com/#/security?check=host-namespaces\u0026q=payments%2Fhostnet",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryprivilegedworkload",
+      "summary": "Privileged workload: new use of host namespaces: Deployment payments/hostnet"
+    },
+    "startsAt": "2026-10-12T12:05:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/security?check=host-namespaces\u0026q=payments%2Fhostnet"
+  },
+  {
+    "labels": {
+      "alertname": "KubesentryExposureChange",
+      "check": "loadbalancer",
+      "cluster": "prod-eks",
+      "kubesentry_slack_channel": "#payments-alerts",
+      "namespace": "payments",
+      "object": "Service/new-lb",
+      "owner": "payments",
+      "production": "true",
+      "severity": "warning"
+    },
+    "annotations": {
+      "dedupe_key": "loadbalancer/Service/payments/new-lb",
+      "description": "kubesentry saw this appear since its last evaluation: Service payments/new-lb: Internet-facing load balancer at a.elb.amazonaws.com.",
+      "kubesentry_url": "https://kubesentry.example.com/#/security?check=loadbalancer\u0026q=payments%2Fnew-lb",
+      "runbook_url": "https://github.com/ByronGary/kubesentry/blob/main/docs/alerts.md#kubesentryexposurechange",
+      "summary": "Exposure change: new internet-facing load balancer: Service payments/new-lb"
+    },
+    "startsAt": "2026-10-12T12:05:00Z",
+    "endsAt": "2026-10-12T12:14:00Z",
+    "generatorURL": "https://kubesentry.example.com/#/security?check=loadbalancer\u0026q=payments%2Fnew-lb"
+  }
+]

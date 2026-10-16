@@ -203,37 +203,13 @@ func run(cfg *config) error {
 	}
 	defer closers.close()
 
-	var alertsRunner *alerts.Runner
-	if cfg.alerts.enabled {
-		if cfg.auditStore != "postgres" {
-			slog.Warn("alerts with the memory store: run one replica; with more, each would notify on its own (use -audit-store=postgres)")
-		}
-		alertsRunner, err = alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built.subscribe()}.start(ctx, srv)
-		if err != nil {
-			return fmt.Errorf("alerts: %w", err)
-		}
-	}
-
-	if cfg.incidents.enabled {
-		if cfg.auditStore != "postgres" {
-			slog.Warn("incidents with the memory store: run one replica; with more, each would keep incidents of its own (use -audit-store=postgres)")
-		}
-		var auditStore audit.Store
-		if ing, ok := srv.Audit.(*audit.Ingester); ok {
-			auditStore = ing.Active()
-		}
-		_, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
-			pg: pg, audit: auditStore, alerts: alertsRunner, cw: cwl}.start(ctx, srv)
-		if err != nil {
-			return fmt.Errorf("incidents: %w", err)
-		}
-	}
-
+	// The node agents' store, before the alerts: agent-missing reads it.
+	var procs *procmon.Store
 	if cfg.agentToken != "" {
-		store := procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})
-		srv.Processes = store
+		procs = procmon.NewStoreWithOptions(procmon.StoreOptions{Interval: cfg.agentInterval})
+		srv.Processes = procs
 		srv.AgentToken = cfg.agentToken
-		metrics.AgentNodesReporting.SetFunc(func() float64 { return float64(store.Reporting()) })
+		metrics.AgentNodesReporting.SetFunc(func() float64 { return float64(procs.Reporting()) })
 		go func() {
 			// Forget silent nodes even when no agent reports at all.
 			t := time.NewTicker(cfg.agentInterval)
@@ -243,10 +219,38 @@ func run(cfg *config) error {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					store.Sweep()
+					procs.Sweep()
 				}
 			}
 		}()
+	}
+
+	var auditStore audit.Store
+	if ing, ok := srv.Audit.(*audit.Ingester); ok {
+		auditStore = ing.Active()
+	}
+
+	var alertsRunner *alerts.Runner
+	if cfg.alerts.enabled {
+		if cfg.auditStore != "postgres" {
+			slog.Warn("alerts with the memory store: run one replica; with more, each would notify on its own (use -audit-store=postgres)")
+		}
+		alertsRunner, err = alertsSetup{cfg: cfg, current: current, leaks: metricsSource.LeakReport, pg: pg, kick: built.subscribe(),
+			audit: auditStore, auditHealth: srv.AuditHealth, procs: procs}.start(ctx, srv)
+		if err != nil {
+			return fmt.Errorf("alerts: %w", err)
+		}
+	}
+
+	if cfg.incidents.enabled {
+		if cfg.auditStore != "postgres" {
+			slog.Warn("incidents with the memory store: run one replica; with more, each would keep incidents of its own (use -audit-store=postgres)")
+		}
+		_, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
+			pg: pg, audit: auditStore, alerts: alertsRunner, cw: cwl}.start(ctx, srv)
+		if err != nil {
+			return fmt.Errorf("incidents: %w", err)
+		}
 	}
 
 	srv.Checks = append(srv.Checks, api.HealthCheck{Name: "snapshot", Check: func(context.Context) error {

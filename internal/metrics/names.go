@@ -86,6 +86,10 @@ var (
 	// ("max_new": more than -alerts-max-new at once; "owner_budget": the
 	// owner's -alerts-owner-max-new per -alerts-owner-window was spent).
 	AlertsDigested = NewCounterVec("kubesentry_alerts_digested_total", "New alert findings sent in a per-owner digest instead of alone, by reason.", "reason")
+	// AlertsStandingDigests counts the standing-state digests sent (one per
+	// owner and kind at each scheduled time). Label: kind ("rbac-posture",
+	// "unused-volumes", "certificates").
+	AlertsStandingDigests = NewCounterVec("kubesentry_alerts_standing_digests_total", "Standing-state digest alerts sent, one per owner, by kind.", "kind")
 	// AlertActions counts acknowledgements and silences, per finding.
 	// Labels: action ("ack", "unack", "silence", "unsilence"), result ("ok",
 	// "forbidden", "not_found", "invalid", "resolved").
