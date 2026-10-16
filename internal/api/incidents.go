@@ -592,7 +592,7 @@ func (s *Server) incidentDetail(w http.ResponseWriter, r *http.Request) {
 	red := s.Incidents.Redactor()
 	resp := incidentDetailResponse{
 		Incident: gateIncident(d.Incident, acc.audit, acc.cloudtrail),
-		Window:   incidentWindow{From: d.From, To: d.To},
+		Window:   incidentWindow{From: incidents.NormalTime(d.From), To: incidents.NormalTime(d.To)},
 		Signals:  []incidents.BundleSignal{}, Events: []incidents.BundleEvent{}, Series: d.Series, Thresholds: d.Thresholds,
 		Related: []incidentRef{}, Sources: acc.gateSources(d.Sources), Warnings: d.Warnings,
 	}
@@ -682,7 +682,7 @@ func (s *Server) incidentLogs(w http.ResponseWriter, r *http.Request) {
 		upstreamError(w, "logs", err)
 		return
 	}
-	resp := incidentLogsResponse{From: res.From, To: res.To, Source: res.Source, Lines: res.Lines, Truncated: res.Truncated, Warnings: res.Warnings}
+	resp := incidentLogsResponse{From: incidents.NormalTime(res.From), To: incidents.NormalTime(res.To), Source: res.Source, Lines: res.Lines, Truncated: res.Truncated, Warnings: res.Warnings}
 	if resp.Lines == nil {
 		resp.Lines = []incidents.LogLine{}
 	}
@@ -805,6 +805,7 @@ func (s *Server) incidentBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.Incident = gateIncident(b.Incident, acc.audit, acc.cloudtrail)
+	b.Window = incidents.BundleWindow{From: incidents.NormalTime(b.Window.From), To: incidents.NormalTime(b.Window.To)}
 	if !acc.nodes || in.Subject.Namespace != "" {
 		evs := b.Events[:0]
 		for _, e := range b.Events {

@@ -13,6 +13,7 @@ import (
 
 // event describes one synthetic audit record.
 type event struct {
+	id          string // default demo-<n>
 	ago         time.Duration
 	user        string
 	verb        string
@@ -131,10 +132,18 @@ func SeedAudit(ing *audit.Ingester, now time.Time) error {
 		})
 	}
 
+	// The edit that precedes the checkout-web incident (incidents.go).
+	events = append(events, event{id: configPatchAuditID, ago: configPatchAgo, user: "dave", verb: "patch", resource: "configmaps",
+		ns: "prod", name: "checkout-web-config", code: 200})
+
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf) // one JSON document per line, like an audit log file
 	for i, e := range events {
-		if err := enc.Encode(rawEvent(fmt.Sprintf("demo-%03d", i+1), now, e)); err != nil {
+		id := e.id
+		if id == "" {
+			id = fmt.Sprintf("demo-%03d", i+1)
+		}
+		if err := enc.Encode(rawEvent(id, now, e)); err != nil {
 			return err
 		}
 	}

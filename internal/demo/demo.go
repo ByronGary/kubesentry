@@ -45,6 +45,12 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 		}}
 	go func() { _ = views.Run(ctx) }()
 
+	metrics := NewMetrics(cluster, now)
+	inc, incStore, err := NewIncidents(ctx, cluster, metrics, ing.Active(), policy, now)
+	if err != nil {
+		return nil, err
+	}
+
 	return &api.Server{
 		History:       hist,
 		Cluster:       cluster,
@@ -52,8 +58,10 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 		Policy:        policy,
 		ResponseCache: &api.ResponseCache{MaxBytes: 16 << 20},
 		Processes:     procs,
-		Metrics:       NewMetrics(cluster, now),
+		Metrics:       metrics,
 		Audit:         ing,
+		Incidents:     inc,
+		IncidentStore: incStore,
 		UI:            ui,
 		Demo:          true,
 		PVCOptions:    detectors.PVCOptions{MinAge: 24 * time.Hour},

@@ -87,9 +87,16 @@ func TestDemoOverview(t *testing.T) {
 			t.Errorf("prod item without its owner: %+v", a)
 		}
 	}
-	for _, k := range []string{"crashloop", "leak"} {
+	// recommendations' crash loop folds into its open incident, which links
+	// to the incident page.
+	for _, k := range []string{"incident", "leak"} {
 		if !kinds[k] {
 			t.Errorf("no %s item in %+v", k, o.Attention)
+		}
+	}
+	for _, a := range o.Attention {
+		if a.Name == "recommendations" && (a.Kind != "incident" || !strings.HasPrefix(a.Href, "#/incidents/") || !strings.Contains(a.Title, "(+1 more)")) {
+			t.Errorf("recommendations item = %+v", a)
 		}
 	}
 	if o.Pods.Failing == 0 || o.Pods.ByReason["CrashLoopBackOff"] == 0 {
@@ -106,7 +113,7 @@ func TestDemoOverview(t *testing.T) {
 	if o.Certificates == nil || o.Certificates.NotReady == 0 || o.Waste.UnusedPVCs == 0 || o.Waste.MonthlyUSD <= 0 {
 		t.Errorf("certificates %+v waste %+v", o.Certificates, o.Waste)
 	}
-	for _, b := range []string{"workloads", "pods", "findings", "memory", "security", "certificates"} {
+	for _, b := range []string{"workloads", "pods", "findings", "memory", "security", "certificates", "incidents"} {
 		if o.Badges[b].Count == 0 {
 			t.Errorf("no %s badge: %v", b, o.Badges)
 		}
