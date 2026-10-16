@@ -410,6 +410,25 @@ rules:
 
 ---
 # Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/alerts: acknowledge and silence the alerts one can see: bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped findings; kubesentry never writes to the cluster or to Alertmanager's silences.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-alerts-responder
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["alerts"]
+    verbs: ["update"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
 # An incident's container logs, per namespace: the permission kubectl logs
 # needs, which kubesentry checks for each user. The built-in view role already
 # grants it; this role is for users who have narrower roles.
@@ -807,9 +826,12 @@ spec:
             - -alertmanager-url=https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012/alertmanager
             - -alerts-default-owner=platform
             - -alerts-interval=30s
+            - -alerts-max-silence=7d
+            - -alerts-owner-window=15m
             - -alerts-resend=1m
             - -alerts-resolve-grace=5m
             - -alerts-max-new=50
+            - -alerts-owner-max-new=20
             - -external-url=https://kubesentry.prod.example.com
             - -prometheus-url=https://aps-workspaces.us-east-1.amazonaws.com/workspaces/ws-12345678-abcd-1234-abcd-123456789012
             - -prometheus-sigv4=true

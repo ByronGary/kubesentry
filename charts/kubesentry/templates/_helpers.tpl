@@ -311,6 +311,7 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- $a = append $a "-addr=:8080" -}}
 {{- end -}}
 {{- with $v.server.allowedHosts }}{{ $a = append $a (printf "-allowed-hosts=%s" (join "," .)) }}{{ end -}}
+{{- with $v.server.allowedOrigins }}{{ $a = append $a (printf "-allowed-origins=%s" (join "," .)) }}{{ end -}}
 {{- $a = append $a "-ingest-addr=:8081" -}}
 {{- $a = append $a "-ops-addr=:9090" -}}
 {{- if $v.server.pprof }}{{ $a = append $a "-pprof=true" }}{{ end -}}
@@ -374,16 +375,18 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- if $al.alertmanager.sigv4 }}{{ $a = append $a "-alertmanager-sigv4=true" }}{{ end -}}
 {{- with $al.alertmanager.basicAuth.username }}{{ $a = append $a (printf "-alertmanager-basic-auth-user=%s" .) }}{{ end -}}
 {{- if or $al.alertmanager.ca.configMap $al.alertmanager.ca.secret }}{{ $a = append $a (printf "-alertmanager-ca-file=/etc/kubesentry/alertmanager-ca/%s" $al.alertmanager.ca.key) }}{{ end -}}
-{{- range $flag, $val := dict "alerts-interval" $al.interval "alerts-resend" $al.resend "alerts-resolve-grace" $al.resolveGrace "alerts-default-owner" $al.defaultOwner "alerts-runbook-url" $al.runbookBaseURL -}}
+{{- range $flag, $val := dict "alerts-interval" $al.interval "alerts-resend" $al.resend "alerts-resolve-grace" $al.resolveGrace "alerts-default-owner" $al.defaultOwner "alerts-runbook-url" $al.runbookBaseURL "alerts-owner-window" $al.ownerWindow "alerts-max-silence" $al.maxSilence -}}
 {{- with $val }}{{ $a = append $a (printf "-%s=%s" $flag .) }}{{ end -}}
 {{- end -}}
 {{- if not (kindIs "invalid" $al.maxNew) }}{{ $a = append $a (printf "-alerts-max-new=%s" (include "kubesentry.scalar" $al.maxNew)) }}{{ end -}}
+{{- if not (kindIs "invalid" $al.ownerMaxNew) }}{{ $a = append $a (printf "-alerts-owner-max-new=%s" (include "kubesentry.scalar" $al.ownerMaxNew)) }}{{ end -}}
 {{- if not (kindIs "invalid" $al.leakCritHours) }}{{ $a = append $a (printf "-alerts-leak-crit-hours=%s" (include "kubesentry.scalar" $al.leakCritHours)) }}{{ end -}}
-{{- with $v.externalURL }}{{ $a = append $a (printf "-external-url=%s" .) }}{{ end -}}
 {{- else if $v.incidents.enabled -}}
 {{- /* Incidents in a namespace without an owner annotation belong to the alerts' default owner. */ -}}
 {{- with $al.defaultOwner }}{{ $a = append $a (printf "-alerts-default-owner=%s" .) }}{{ end -}}
 {{- end -}}
+{{- /* Alert and incident links, and the origin browsers may send write requests from. */ -}}
+{{- with $v.externalURL }}{{ $a = append $a (printf "-external-url=%s" .) }}{{ end -}}
 {{- /* prometheus */ -}}
 {{- $p := $v.prometheus -}}
 {{- $region := include "kubesentry.awsRegion" . -}}

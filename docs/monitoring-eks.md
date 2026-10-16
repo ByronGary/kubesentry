@@ -175,10 +175,10 @@ There are two ways to use AMP:
    kubectl annotate namespace payments kubesentry.io/slack-channel='#payments-alerts'   # becomes kubesentry_slack_channel
    ```
 
-   A finding in a namespace without the annotation, or a cluster-scoped finding such as RBAC drift, gets `alerts.defaultOwner` (`platform`). It then falls through to the platform receivers, unless you give `owner="platform"` a branch of its own.
+   A finding in a namespace without the annotation, or a cluster-scoped finding such as RBAC drift, gets `alerts.defaultOwner` (`platform`). It then falls through to the platform receivers, unless you give `owner="platform"` a branch of its own. The same annotation on a workload, Service, Ingress, Certificate or RBAC object overrides its namespace's for that object's alerts; the namespace's routing hints then stay off them (`docs/alerts.md`, Owners).
 3. **Production.** The namespace label `environment=production` sets `production="true"`, so a route can page for production only (`matchers: ['production = "true"', 'severity = "critical"']`). Production-only checks, such as exec into a production pod, come in phase C.
-4. **Storms.** When more than `alerts.maxNew` (50) new findings appear at once, as on a first install, kubesentry sends one `KubesentryFindingsDigest` per owner with `kubesentry_digest="true"`, which the digest route below keeps quiet.
-5. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration. Duplicate posts (an HA pair, a leader change) are harmless: Alertmanager knows an alert by its label set.
+4. **Storms.** When more than `alerts.maxNew` (50) new findings appear at once, as on a first install, or one owner gets more than `alerts.ownerMaxNew` (20) in `alerts.ownerWindow` (15m), kubesentry sends one `KubesentryFindingsDigest` per owner with `kubesentry_digest="true"`, which the digest route below keeps quiet. A digested finding that turns critical fires on its own.
+5. **Alertmanager** does the rest: grouping, silences, inhibition and paging. kubesentry never writes to the cluster, and there is no ticketing integration. Acknowledging or silencing a finding in kubesentry (`docs/alerts.md`) changes what it posts (an ack adds `acknowledged_by`; a silence ends the alert, which receivers with `send_resolved` report as resolved), but never creates an Alertmanager silence. Duplicate posts (an HA pair, a leader change) are harmless: Alertmanager knows an alert by its label set.
 
 **Routing hints.** A receiver can take its destination from a hint instead of needing one branch per team. For example, one Slack receiver for every team that set `kubesentry.io/slack-channel`:
 

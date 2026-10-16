@@ -150,6 +150,7 @@ refuses guardrail-incident-logs-group --set incidents.enabled=true --set inciden
 # The schema rejects values the server would not understand.
 refuses schema-auth-mode --set auth.mode=sso
 refuses schema-production-label --set 'alerts.production.labelKey=bad key'
+refuses schema-allowed-origins --set 'server.allowedOrigins={portal.example.com}'
 # An incident covers at most 24 hours.
 refuses schema-incidents-max-range --set incidents.enabled=true --set incidents.maxRange=48h
 

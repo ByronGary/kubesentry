@@ -281,6 +281,26 @@ rules:
 
 ---
 # Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/alerts: acknowledge and silence the alerts one can see: bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped findings; kubesentry never writes to the cluster or to Alertmanager's silences.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-alerts-responder
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["alerts"]
+    verbs: ["update"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
 # An incident's container logs, per namespace: the permission kubectl logs
 # needs, which kubesentry checks for each user. The built-in view role already
 # grants it; this role is for users who have narrower roles.
@@ -611,6 +631,7 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - -addr=:8080
+            - -allowed-origins=https://portal.example.com
             - -ingest-addr=:8081
             - -ops-addr=:9090
             - -auth-mode=token
@@ -621,9 +642,12 @@ spec:
             - -alertmanager-ca-file=/etc/kubesentry/alertmanager-ca/ca.crt
             - -alerts-default-owner=platform-team
             - -alerts-interval=30s
+            - -alerts-max-silence=3d
+            - -alerts-owner-window=30m
             - -alerts-resend=1m
             - -alerts-resolve-grace=5m
             - -alerts-max-new=100
+            - -alerts-owner-max-new=10
             - -alerts-leak-crit-hours=12
             - -external-url=https://kubesentry.example.com
             - -prometheus-autodiscover=true

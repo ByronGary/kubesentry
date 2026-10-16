@@ -196,7 +196,8 @@
             "processViewer": { "$ref": "#/definitions/viewerRole" },
             "agentsViewer": { "$ref": "#/definitions/viewerRole" },
             "cloudtrailViewer": { "$ref": "#/definitions/viewerRole" },
-            "logsViewer": { "$ref": "#/definitions/viewerRole" }
+            "logsViewer": { "$ref": "#/definitions/viewerRole" },
+            "alertsResponder": { "$ref": "#/definitions/viewerRole" }
           }
         }
       }
@@ -216,6 +217,11 @@
         "maxInflight": { "$ref": "#/definitions/intOrNull" },
         "maxInflightPerIdentity": { "$ref": "#/definitions/intOrNull" },
         "allowedHosts": { "$ref": "#/definitions/stringList" },
+        "allowedOrigins": {
+          "description": "origins (scheme://host[:port]) browsers may send write requests from",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^https?://[^/?#@]+$" }
+        },
         "systemPrincipalPrefixes": { "$ref": "#/definitions/stringList" },
         "builtinRBACPrefixes": { "$ref": "#/definitions/stringList" },
         "nodeLabelKeysAdd": { "$ref": "#/definitions/stringList" }
@@ -514,6 +520,9 @@
         "resend": { "$ref": "#/definitions/duration" },
         "resolveGrace": { "$ref": "#/definitions/duration" },
         "maxNew": { "type": "integer", "minimum": 1 },
+        "ownerMaxNew": { "type": "integer", "minimum": 1 },
+        "ownerWindow": { "$ref": "#/definitions/duration" },
+        "maxSilence": { "$ref": "#/definitions/durationDaysOrNull" },
         "leakCritHours": { "$ref": "#/definitions/numberOrNull" },
         "runbookBaseURL": { "type": "string", "pattern": "^(https?://.+)?$" },
         "alertmanager": {

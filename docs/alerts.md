@@ -42,11 +42,42 @@ The other checks report standing state, so they do fire on the first run, under 
 
 ### Storm protection
 
-If more than `-alerts-max-new` (50) new alerts would fire in one evaluation, kubesentry sends one digest alert per owner instead, `KubesentryFindingsDigest` with `kubesentry_digest="true"`. This happens on a first install, or after a cluster-wide incident.
+New findings that would fire together are summed up per owner in one digest alert, `KubesentryFindingsDigest` with `kubesentry_digest="true"`, in this order:
+
+1. **The global breaker.** If more than `-alerts-max-new` (50) new alerts would fire in one evaluation, every one of them goes into its owner's digest. This happens on a first install, or after a cluster-wide incident.
+2. **The per-owner budget.** Otherwise each owner gets at most `-alerts-owner-max-new` (20) new alerts on their own in any `-alerts-owner-window` (15m, a sliding window kept by the evaluating replica); criticals take the budget first, and the rest join that owner's digest. One team's incident therefore never floods another team's pager, and a team's own storm reaches it as one message.
+3. **Promotion.** A digested finding that turns from warning to critical leaves the digest and fires on its own (at most `-alerts-max-new` per evaluation; the rest follow at the next ones).
+4. **What never counts.** Silenced findings and quiet ones (reported only in a standing digest) neither use a budget nor appear in a digest.
 
 - The monitoring profile routes digests to a quiet receiver, one message per owner per day.
-- The digest lists counts by alert and the 10 worst findings. It stays open while any of its findings is open, and ends when all of them have resolved.
-- Findings sent in a digest are marked `digest` and are not sent on their own later. Later new findings, if there are not too many, fire on their own as usual.
+- The digest lists counts by alert and the 10 worst findings. It stays open while any of its findings is open, and ends when all of them have resolved or left it.
+- Findings sent in a digest are marked `digest` and are not sent on their own later, unless they turn critical. Later new findings, within the limits, fire on their own as usual.
+- `kubesentry_alerts_digested_total{reason}` counts the findings digested by `max_new` and by `owner_budget`.
+
+### Acknowledging and silencing
+
+People act on findings through `POST /api/v1/alerts/actions` (section 4), which the Alerts page uses. It needs `update` on the virtual resource `alerts.kubesentry.io` where the finding is: per namespace through a RoleBinding, and cluster-wide (a ClusterRoleBinding) for cluster-scoped findings such as RBAC drift. The chart ships it as the ClusterRole `<release>-alerts-responder`; `rbac.viewerRoles.alertsResponder.aggregateTo: [edit]` adds it to the built-in `edit` (and so `admin`) role.
+
+| Action | Applies to | What Alertmanager gets |
+|---|---|---|
+| **ack** | the current episode (the finding's `firstSeen`). A new episode after a resolve starts unacknowledged, and an ack taken at warning no longer covers the finding while it is critical | the alert keeps being re-posted every `-alerts-resend`, at once with the annotations `acknowledged_by` and `acknowledged_at`. An ack does **not** stop Alertmanager's `repeat_interval`: to stop the reminders, add an Alertmanager silence |
+| **unack** | lifts the ack | the alert again at once, without the annotations |
+| **silence** | the finding's key, from 5m to `-alerts-max-silence` (7d, at most 30d), with a reason of 3 to 500 characters. It lasts across a resolve and a reopen | the alert once with `endsAt` = now and the annotations `silenced_by`, `silenced_until`, `silence_reason`, then nothing. Receivers with `send_resolved: true` therefore get a **resolved** notification when a finding is silenced |
+| **unsilence**, or the silence expires | lifts the silence | the alert fires again at once (`startsAt` = the episode's first seen) |
+
+- **kubesentry's own log.** Actions go to an append-only log (`alert_actions`) that every replica writes through its connection pool and reads: the leader applies them at its next evaluation, at most `-alerts-interval` later (within about a second when the action was taken on the leader itself), and every replica's board shows them at once on the replica that took them and within 15s elsewhere. kubesentry never writes to Alertmanager's silence API, and never to the cluster.
+- **Digests.** A silenced finding leaves its owner's digest; an acknowledged one stays in it.
+- **History.** `GET /api/v1/alerts/actions` lists who did what, for the findings the caller may see. The log is kept for the findings' retention (30 days) plus a day.
+
+### Owners
+
+Every alert has an `owner` label, taken in this order:
+
+1. **The object's own** owner annotation (`-owner-annotation`, `kubesentry.io/owner`) on the Deployment, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, cert-manager Certificate, Role, RoleBinding, ClusterRole or ClusterRoleBinding the finding names. The informer cache keeps this one annotation on these kinds, and no other.
+2. **Its namespace's** owner annotation.
+3. **`-alerts-default-owner`** (`platform`), also for cluster-scoped objects without one.
+
+Pods carry no annotations in kubesentry's cache: a workload's finding uses the workload's owner, and a bare pod's its namespace's. When the object names an owner other than its namespace's, the namespace's routing hints (`kubesentry_*` labels from `kubesentry.io/*` namespace annotations) are left off: they route the namespace owner's alerts, not another team's.
 
 ### Leadership and duplicates
 
@@ -79,11 +110,14 @@ If more than `-alerts-max-new` (50) new alerts would fire in one evaluation, kub
 | `-alerts-resend` | `alerts.resend` | `1m` | re-post interval; `endsAt` is 4 × this ahead |
 | `-alerts-resolve-grace` | `alerts.resolveGrace` | `5m` | how long a finding must be gone before it resolves |
 | `-alerts-max-new` | `alerts.maxNew` | `50` | more new alerts in one evaluation become digests |
+| `-alerts-owner-max-new`, `-alerts-owner-window` | `alerts.ownerMaxNew`, `alerts.ownerWindow` | `20`, `15m` | one owner's new alerts on their own per sliding window; more join that owner's digest |
+| `-alerts-max-silence` | `alerts.maxSilence` | `7d` | the longest silence a user may set (at most `30d`) |
 | `-alerts-default-owner` | `alerts.defaultOwner` | `platform` | owner of findings in namespaces without one, and of cluster-scoped findings |
 | `-alerts-leak-crit-hours` | `alerts.leakCritHours` | `-leak-crit-hours` (6) | a leak is critical when its container is closer than this to its limit |
 | `-alerts-runbook-url` | `alerts.runbookBaseURL` | this page on GitHub | `runbook_url` is this plus `#<alert name in lower case>` |
-| `-external-url` | `externalURL` | | kubesentry's address; each alert links to its finding there (`kubesentry_url`), and to its incident once it has one (`incident_url`) |
-| `-owner-annotation` | `alerts.ownerAnnotation` | `kubesentry.io/owner` | the namespace annotation naming the owner |
+| `-external-url` | `externalURL` | | kubesentry's address; each alert links to its finding there (`kubesentry_url`), and to its incident once it has one (`incident_url`). Browsers may send write requests (acknowledge, silence) from its origin |
+| `-allowed-origins` | `server.allowedOrigins` | | further origins (`scheme://host[:port]`) browsers may send write requests from, e.g. a portal that embeds kubesentry. Other cross-origin browser requests that change state get 403; requests without `Origin` and `Sec-Fetch-Site` (curl with the API token) are not affected |
+| `-owner-annotation` | `alerts.ownerAnnotation` | `kubesentry.io/owner` | the annotation naming the owner, on namespaces and on the objects listed under [Owners](#owners) |
 | `-production-label` | `alerts.production.labelKey`/`labelValue` | `environment=production` | the namespace label marking production |
 
 **Constraints:**
@@ -136,13 +170,13 @@ networkPolicy:
 | `severity` | `warning` or `critical` |
 | `check` | `cert-expiring`, `cert-not-ready`, `memory-leak`, `workload-unhealthy`, `pod-evicted`, `pod-stuck-terminating`; for RBAC drift the security check: `cluster-admin`, `anonymous-binding`, `wildcard-rbac`, `aws-auth-masters`; `digest` |
 | `namespace` | the object's namespace; absent for cluster-scoped findings |
-| `owner` | the namespace's `kubesentry.io/owner` annotation (`-owner-annotation`), else `-alerts-default-owner` |
+| `owner` | the object's `kubesentry.io/owner` annotation (`-owner-annotation`), else its namespace's, else `-alerts-default-owner` ([Owners](#owners)) |
 | `production` | `"true"` when the namespace carries the production label, else `"false"` |
 | `workload` | `Kind/name` of the workload, for workload, pod and leak alerts (a bare pod is `Pod/name`) |
 | `object` | `Kind/name` of the object, for certificate and RBAC alerts |
 | `node` | the node, when every pod of a pod alert runs on one, so the profile's node-down inhibition mutes it |
 | `cluster` | `-cluster-name`, when set, so several clusters can share one Alertmanager without their alerts merging |
-| `kubesentry_<x>` | every other `kubesentry.io/<x>` namespace annotation, as a routing hint: `kubesentry.io/slack-channel: "#payments"` becomes `kubesentry_slack_channel="#payments"`. Characters a label name cannot hold become `_`. At most 10 per namespace, values cut to 256 bytes. `kubesentry_digest` is reserved |
+| `kubesentry_<x>` | every other `kubesentry.io/<x>` namespace annotation, as a routing hint: `kubesentry.io/slack-channel: "#payments"` becomes `kubesentry_slack_channel="#payments"`. Characters a label name cannot hold become `_`. At most 10 per namespace, values cut to 256 bytes. `kubesentry_digest` is reserved. Left off when the object names an owner other than its namespace's |
 | `kubesentry_digest` | `"true"`, on digests only |
 
 **Annotations:**
@@ -159,6 +193,7 @@ networkPolicy:
   - `predicted_oom`, `container`, `pod`, `growth_bytes_per_hour`: memory leaks
   - `expires_at`, `issuer`, `reason` (`issuer-missing` or `not-ready`): certificates
   - `findings`: digests
+- **Acknowledged and silenced** ([section 1](#acknowledging-and-silencing)): `acknowledged_by`, `acknowledged_at` on every post of an acknowledged alert; `silenced_by`, `silenced_until` (RFC 3339), `silence_reason` on the one post that ends a silenced alert.
 - **With incidents on** (`-incidents`, `docs/incidents.md`): `incident_url`, the incident the alert's episode joined, with `-external-url`. Workload, pod and leak alerts join their workload's incident within a minute or so; the link goes out with the next resend (`-alerts-resend`) and stays for the episode. It is an annotation, never a label, so it never retires the alert. A link to a capped incident moves to its continuation.
 
 **Example**, as posted to `/api/v2/alerts` (`internal/alerts/testdata/alertmanager-post.golden.json` has one of each):
@@ -196,9 +231,21 @@ networkPolicy:
 ## 4. Watching the alerting itself
 
 - **`GET /api/v1/alerts`** lists the findings the caller may see: open, acknowledged, silenced, and those resolved in the last 24h. It accepts `?namespace=&owner=&state=&limit=&continue=`.
-  - A namespaced finding needs the namespace. An RBAC drift finding there also needs `list rolebindings`. A cluster-scoped one needs `clusterRBAC`.
+  - Who may see a finding depends on its kind:
+
+    | Kind | Namespaced finding | Cluster-scoped finding |
+    |---|---|---|
+    | workloads, pods, leaks, certificates | `list pods` there | (`list pods` in every namespace) |
+    | RBAC drift | `list pods` and `list rolebindings` there | `list clusterrolebindings` |
+    | audit activity | `list pods` and `list auditevents.kubesentry.io` there | `list auditevents.kubesentry.io` cluster-wide |
+    | nodes | (`list pods` there and `list nodes`) | `list nodes` |
+    | agents | (`list pods` there and `list agents.kubesentry.io`) | `list agents.kubesentry.io` |
+
+  - Each item carries `actionable` when the caller may acknowledge and silence it, `link` (the UI page that explains it), and the acknowledgement and silence details (`ackBy`, `ackAt`, `silencedBy`, `silencedAt`, `silenceReason`, `silencedUntil`).
   - With incidents on, an item whose episode joined an incident in its namespace carries `incidentId` (open it at `#/incidents/<id>`).
   - The Overview's `alerts` field counts the same findings for its widget.
+- **`POST /api/v1/alerts/actions`** takes `{"keys": [...], "action": "ack"|"unack"|"silence"|"unsilence", "for": "4h", "reason": "..."}` (`for` and `reason` for silences only; at most 100 keys; JSON, at most 16 KiB). It answers 403 when the caller may act nowhere, otherwise a result per key: `ok` with the finding as it is now, or `not found` (unknown, or not visible to the caller), `forbidden` (visible, but no `update alerts.kubesentry.io` there), `resolved`, `invalid` (an unack without an ack, an unsilence without a silence). Browsers may send it only from kubesentry's own origin, `-external-url`'s and `-allowed-origins`.
+- **`GET /api/v1/alerts/actions?key=&limit=`** lists the actions on findings the caller may see, newest first (at most 200).
 - **`/info`** has `alerts: {enabled, sink, leader, lastSentAt, lastError}`. Only the leader sends, so ask more than once if a load balancer spreads requests over replicas.
 - **Metrics:**
   - `kubesentry_findings{check,severity}` on the leader (0 elsewhere)
@@ -206,6 +253,8 @@ networkPolicy:
   - `kubesentry_alerts_queue_depth`
   - `kubesentry_alerts_evaluation_seconds`
   - `kubesentry_alerts_leader`
+  - `kubesentry_alerts_digested_total{reason}` (`max_new`, `owner_budget`)
+  - `kubesentry_alert_actions_total{action,result}` (`ok`, `forbidden`, `not_found`, `invalid`, `resolved`)
   - `kubesentry_dependency_up{dependency="alertmanager"}`
 - **Dashboard.** The chart's "kubesentry health" dashboard shows them in the "Alerts and dependencies" row.
 - **Alerts on the alerting.** The chart's `PrometheusRule` adds `KubesentryAlertsNotEvaluated` (no replica holds the lock) and `KubesentryAlertmanagerFailing` (deliveries fail on the leader). Their runbooks are in `docs/monitoring-eks.md`.
@@ -315,19 +364,19 @@ Standing state never fires; the first evaluation records it. The alert stays ope
 - An expected change needs nothing: the alert resolves after 24 hours.
 
 ### KubesentryFindingsDigest
-**Fires:** more than `-alerts-max-new` new findings appeared in one evaluation, so they were summed up per owner instead of sent one by one (`kubesentry_digest="true"`). This happens on a first install, after an empty memory store, or in a cluster-wide incident. `findings` is the count. The description lists counts by alert and the 10 worst.
+**Fires:** more than `-alerts-max-new` new findings appeared in one evaluation, or one owner had more than `-alerts-owner-max-new` new ones in `-alerts-owner-window`, so they were summed up per owner instead of sent one by one (`kubesentry_digest="true"`). This happens on a first install, after an empty memory store, or in an incident. `findings` is the count. The description lists counts by alert and the 10 worst. A digested finding that turns critical leaves the digest and fires on its own.
 **Check:**
 - `GET /api/v1/alerts?owner=<owner>` or the Overview filtered by the owner (`kubesentry_url`) for the full list.
 - After an install, the digest is the cluster's standing backlog.
+- `kubesentry_alerts_digested_total{reason}` says whether the global breaker or the owner's budget sent them here.
 
-**Fix:** work through the findings by severity; the digest ends when all of them have resolved. Raise `-alerts-max-new` if your incidents routinely exceed it and your receivers cope.
+**Fix:** work through the findings by severity; the digest ends when all of them have resolved, left it, or been silenced. Raise `-alerts-max-new` or `-alerts-owner-max-new` if your incidents routinely exceed them and your receivers cope.
 
 ## 6. Limits of this release
 
-Phase C of the proposal adds:
+Acknowledging and silencing, full storm protection and per-object owners are in. Still to come in phase C:
 
-- **The UI.** The Alerts page, and acknowledging and silencing with RBAC. The `acknowledged` and `silenced` states exist in the store and the API, but nothing sets them yet.
-- **Full storm protection.** Per-owner rate limits, and promoting a digested finding that turns critical to an alert of its own. Today a digested finding stays in the digest until it resolves.
+- **The UI.** The Alerts page with its Ack and Silence buttons. Until then, use `POST /api/v1/alerts/actions` (section 4).
 - **Digests of standing state.** Weekly RBAC posture, unused volumes with their cost, and certificates more than 14 days from expiry.
-- **The rest of the catalog.** Exposure changes, privileged workloads created, the production-aware audit alerts (exec, port-forward or secret reads in production), and agent and process alerts.
-- **Per-object owners.** An owner annotation on the object, overriding its namespace's.
+- **The rest of the catalog.** Exposure changes, privileged workloads created, the production-aware audit alerts (exec, port-forward or secret reads in production), and agent alerts.
+- **Long acknowledgements.** The actions log keeps 31 days, so an episode open longer than that loses its acknowledgement.

@@ -123,7 +123,8 @@ subjects:
     (dict "suffix" "audit-viewer" "cfg" $vr.auditViewer "resource" "auditevents" "verbs" (list "list") "what" "audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events")
     (dict "suffix" "process-viewer" "cfg" $vr.processViewer "resource" "processes" "verbs" (list "get") "what" "processes inside pods, per namespace")
     (dict "suffix" "agents-viewer" "cfg" $vr.agentsViewer "resource" "agents" "verbs" (list "list") "what" "node agent health; needs a ClusterRoleBinding")
-    (dict "suffix" "cloudtrail-viewer" "cfg" $vr.cloudtrailViewer "resource" "cloudtrail" "verbs" (list "list") "what" "the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding") }}
+    (dict "suffix" "cloudtrail-viewer" "cfg" $vr.cloudtrailViewer "resource" "cloudtrail" "verbs" (list "list") "what" "the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding")
+    (dict "suffix" "alerts-responder" "cfg" $vr.alertsResponder "resource" "alerts" "verbs" (list "update") "what" "acknowledge and silence the alerts one can see: bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped findings; kubesentry never writes to the cluster or to Alertmanager's silences") }}
 {{- range $roles }}
 ---
 # Virtual resource kubesentry.io/{{ .resource }}: {{ .what }}.

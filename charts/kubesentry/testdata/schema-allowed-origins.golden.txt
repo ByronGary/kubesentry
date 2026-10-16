@@ -1,0 +1,4 @@
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+kubesentry:
+- at '/server/allowedOrigins/0': 'portal.example.com' does not match pattern '^https?://[^/?#@]+$'
+

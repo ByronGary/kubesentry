@@ -150,6 +150,12 @@ rbac:
     # already grants, so most users need no extra binding.
     logsViewer:
       aggregateTo: []
+    # update alerts.kubesentry.io: acknowledge and silence the alerts one can
+    # see, per namespace through a RoleBinding; cluster-scoped findings (RBAC
+    # drift) need a ClusterRoleBinding. kubesentry records these actions
+    # itself and never writes to the cluster or to Alertmanager's silences.
+    alertsResponder:
+      aggregateTo: []
 
 # -- Server listener and tuning flags beyond the ones grouped elsewhere.
 server:
@@ -174,6 +180,11 @@ server:
   # listener answers; others get 403. Empty answers any Host. Behind the ALB,
   # e.g. [kubesentry.example.com].
   allowedHosts: []
+  # -- -allowed-origins: origins (scheme://host[:port]) besides kubesentry's
+  # own and externalURL's from which browsers may send requests that change
+  # state (acknowledge, silence); others get 403. Requests without an Origin
+  # (curl with the API token) are not affected. e.g. [https://portal.example.com].
+  allowedOrigins: []
   # -- -system-principal-prefixes (system:,eks:): users and groups that are
   # components, not people.
   systemPrincipalPrefixes: []
@@ -534,6 +545,15 @@ alerts:
   # -- More new alerts than this in one evaluation go out as one digest per
   # owner, labelled kubesentry_digest="true" (-alerts-max-new).
   maxNew: 50
+  # -- One owner gets at most ownerMaxNew new alerts on their own in any
+  # ownerWindow; more join that owner's digest (-alerts-owner-max-new,
+  # -alerts-owner-window).
+  ownerMaxNew: 20
+  ownerWindow: 15m
+  # -- The longest silence a user may set on a finding, at most 30d
+  # (-alerts-max-silence). Silences and acknowledgements need update on
+  # alerts.kubesentry.io (rbac.viewerRoles.alertsResponder).
+  maxSilence: 7d
   # -- A memory leak alert is critical when the limit is closer than this many
   # hours; null uses thresholds.leakCritHours (-alerts-leak-crit-hours).
   leakCritHours: null

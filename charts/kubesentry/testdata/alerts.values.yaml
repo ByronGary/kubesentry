@@ -1,10 +1,14 @@
 # The alerts golden case (hack/helm-test.sh): findings go to an in-cluster
 # Alertmanager pair with a bearer token and a private CA, through a
-# restricted egress policy, with the alerting rules rendered.
+# restricted egress policy, with the alerting rules rendered; editors may
+# acknowledge and silence, also from the team portal.
 alerts:
   enabled: true
   defaultOwner: platform-team
   maxNew: 100
+  ownerMaxNew: 10
+  ownerWindow: 30m
+  maxSilence: 3d
   leakCritHours: 12
   alertmanager:
     urls:
@@ -14,6 +18,12 @@ alerts:
     ca:
       configMap: alertmanager-ca
 externalURL: https://kubesentry.example.com
+server:
+  allowedOrigins: [https://portal.example.com]
+rbac:
+  viewerRoles:
+    alertsResponder:
+      aggregateTo: [edit]
 networkPolicy:
   enabled: true
   egress:
