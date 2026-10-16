@@ -62,7 +62,7 @@ func (a *alertsConfig) register(fs *flag.FlagSet, dur durFlag) {
 	fs.StringVar(&a.defaultOwner, "alerts-default-owner", "platform", "owner of findings whose namespace has no owner annotation, and of cluster-scoped findings")
 	fs.Float64Var(&a.leakCritHours, "alerts-leak-crit-hours", 0, "a memory leak alert is critical when the limit is closer than this many hours (0: -leak-crit-hours)")
 	fs.StringVar(&a.runbookURL, "alerts-runbook-url", alerts.DefaultRunbookURL, "each alert's runbook_url is this plus #<alert name in lower case>")
-	fs.StringVar(&a.externalURL, "external-url", "", "kubesentry's URL as users reach it (e.g. https://kubesentry.example.com); alerts link to their finding there (kubesentry_url)")
+	fs.StringVar(&a.externalURL, "external-url", "", "kubesentry's URL as users reach it (e.g. https://kubesentry.example.com); alerts link to their finding there (kubesentry_url), and with -incidents to their incident (incident_url)")
 }
 
 // endpoints parses -alertmanager-url.

@@ -889,22 +889,50 @@ spec:
               {{ $labels.pod }} has failed to read CloudTrail for 15 minutes, so AWS changes (security groups, target
               groups, node groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
             runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycloudtrailfailing
-        # Events that could not be stored, and event lists or watches the API
-        # server refused (403) after the permission probe passed.
+        # Events that could not be stored, event lists or watches the API
+        # server refused (403) after the permission probe passed, and the
+        # events source in error on the replica running the engine (a refused
+        # permission probe, or a watch that keeps failing).
         - alert: KubesentryIncidentEventsFailing
           expr: |
             sum by (namespace, pod) (increase(kubesentry_k8s_events_total{namespace="kubesentry",result="error"}[10m])) > 0
             or
             sum by (namespace, pod) (increase(kubesentry_kube_requests_total{namespace="kubesentry",resource="events",code="403"}[10m])) > 0
+            or
+            (
+              min by (namespace, pod) (kubesentry_incident_source_up{namespace="kubesentry",source="events"}) == 0
+              and on (namespace, pod)
+              max by (namespace, pod) (kubesentry_incidents_leader{namespace="kubesentry"}) == 1
+            )
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: kubesentry is losing Kubernetes events for incidents.
             description: >-
-              For 15 minutes {{ $labels.pod }} has failed to store Kubernetes events, or the API server has refused its event
-              watch. BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their events.
+              For 15 minutes {{ $labels.pod }} has failed to store Kubernetes events, or cannot watch them (the API server
+              refused the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and FailedScheduling events
+              stop opening incidents, and incident pages miss their events.
             runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+        # A source the incidents engine reads is in error on the replica
+        # running the engine. CloudTrail has its own alert.
+        - alert: KubesentryIncidentSourceDown
+          expr: |
+            min by (namespace, source) (
+              kubesentry_incident_source_up{namespace="kubesentry",source!="cloudtrail"}
+              and on (namespace, pod)
+              max by (namespace, pod) (kubesentry_incidents_leader{namespace="kubesentry"}) == 1
+            ) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: An incidents source of kubesentry is failing.
+            description: >-
+              For 15 minutes the incidents source {{ $labels.source }} has been in error on the replica running the
+              incidents engine, so incidents miss what it reads (request or memory metrics, events, audit changes or logs).
+              /api/v1/info names the error under incidents.sources and unavailable.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentsourcedown
         - alert: KubesentryIncidentLogsFailing
           expr: |
             sum by (namespace, source) (increase(kubesentry_incident_log_fetches_total{namespace="kubesentry",result="error"}[30m])) > 0

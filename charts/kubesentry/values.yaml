@@ -564,7 +564,8 @@ alerts:
       key: ca.crt
 
 # -- kubesentry's URL as users reach it, e.g. https://kubesentry.example.com
-# (-external-url): each alert links to its finding there (kubesentry_url).
+# (-external-url): each alert links to its finding there (kubesentry_url),
+# and, with incidents on, to the incident it joined (incident_url).
 externalURL: ""
 
 # -- Incidents (-incidents, docs/incidents.md): the critical and warning

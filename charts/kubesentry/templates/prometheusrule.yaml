@@ -284,22 +284,50 @@ spec:
               groups, node groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
             runbook_url: {{ $rb }}#kubesentrycloudtrailfailing
         {{- end }}
-        # Events that could not be stored, and event lists or watches the API
-        # server refused (403) after the permission probe passed.
+        # Events that could not be stored, event lists or watches the API
+        # server refused (403) after the permission probe passed, and the
+        # events source in error on the replica running the engine (a refused
+        # permission probe, or a watch that keeps failing).
         - alert: KubesentryIncidentEventsFailing
           expr: |
             sum by (namespace, pod) (increase({{ printf "kubesentry_k8s_events_total{%s,result=\"error\"}" $m }}[10m])) > 0
             or
             sum by (namespace, pod) (increase({{ printf "kubesentry_kube_requests_total{%s,resource=\"events\",code=\"403\"}" $m }}[10m])) > 0
+            or
+            (
+              min by (namespace, pod) ({{ printf "kubesentry_incident_source_up{%s,source=\"events\"}" $m }}) == 0
+              and on (namespace, pod)
+              max by (namespace, pod) ({{ printf "kubesentry_incidents_leader{%s}" $m }}) == 1
+            )
           for: 15m
           labels:
             severity: warning
           annotations:
             summary: kubesentry is losing Kubernetes events for incidents.
             description: >-
-              For 15 minutes {{ "{{" }} $labels.pod {{ "}}" }} has failed to store Kubernetes events, or the API server has refused its event
-              watch. BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their events.
+              For 15 minutes {{ "{{" }} $labels.pod {{ "}}" }} has failed to store Kubernetes events, or cannot watch them (the API server
+              refused the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and FailedScheduling events
+              stop opening incidents, and incident pages miss their events.
             runbook_url: {{ $rb }}#kubesentryincidenteventsfailing
+        # A source the incidents engine reads is in error on the replica
+        # running the engine. CloudTrail has its own alert.
+        - alert: KubesentryIncidentSourceDown
+          expr: |
+            min by (namespace, source) (
+              {{ printf "kubesentry_incident_source_up{%s,source!=\"cloudtrail\"}" $m }}
+              and on (namespace, pod)
+              max by (namespace, pod) ({{ printf "kubesentry_incidents_leader{%s}" $m }}) == 1
+            ) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: An incidents source of kubesentry is failing.
+            description: >-
+              For 15 minutes the incidents source {{ "{{" }} $labels.source {{ "}}" }} has been in error on the replica running the
+              incidents engine, so incidents miss what it reads (request or memory metrics, events, audit changes or logs).
+              /api/v1/info names the error under incidents.sources and unavailable.
+            runbook_url: {{ $rb }}#kubesentryincidentsourcedown
         {{- if ne (include "kubesentry.logsMode" .) "off" }}
         - alert: KubesentryIncidentLogsFailing
           expr: |

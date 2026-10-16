@@ -256,7 +256,7 @@ rules:
     verbs: ["get"]
 ```
 
-Bind it to the same group as the reader role. `serviceaccounts` and `targetgroupbindings` are already in that role. `AmazonEKSAdminViewPolicy` covers all of these. Without `events`, `/api/v1/info` shows `incidents.sources.events` as `error: kube: events are forbidden: …` and incidents open from metrics, restarts and OOM kills only. Without `pods/log`, the log panel shows the API server's refusal when it reads from `kubernetes`.
+Bind it to the same group as the reader role. `serviceaccounts` and `targetgroupbindings` are already in that role. `AmazonEKSAdminViewPolicy` covers all of these. Without `events`, `/api/v1/info` shows `incidents.sources.events` (and `unavailable["incidents:events"]`) as an `error: …` naming the missing permission, and incidents open from metrics, restarts and OOM kills only. Without `pods/log`, the log panel shows the API server's refusal when it reads from `kubernetes`.
 
 **Your AWS credentials** need the IAM actions of `docs/deploy-eks.md`, section 3, "Incidents": `logs:FilterLogEvents` on the container log group, `cloudwatch:GetMetricData` and `cloudwatch:ListMetrics` for `-incident-alb`, and `cloudtrail:LookupEvents`.
 

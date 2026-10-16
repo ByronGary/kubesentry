@@ -167,7 +167,7 @@ There are two ways to use AMP:
    - a `kubesentry_<x>` routing hint for every other `kubesentry.io/<x>` namespace annotation
    - `kubesentry_digest="true"` on digests
 
-   The dedupe key (`check/kind/namespace/name`) and a link to the finding (`kubesentry_url`, with `externalURL`) are annotations.
+   The dedupe key (`check/kind/namespace/name`), a link to the finding (`kubesentry_url`, with `externalURL`) and, once the alert's episode has joined an incident, a link to the incident (`incident_url`, with `externalURL` and incidents on) are annotations.
 2. **Owner.** The owner comes from the annotation `kubesentry.io/owner` on the namespace:
 
    ```bash
@@ -263,7 +263,8 @@ Group such a route by `kubesentry_slack_channel` as well, so that every notifica
 | `KubesentryAlertsNotEvaluated` | no replica holds the alerts lock for 10m (`alerts.enabled` only) | |
 | `KubesentryAlertmanagerFailing` | the replica that notifies fails or drops deliveries for 15m (with `alerts.alertmanager.urls`) | |
 | `KubesentryCloudTrailFailing` | a replica cannot read CloudTrail for 15m (`incidents.cloudtrail.mode` lookup or logs) | |
-| `KubesentryIncidentEventsFailing` | Kubernetes events fail to store, or the event watch is refused (403), for 15m (`incidents.enabled`) | |
+| `KubesentryIncidentEventsFailing` | Kubernetes events fail to store, the event watch is refused (403), or the events source is in error on the replica running the engine, for 15m (`incidents.enabled`) | |
+| `KubesentryIncidentSourceDown` | an incidents source other than CloudTrail is in error on the replica running the engine for 15m (`incidents.enabled`) | |
 | `KubesentryIncidentLogsFailing` | every incident log read from one source failed over 30m, for 10m (`incidents.enabled`, logs not off) | |
 | `KubesentryAgentNodesDropped` | nodes reporting processes drop by a fraction within an hour, for 10m (agent only) | `agentDropRatio` (0.2) |
 | `KubesentryCrashLooping` | a server, oauth2-proxy or agent container in CrashLoopBackOff, or restarting, for 10m (kube-state-metrics) | `kubeStateMetrics.restarts` (3 in 30m) |
@@ -626,13 +627,24 @@ Requests without credentials (`unauthenticated`) are counted but not alerted on:
 **Fix:** grant the action, lower `incidents.cloudtrail.qps` or find the other heavy caller, or read a trail from CloudWatch Logs instead (`cloudtrail.mode: logs`). After a fix the next poll resumes from its checkpoint, reading back at most 24 hours.
 
 ### KubesentryIncidentEventsFailing
-**Meaning:** for 15 minutes the replica running the incidents engine has failed to store Kubernetes events (`kubesentry_k8s_events_total{result="error"}`), or the API server has refused its event list or watch (`kubesentry_kube_requests_total{resource="events",code="403"}`). Repeated `BackOff`, `Unhealthy` and `FailedScheduling` events no longer open incidents, and incident pages miss their events.
+**Meaning:** for 15 minutes the replica running the incidents engine has failed to store Kubernetes events (`kubesentry_k8s_events_total{result="error"}`), the API server has refused its event list or watch (`kubesentry_kube_requests_total{resource="events",code="403"}`), or its events source has been in error (`kubesentry_incident_source_up{source="events"}` is 0 where `kubesentry_incidents_leader` is 1). Repeated `BackOff`, `Unhealthy` and `FailedScheduling` events no longer open incidents, and incident pages miss their events.
 **Check:**
 - A store error: `KubesentryPostgresErrors` and `kubesentry_dependency_up{dependency="postgres"}`; the log line `incidents: storing events failed`.
 - A 403: kubesentry's ClusterRole must allow `list` and `watch` on `events` (the chart adds it with `incidents.enabled`). `kubectl auth can-i watch events --all-namespaces --as=system:serviceaccount:kubesentry:kubesentry`.
-- When the startup permission check itself is denied, the watch is not attempted and nothing is counted: `/api/v1/info` shows `incidents.sources.events` as `error: kube: events are forbidden: …`, and the server retries every 5 minutes.
+- A denied permission check: the watch is not attempted and no request is counted, but the events source is in error. `/api/v1/info` shows `incidents.sources.events` and `unavailable["incidents:events"]` as `error: … forbidden: cannot list events …`.
+- A watch that keeps failing for another reason (the API server unreachable, say): the log line `incidents: the event watch stopped; restarting` with the error. The watch is retried after 10 seconds, then twice as long after each quick failure, up to every 5 minutes.
 
-**Fix:** restore Postgres, or the RBAC rule. Events missed meanwhile are not recovered once they expire (an hour by default): the next watch lists only the ones still there.
+**Fix:** restore Postgres, or the RBAC rule. The source returns to `ok` once the watch delivers events or stays up 30 seconds; on the other replicas, at the next permission probe (every 10 minutes). Events missed meanwhile are not recovered once they expire (an hour by default): the next watch lists only the ones still there.
+
+### KubesentryIncidentSourceDown
+**Meaning:** for 15 minutes one source the incidents engine reads (the `source` label) has been in error on the replica running the engine: `kubesentry_incident_source_up{source}` is 0 where `kubesentry_incidents_leader` is 1. Incidents miss what that source reads. CloudTrail is left out: `KubesentryCloudTrailFailing` covers it. An `absent` source (not configured, or without data, such as `requests:nginx` without ingress-nginx metrics) has no sample and never fires this.
+**Check:** `/api/v1/info`, `incidents.sources.<source>` and `unavailable["incidents:<source>"]`, and the server log. By source:
+- `requests:<profile>`, `memory`: Prometheus (`KubesentryPrometheusUnreachable`), or a request profile whose query fails. For `requests:alb`, CloudWatch `GetMetricData` (IAM `cloudwatch:GetMetricData`).
+- `events`: see `KubesentryIncidentEventsFailing`.
+- `audit`: the audit store (`KubesentryPostgresErrors`).
+- `logs:kubernetes`: kubesentry lacks `get pods/log`. `logs:cloudwatch`: `logs:FilterLogEvents` on the application log group, or throttling.
+
+**Fix:** follow the source's own alert or permission above. Request, event, log and CloudTrail sources are probed every 10 minutes on every replica; the engine's replica also updates them from its scans and polls, so a fixed source turns `ok` within minutes.
 
 ### KubesentryIncidentLogsFailing
 **Meaning:** in the last 30 minutes every read of incident logs from one source (`kubernetes` or `cloudwatch`, the `source` label) failed, and none succeeded (`kubesentry_incident_log_fetches_total`). People opening incidents and downloading bundles see no logs. Reads happen only when someone views logs or downloads a bundle, so the alert can only fire then.
@@ -686,6 +698,6 @@ Some rules here could not be expressed with the metrics phase A had, or had to h
 | `kubesentry_snapshot_last_change_timestamp_seconds` (**shipped**: `KubesentrySnapshotStale` now needs a change waiting) and `kubesentry_snapshot_build_failures_total` | Tell a quiet cluster from a stuck view (bug 3), so `KubesentrySnapshotStale` stops firing falsely |
 | `kubesentry_cloudwatch_reader_leader` (1 on the lock holder) | The lag gauge may be stale on a replica that lost the lock; the lag rule would read only the leader |
 | `kubesentry_findings{check, severity}` (**shipped**, without `namespace` and `owner` to keep it small; reported by the replica that evaluates) | Finding counts for teams' own rules |
-| `kubesentry_k8s_events_total{result="forbidden"}`, or `kubesentry_dependency_up{dependency="events"}` | A denied event permission check is visible today only in `/info` and the log; `KubesentryIncidentEventsFailing` catches refused watches, not a refused check |
+| `kubesentry_k8s_events_total{result="forbidden"}`, or `kubesentry_dependency_up{dependency="events"}` (**shipped** as `kubesentry_incident_source_up{source="events"}`, with every other incidents source: `KubesentryIncidentEventsFailing`, `KubesentryIncidentSourceDown`) | A denied event permission check was visible only in `/info` and the log; `KubesentryIncidentEventsFailing` caught refused watches, not a refused check |
 
 One more phase B change concerned labels rather than metrics: kubesentry's pod alerts carry a `node` label when their pods all run on one node, so the profile's node-down inhibition mutes them (shipped).

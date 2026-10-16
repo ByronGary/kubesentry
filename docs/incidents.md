@@ -4,7 +4,7 @@ An incident is a workload in trouble, and everything around it on one time axis:
 
 Take an app that receives too many requests while its memory climbs. kubesentry opens one incident for its Deployment with a `request-spike` and a `memory-spike`. It attaches the deploy made 20 minutes earlier and a security group change from CloudTrail, then shows the error lines the pods wrote a few minutes after the spike.
 
-Incidents are **dashboard only**: they never notify anyone. The alert findings (`docs/alerts.md`) keep notifying per finding, and each finding's episode shows up in its workload's incident as an `alert` signal. Each incident can be downloaded as an **agent-ready bundle**, a redacted, size-capped JSON or NDJSON file meant for a future investigator agent (or a person with `jq`).
+Incidents are **dashboard only**: they never notify anyone. The alert findings (`docs/alerts.md`) keep notifying per finding, and each finding's episode shows up in its workload's incident as an `alert` signal. Once it has, the alert links to the incident: the Alertmanager annotation `incident_url` (with `-external-url`, from the next resend on) and `incidentId` in `GET /api/v1/alerts`. Each incident can be downloaded as an **agent-ready bundle**, a redacted, size-capped JSON or NDJSON file meant for a future investigator agent (or a person with `jq`).
 
 Turn incidents on with `-incidents`, or `incidents.enabled` in the Helm chart. `go run ./cmd/demo` shows three seeded incidents without a cluster.
 
@@ -83,7 +83,11 @@ Resolved incidents are kept for `retention` (7 days) and raw Kubernetes events f
 
 Other events are dropped. Read-only calls are never fetched.
 
-**Sources that are missing.** Every source is probed at startup and every 10 minutes, and `GET /api/v1/info` reports each under `incidents.sources` as `ok`, `absent` or `error: …`. Keys are `requests:<profile>` (for example `requests:nginx`, `requests:alb`), `memory`, `series`, `events`, `audit`, `alerts`, `cloudtrail` and `logs:<source>`. The scan skips what is missing, and the incident page hides a chart without data and says why. With no request metrics at all, memory spikes, restarts, events and alerts still open incidents.
+**Sources that are missing.** `GET /api/v1/info` reports each source under `incidents.sources` as `ok`, `absent` or `error: …`, and lists the ones in error under `unavailable` as `incidents:<source>`. Keys are `requests:<profile>` (for example `requests:nginx`, `requests:alb`), `memory`, `series`, `events`, `audit`, `alerts`, `cloudtrail` and `logs:<source>`. The scan skips what is missing, and the incident page hides a chart without data and says why. With no request metrics at all, memory spikes, restarts, events and alerts still open incidents.
+- **Probes.** Every replica probes the request sources, the event permission (`list` and `watch` on `events`), each log source and CloudTrail at startup and every 10 minutes.
+- **Recovery.** `events` returns to `ok` on a successful probe, when the watch delivers events, or once the watch has stayed up 30 seconds. On the replica running the engine, a successful probe does not hide a watch that keeps failing; a failed watch is retried after 10 seconds, waiting twice as long after each quick failure, up to 5 minutes. `cloudtrail` returns to `ok` after a successful poll.
+- **Leadership.** Sources only the engine's replica updates (memory, audit, alerts, and the watch's and polls' errors) go back to their last probe, or their initial state, when that replica stops leading.
+- **Metrics.** `kubesentry_incident_source_up{source}` is 1 for `ok` and 0 for an error; an `absent` source has no sample. `kubesentry_incidents_leader` is 1 on the replica running the engine.
 
 ## 3. App and service tags, and related incidents
 
@@ -370,7 +374,7 @@ Incidents without an owner annotation on their namespace belong to `alerts.defau
 
 **Postgres connections.** The replica that holds a lock (CloudWatch reader, alerts, incidents) keeps one connection per lock besides `-pg-max-conns`. Size `max_connections` for replicas × `maxConns` + 3.
 
-**Monitoring kubesentry itself.** With `metrics.prometheusRule.enabled`, three rules watch the incidents' inputs: `KubesentryCloudTrailFailing`, `KubesentryIncidentEventsFailing` and `KubesentryIncidentLogsFailing`. Their runbooks are in `docs/monitoring-eks.md`, which also describes the dashboard's Incidents row. The metrics are `kubesentry_incidents{severity}`, `kubesentry_incident_signals_total{type}`, `kubesentry_k8s_events_total{result}`, `kubesentry_cloudtrail_events_total{result}`, `kubesentry_incident_log_fetches_total{source,result}` and `kubesentry_dependency_up{dependency="cloudtrail"}`.
+**Monitoring kubesentry itself.** With `metrics.prometheusRule.enabled`, four rules watch the incidents' inputs: `KubesentryCloudTrailFailing`, `KubesentryIncidentEventsFailing`, `KubesentryIncidentLogsFailing` and `KubesentryIncidentSourceDown` (any other source in error on the replica running the engine for 15 minutes). Their runbooks are in `docs/monitoring-eks.md`, which also describes the dashboard's Incidents row. The metrics are `kubesentry_incidents{severity}`, `kubesentry_incident_signals_total{type}`, `kubesentry_k8s_events_total{result}`, `kubesentry_cloudtrail_events_total{result}`, `kubesentry_incident_log_fetches_total{source,result}`, `kubesentry_incident_source_up{source}`, `kubesentry_incidents_leader` and `kubesentry_dependency_up{dependency="cloudtrail"}`.
 
 ## 10. Known limits
 

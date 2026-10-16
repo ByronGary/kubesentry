@@ -388,10 +388,10 @@ Milestones land in order M1 → M7; each section names its milestone. TypeScript
 ### Incident follow-ups (M1)
 - **Alert → incident:** the incidents board indexes signal ID → incident ID on every replica. A finding whose episode (`EpisodeID`, `alert:<key>@<firstSeen>`) has joined an incident gains the Alertmanager **annotation** `incident_url` (`-external-url` + `#/incidents/<id>`; never a label, so it never retires the alert). It goes out at the next resend. `firstSeen` is stored at microsecond precision on the leader too, so the episode ID is the same on every replica.
 - `GET /api/v1/alerts` items gain `incidentId` (resolved at response time; same namespace as the finding).
-- **Source health:** the runner probes every source, including `events` and each `logs:<name>`, every 10 minutes on every replica. `events` returns to `ok` on a successful probe, on a received batch, or once the watch has run 30s; `cloudtrail` returns to `ok` after a successful poll. Sources only the leader updates reset to their initial state when leadership ends.
+- **Source health:** the runner probes every source, including `events` and each `logs:<name>`, every 10 minutes on every replica. `events` returns to `ok` on a successful probe (unless this replica's own watch is failing: a granted permission does not make a broken watch work), on a received batch, or once the watch has run 30s; a failed watch is retried after 10s, doubling after each quick failure up to 5m. `cloudtrail` returns to `ok` after a successful poll. Sources only the leader updates reset to their initial state when leadership ends.
 - `/info.unavailable` gains `incidents:<source>` for sources in error (the CloudTrail reason reads `error` without the `cloudtrail` capability).
 - Metrics: `kubesentry_incident_source_up{source}` (1 `ok`, 0 error; `absent` sources not exported), `kubesentry_incidents_leader`.
-- Rules: `KubesentryIncidentSourceDown` (15m; `min by (namespace, source)` on the leader, CloudTrail excluded since `KubesentryCloudTrailFailing` covers it); `KubesentryIncidentEventsFailing` also fires on `kubesentry_incident_source_up{source="events"} == 0`.
+- Rules: `KubesentryIncidentSourceDown` (15m; `min by (namespace, source)` on the leader, CloudTrail excluded since `KubesentryCloudTrailFailing` covers it); `KubesentryIncidentEventsFailing` also fires on `kubesentry_incident_source_up{source="events"} == 0` on the leader (every replica probes the same permission, so followers would only repeat it).
 
 ### Alerting phase C (M2, M3)
 

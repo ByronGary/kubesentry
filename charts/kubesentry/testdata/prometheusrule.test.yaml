@@ -437,7 +437,9 @@ tests:
               runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycloudtrailfailing
 
   # "a" cannot store the events it reads; "b" is refused the event watch;
-  # "c" stores every event and was refused a pods/log read, which is not this alert.
+  # "c" stores every event and was refused a pods/log read, which is not this alert;
+  # "d" runs the engine and its events source is in error (a refused permission
+  # probe); "e" reports the same but does not run the engine.
   - name: incident events failing
     interval: 1m
     input_series:
@@ -451,6 +453,14 @@ tests:
         values: '0+20x40'
       - series: 'kubesentry_kube_requests_total{namespace="kubesentry",pod="c",verb="get",resource="pods/log",code="403"}'
         values: '0+1x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="d",source="events"}'
+        values: '0x40'
+      - series: 'kubesentry_incidents_leader{namespace="kubesentry",pod="d"}'
+        values: '1x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="e",source="events"}'
+        values: '0x40'
+      - series: 'kubesentry_incidents_leader{namespace="kubesentry",pod="e"}'
+        values: '0x40'
     alert_rule_test:
       - eval_time: 10m
         alertname: KubesentryIncidentEventsFailing
@@ -462,18 +472,67 @@ tests:
             exp_annotations:
               summary: kubesentry is losing Kubernetes events for incidents.
               description: >-
-                For 15 minutes a has failed to store Kubernetes events, or the API server has refused its event watch.
-                BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their
-                events.
+                For 15 minutes a has failed to store Kubernetes events, or cannot watch them (the API server refused
+                the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and
+                FailedScheduling events stop opening incidents, and incident pages miss their events.
               runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
           - exp_labels: {severity: warning, namespace: kubesentry, pod: b}
             exp_annotations:
               summary: kubesentry is losing Kubernetes events for incidents.
               description: >-
-                For 15 minutes b has failed to store Kubernetes events, or the API server has refused its event watch.
-                BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their
-                events.
+                For 15 minutes b has failed to store Kubernetes events, or cannot watch them (the API server refused
+                the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and
+                FailedScheduling events stop opening incidents, and incident pages miss their events.
               runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: d}
+            exp_annotations:
+              summary: kubesentry is losing Kubernetes events for incidents.
+              description: >-
+                For 15 minutes d has failed to store Kubernetes events, or cannot watch them (the API server refused
+                the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and
+                FailedScheduling events stop opening incidents, and incident pages miss their events.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+
+  # On "a", which runs the engine, events fail throughout and the pods/log
+  # probe fails for 10 minutes, then recovers; CloudTrail fails too, which has
+  # its own alert. "b" does not run the engine, so its failing memory source
+  # does not count; "c" ran the engine for 5 minutes with failing audit.
+  - name: incident source down
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="a",source="events"}'
+        values: '0x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="a",source="memory"}'
+        values: '1x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="a",source="logs:kubernetes"}'
+        values: '0x10 1x30'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="a",source="cloudtrail"}'
+        values: '0x40'
+      - series: 'kubesentry_incidents_leader{namespace="kubesentry",pod="a"}'
+        values: '1x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="b",source="memory"}'
+        values: '0x40'
+      - series: 'kubesentry_incidents_leader{namespace="kubesentry",pod="b"}'
+        values: '0x40'
+      - series: 'kubesentry_incident_source_up{namespace="kubesentry",pod="c",source="audit"}'
+        values: '0x40'
+      - series: 'kubesentry_incidents_leader{namespace="kubesentry",pod="c"}'
+        values: '1x5 0x35'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryIncidentSourceDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryIncidentSourceDown
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, source: events}
+            exp_annotations:
+              summary: An incidents source of kubesentry is failing.
+              description: >-
+                For 15 minutes the incidents source events has been in error on the replica running the incidents
+                engine, so incidents miss what it reads (request or memory metrics, events, audit changes or logs).
+                /api/v1/info names the error under incidents.sources and unavailable.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentsourcedown
 
   # Every pods/log read fails (kubesentry lacks get pods/log); CloudWatch
   # reads fail now and then but others succeed.

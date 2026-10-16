@@ -82,7 +82,7 @@ If more than `-alerts-max-new` (50) new alerts would fire in one evaluation, kub
 | `-alerts-default-owner` | `alerts.defaultOwner` | `platform` | owner of findings in namespaces without one, and of cluster-scoped findings |
 | `-alerts-leak-crit-hours` | `alerts.leakCritHours` | `-leak-crit-hours` (6) | a leak is critical when its container is closer than this to its limit |
 | `-alerts-runbook-url` | `alerts.runbookBaseURL` | this page on GitHub | `runbook_url` is this plus `#<alert name in lower case>` |
-| `-external-url` | `externalURL` | | kubesentry's address; each alert links to its finding there (`kubesentry_url`) |
+| `-external-url` | `externalURL` | | kubesentry's address; each alert links to its finding there (`kubesentry_url`), and to its incident once it has one (`incident_url`) |
 | `-owner-annotation` | `alerts.ownerAnnotation` | `kubesentry.io/owner` | the namespace annotation naming the owner |
 | `-production-label` | `alerts.production.labelKey`/`labelValue` | `environment=production` | the namespace label marking production |
 
@@ -159,6 +159,7 @@ networkPolicy:
   - `predicted_oom`, `container`, `pod`, `growth_bytes_per_hour`: memory leaks
   - `expires_at`, `issuer`, `reason` (`issuer-missing` or `not-ready`): certificates
   - `findings`: digests
+- **With incidents on** (`-incidents`, `docs/incidents.md`): `incident_url`, the incident the alert's episode joined, with `-external-url`. Workload, pod and leak alerts join their workload's incident within a minute or so; the link goes out with the next resend (`-alerts-resend`) and stays for the episode. It is an annotation, never a label, so it never retires the alert. A link to a capped incident moves to its continuation.
 
 **Example**, as posted to `/api/v2/alerts` (`internal/alerts/testdata/alertmanager-post.golden.json` has one of each):
 
@@ -196,6 +197,7 @@ networkPolicy:
 
 - **`GET /api/v1/alerts`** lists the findings the caller may see: open, acknowledged, silenced, and those resolved in the last 24h. It accepts `?namespace=&owner=&state=&limit=&continue=`.
   - A namespaced finding needs the namespace. An RBAC drift finding there also needs `list rolebindings`. A cluster-scoped one needs `clusterRBAC`.
+  - With incidents on, an item whose episode joined an incident in its namespace carries `incidentId` (open it at `#/incidents/<id>`).
   - The Overview's `alerts` field counts the same findings for its widget.
 - **`/info`** has `alerts: {enabled, sink, leader, lastSentAt, lastError}`. Only the leader sends, so ask more than once if a load balancer spreads requests over replicas.
 - **Metrics:**
