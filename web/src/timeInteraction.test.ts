@@ -57,7 +57,7 @@ describe('stepTime', () => {
 
 describe('axisFor', () => {
   it('shares one left edge and makes room for end labels except on a phone', () => {
-    expect(axisFor(1200)).toEqual({ top: 14, right: 112, bottom: 26, left: 62 })
+    expect(axisFor(1200)).toEqual({ top: 14, right: 136, bottom: 26, left: 62 })
     expect(axisFor(360).right).toBe(14)
     expect(axisFor(360).left).toBe(axisFor(1200).left)
   })

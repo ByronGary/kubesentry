@@ -7,7 +7,7 @@ import { TIME_KEYS_HINT, useTimeInteraction } from './useTimeInteraction'
 
 /** Margins shared by every chart, lane and strip on the incident page, so a time sits at the same x in each. */
 export function axisFor(width: number): Margin {
-  return { top: 14, right: width < 520 ? 14 : 112, bottom: 26, left: 62 }
+  return { top: 14, right: width < 520 ? 14 : 136, bottom: 26, left: 62 }
 }
 
 /** Measures a box's width, for charts that fill it. */
@@ -255,7 +255,7 @@ export function TimeChart(p: TimeChartProps) {
                 </line>
                 {showEndLabels ? (
                   <text className="limit-label" x={right + 6} y={thresholdYs[i]} dominantBaseline="middle">
-                    {p.format(t.value)} {t.label}
+                    {truncateMiddle(`${p.format(t.value)} ${t.label}`, 18)}
                   </text>
                 ) : (
                   <text className="limit-label" x={right - 4} y={g.y(t.value) - 5} textAnchor="end">
@@ -287,7 +287,7 @@ export function TimeChart(p: TimeChartProps) {
               labelled.map((l, i) => (
                 <text key={l.key} className="end-label" x={right + 6} y={endYs[i]} dominantBaseline="middle">
                   <title>{l.label}</title>
-                  {truncateMiddle(l.label, 15)}
+                  {truncateMiddle(l.label, 17)}
                 </text>
               ))}
             {stacks.map((s, i) => (
