@@ -1,0 +1,60 @@
+# The incidents golden case (hack/helm-test.sh): one replica with the memory
+# store, container logs from CloudWatch first and pods/log after, CloudTrail
+# from the event history, a request profile of its own, every tuning value set,
+# and the incidents rules rendered.
+clusterName: prod-eks
+eks:
+  region: us-east-1
+rbac:
+  viewerRoles:
+    cloudtrailViewer:
+      aggregateTo: [admin]
+incidents:
+  enabled: true
+  interval: 30s
+  maxRange: 12h
+  retention: 14d
+  eventsRetention: 72h
+  quiet: 20m
+  lookbehind: 45m
+  logLead: 2m
+  logLag: 15m
+  namespaces: [payments, checkout]
+  appLabel: example.com/system
+  thresholds:
+    requestRatio: 3
+    requestCritRatio: 6
+    requestMinRPS: 0.5
+    errorRatio: 0.1
+    errorCritRatio: 0.3
+    memoryLimitPct: 90
+    memoryCritPct: 98
+    memoryJumpRatio: 2
+    memoryJumpMin: 256MiB
+    spikeRecent: 10m
+    spikeBaseline: 2h
+    eventMinCount: 5
+  requestSources: [nginx]
+  requestProfiles:
+    - name: envoy
+      metric: envoy_cluster_upstream_rq_total
+      namespaceLabel: namespace
+      serviceLabel: service
+      statusLabel: response_code
+  alb: true
+  eventNormalReasons: [SuccessfulRescale, ScalingReplicaSet]
+  logs:
+    mode: auto
+    group: /aws/containerinsights/prod-eks/application
+    maxLines: 5000
+    maxBytes: 2MiB
+  redactPatterns:
+    - 'card=[0-9]{12,19}'
+    - 'X-Api-Key: \S+'
+  cloudtrail:
+    mode: lookup
+    qps: 0.5
+    start: 2h
+metrics:
+  prometheusRule:
+    enabled: true

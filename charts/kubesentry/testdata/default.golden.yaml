@@ -113,10 +113,20 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["get", "list", "watch"]
+  # The IRSA role annotations (eks.amazonaws.com/role-arn) that tie CloudTrail
+  # changes to workloads; only ServiceAccounts with one are kept.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
   # Optional: without cert-manager the Certificates page reports it as not installed.
   - apiGroups: ["cert-manager.io"]
     resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
     verbs: ["get", "list", "watch"]
+  # Optional: AWS Load Balancer Controller target groups, for ALB metrics and
+  # CloudTrail changes on incidents.
+  - apiGroups: ["elbv2.k8s.aws"]
+    resources: ["targetgroupbindings"]
+    verbs: ["list", "watch"]
   # Per-user scoping asks the API server what each signed-in user may see, and
   # the startup probe checks kubesentry's own access per resource.
   - apiGroups: ["authorization.k8s.io"]
@@ -179,6 +189,46 @@ rules:
   - apiGroups: ["kubesentry.io"]
     resources: ["agents"]
     verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/cloudtrail: the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-cloudtrail-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["cloudtrail"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# An incident's container logs, per namespace: the permission kubectl logs
+# needs, which kubesentry checks for each user. The built-in view role already
+# grants it; this role is for users who have narrower roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-logs-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
 
 ---
 # Source: kubesentry/templates/rbac.yaml

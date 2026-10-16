@@ -1,5 +1,6 @@
 # promtool unit tests for the chart's PrometheusRule, rendered with
-# examples/values-eks.yaml (every optional rule on, default thresholds).
+# examples/values-eks.yaml (every optional rule on, default thresholds;
+# incidents with CloudTrail lookup).
 # hack/check-rules.sh renders the rules next to this file and runs:
 #   promtool test rules prometheusrule.test.yaml
 rule_files:
@@ -409,3 +410,94 @@ tests:
                 findings are not reaching anyone. /info (alerts.lastError) names the Alertmanager and the error. If
                 Alertmanager itself is down, this alert cannot reach you through it either.
               runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryalertmanagerfailing
+
+  # "a" cannot read CloudTrail (an IAM denial, say); "b" can.
+  - name: cloudtrail failing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="a",dependency="cloudtrail"}'
+        values: '0x30'
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="b",dependency="cloudtrail"}'
+        values: '1x30'
+      - series: 'kubesentry_dependency_up{namespace="kubesentry",pod="b",dependency="prometheus"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryCloudTrailFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KubesentryCloudTrailFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry cannot read CloudTrail.
+              description: >-
+                a has failed to read CloudTrail for 15 minutes, so AWS changes (security groups, target groups, node
+                groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycloudtrailfailing
+
+  # "a" cannot store the events it reads; "b" is refused the event watch;
+  # "c" stores every event and was refused a pods/log read, which is not this alert.
+  - name: incident events failing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_k8s_events_total{namespace="kubesentry",pod="a",result="error"}'
+        values: '0+5x40'
+      - series: 'kubesentry_k8s_events_total{namespace="kubesentry",pod="a",result="stored"}'
+        values: '0x40'
+      - series: 'kubesentry_kube_requests_total{namespace="kubesentry",pod="b",verb="watch",resource="events",code="403"}'
+        values: '0+1x40'
+      - series: 'kubesentry_k8s_events_total{namespace="kubesentry",pod="c",result="stored"}'
+        values: '0+20x40'
+      - series: 'kubesentry_kube_requests_total{namespace="kubesentry",pod="c",verb="get",resource="pods/log",code="403"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: KubesentryIncidentEventsFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryIncidentEventsFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: a}
+            exp_annotations:
+              summary: kubesentry is losing Kubernetes events for incidents.
+              description: >-
+                For 15 minutes a has failed to store Kubernetes events, or the API server has refused its event watch.
+                BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their
+                events.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+          - exp_labels: {severity: warning, namespace: kubesentry, pod: b}
+            exp_annotations:
+              summary: kubesentry is losing Kubernetes events for incidents.
+              description: >-
+                For 15 minutes b has failed to store Kubernetes events, or the API server has refused its event watch.
+                BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their
+                events.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+
+  # Every pods/log read fails (kubesentry lacks get pods/log); CloudWatch
+  # reads fail now and then but others succeed.
+  - name: incident logs failing
+    interval: 1m
+    input_series:
+      - series: 'kubesentry_incident_log_fetches_total{namespace="kubesentry",pod="a",source="kubernetes",result="error"}'
+        values: '0+1x60'
+      - series: 'kubesentry_incident_log_fetches_total{namespace="kubesentry",pod="a",source="cloudwatch",result="error"}'
+        values: '0+1x60'
+      - series: 'kubesentry_incident_log_fetches_total{namespace="kubesentry",pod="b",source="cloudwatch",result="ok"}'
+        values: '0+2x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KubesentryIncidentLogsFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: KubesentryIncidentLogsFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, namespace: kubesentry, source: kubernetes}
+            exp_annotations:
+              summary: kubesentry cannot read container logs for incidents.
+              description: >-
+                Every read of incident logs from kubernetes in the last 30 minutes failed, so incident pages and bundles
+                show no logs. The log panel and the server log name the error: usually a missing permission (pods/log,
+                or logs:FilterLogEvents) or a log group that does not exist.
+              runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentlogsfailing

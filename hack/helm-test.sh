@@ -106,6 +106,7 @@ lint kind -f deploy/kind/values-kind.yaml
 lint eks -f "$CHART/examples/values-eks.yaml"
 lint dashboards --set metrics.grafanaDashboards.enabled=true
 lint alerts -f "$TESTDATA/alerts.values.yaml"
+lint incidents -f "$TESTDATA/incidents.values.yaml"
 
 echo "== golden renders"
 golden default
@@ -116,6 +117,9 @@ golden dashboards --set metrics.grafanaDashboards.enabled=true \
   --set metrics.grafanaDashboards.annotations.grafana_folder=kubesentry --set auth.authzQPS=300
 # Alerts to an in-cluster Alertmanager pair: token Secret, CA, egress, the alerting rules.
 golden alerts -f "$TESTDATA/alerts.values.yaml"
+# Incidents with every value set: CloudWatch logs then pods/log, CloudTrail
+# lookup, a request profile ConfigMap, the read-only RBAC and the rules.
+golden incidents -f "$TESTDATA/incidents.values.yaml"
 
 echo "== refused configurations"
 # Two replicas would each keep a partial, different audit history.
@@ -133,9 +137,21 @@ refuses guardrail-proxy-any-cidr --set auth.mode=proxy --set 'auth.trustedProxyC
 refuses schema-custom-user-header --set auth.userHeader=X-Remote-User
 # The CloudWatch reader needs a log group, from the cluster name or explicitly.
 refuses guardrail-cloudwatch-group --set audit.sources.cloudwatch.enabled=true
+# Incidents follow the informer cache's views.
+refuses guardrail-incidents-cache --set incidents.enabled=true --set server.cache=false
+# Two replicas would each run the engine: the incidents lock needs Postgres.
+refuses guardrail-incidents-replicas --set replicas=2 --set incidents.enabled=true
+# CloudTrail only attaches to incidents; the server refuses it alone.
+refuses guardrail-cloudtrail-needs-incidents --set incidents.cloudtrail.mode=lookup
+# A trail in CloudWatch Logs needs its log group...
+refuses guardrail-cloudtrail-log-group --set incidents.enabled=true --set incidents.cloudtrail.mode=logs
+# ...and CloudWatch container logs a group, or the cluster name for Container Insights'.
+refuses guardrail-incident-logs-group --set incidents.enabled=true --set incidents.logs.mode=cloudwatch
 # The schema rejects values the server would not understand.
 refuses schema-auth-mode --set auth.mode=sso
 refuses schema-production-label --set 'alerts.production.labelKey=bad key'
+# An incident covers at most 24 hours.
+refuses schema-incidents-max-range --set incidents.enabled=true --set incidents.maxRange=48h
 
 if [ "$failed" -ne 0 ]; then
   echo "helm tests FAILED"

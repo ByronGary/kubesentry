@@ -270,6 +270,54 @@ spec:
             runbook_url: {{ $rb }}#kubesentryalertmanagerfailing
         {{- end }}
         {{- end }}
+        {{- if .Values.incidents.enabled }}
+        {{- if ne (include "kubesentry.cloudtrailMode" .) "off" }}
+        - alert: KubesentryCloudTrailFailing
+          expr: min by (namespace, pod) ({{ printf "kubesentry_dependency_up{%s,dependency=\"cloudtrail\"}" $m }}) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read CloudTrail.
+            description: >-
+              {{ "{{" }} $labels.pod {{ "}}" }} has failed to read CloudTrail for 15 minutes, so AWS changes (security groups, target
+              groups, node groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
+            runbook_url: {{ $rb }}#kubesentrycloudtrailfailing
+        {{- end }}
+        # Events that could not be stored, and event lists or watches the API
+        # server refused (403) after the permission probe passed.
+        - alert: KubesentryIncidentEventsFailing
+          expr: |
+            sum by (namespace, pod) (increase({{ printf "kubesentry_k8s_events_total{%s,result=\"error\"}" $m }}[10m])) > 0
+            or
+            sum by (namespace, pod) (increase({{ printf "kubesentry_kube_requests_total{%s,resource=\"events\",code=\"403\"}" $m }}[10m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is losing Kubernetes events for incidents.
+            description: >-
+              For 15 minutes {{ "{{" }} $labels.pod {{ "}}" }} has failed to store Kubernetes events, or the API server has refused its event
+              watch. BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their events.
+            runbook_url: {{ $rb }}#kubesentryincidenteventsfailing
+        {{- if ne (include "kubesentry.logsMode" .) "off" }}
+        - alert: KubesentryIncidentLogsFailing
+          expr: |
+            sum by (namespace, source) (increase({{ printf "kubesentry_incident_log_fetches_total{%s,result=\"error\"}" $m }}[30m])) > 0
+            unless on (namespace, source)
+            sum by (namespace, source) (increase({{ printf "kubesentry_incident_log_fetches_total{%s,result=~\"ok|truncated\"}" $m }}[30m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read container logs for incidents.
+            description: >-
+              Every read of incident logs from {{ "{{" }} $labels.source {{ "}}" }} in the last 30 minutes failed, so incident pages and
+              bundles show no logs. The log panel and the server log name the error: usually a missing permission
+              (pods/log, or logs:FilterLogEvents) or a log group that does not exist.
+            runbook_url: {{ $rb }}#kubesentryincidentlogsfailing
+        {{- end }}
+        {{- end }}
         {{- if .Values.agent.enabled }}
         - alert: KubesentryAgentNodesDropped
           expr: |

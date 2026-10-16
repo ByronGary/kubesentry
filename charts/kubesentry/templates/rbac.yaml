@@ -32,10 +32,34 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["get", "list", "watch"]
+  # The IRSA role annotations (eks.amazonaws.com/role-arn) that tie CloudTrail
+  # changes to workloads; only ServiceAccounts with one are kept.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
   # Optional: without cert-manager the Certificates page reports it as not installed.
   - apiGroups: ["cert-manager.io"]
     resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
     verbs: ["get", "list", "watch"]
+  # Optional: AWS Load Balancer Controller target groups, for ALB metrics and
+  # CloudTrail changes on incidents.
+  - apiGroups: ["elbv2.k8s.aws"]
+    resources: ["targetgroupbindings"]
+    verbs: ["list", "watch"]
+  {{- if .Values.incidents.enabled }}
+  # Incidents: Warning events (and the Normal reasons kept), watched by the
+  # replica running the incidents engine.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
+  {{- end }}
+  {{- if include "kubesentry.podLogsWanted" . }}
+  # Incidents: container logs, read when a user who may read them (get
+  # pods/log, checked per namespace) opens an incident.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  {{- end }}
   # Per-user scoping asks the API server what each signed-in user may see, and
   # the startup probe checks kubesentry's own access per resource.
   - apiGroups: ["authorization.k8s.io"]
@@ -94,10 +118,12 @@ subjects:
 {{- end }}
 {{- end }}
 {{- if .Values.rbac.viewerRoles.create }}
+{{- $vr := .Values.rbac.viewerRoles -}}
 {{- $roles := list
-    (dict "suffix" "audit-viewer" "cfg" .Values.rbac.viewerRoles.auditViewer "resource" "auditevents" "verbs" (list "list") "what" "audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events")
-    (dict "suffix" "process-viewer" "cfg" .Values.rbac.viewerRoles.processViewer "resource" "processes" "verbs" (list "get") "what" "processes inside pods, per namespace")
-    (dict "suffix" "agents-viewer" "cfg" .Values.rbac.viewerRoles.agentsViewer "resource" "agents" "verbs" (list "list") "what" "node agent health; needs a ClusterRoleBinding") }}
+    (dict "suffix" "audit-viewer" "cfg" $vr.auditViewer "resource" "auditevents" "verbs" (list "list") "what" "audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events")
+    (dict "suffix" "process-viewer" "cfg" $vr.processViewer "resource" "processes" "verbs" (list "get") "what" "processes inside pods, per namespace")
+    (dict "suffix" "agents-viewer" "cfg" $vr.agentsViewer "resource" "agents" "verbs" (list "list") "what" "node agent health; needs a ClusterRoleBinding")
+    (dict "suffix" "cloudtrail-viewer" "cfg" $vr.cloudtrailViewer "resource" "cloudtrail" "verbs" (list "list") "what" "the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding") }}
 {{- range $roles }}
 ---
 # Virtual resource kubesentry.io/{{ .resource }}: {{ .what }}.
@@ -115,4 +141,21 @@ rules:
     resources: [{{ .resource | quote }}]
     verbs: {{ toJson .verbs }}
 {{- end }}
+---
+# An incident's container logs, per namespace: the permission kubectl logs
+# needs, which kubesentry checks for each user. The built-in view role already
+# grants it; this role is for users who have narrower roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}-logs-viewer
+  labels:
+    {{- include "kubesentry.labels" . | nindent 4 }}
+    {{- range $vr.logsViewer.aggregateTo }}
+    rbac.authorization.k8s.io/aggregate-to-{{ . }}: "true"
+    {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
 {{- end }}

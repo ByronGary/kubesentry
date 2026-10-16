@@ -1,0 +1,3 @@
+Error: execution error at (kubesentry/templates/deployment.yaml:1:4): kubesentry: incidents.cloudtrail.mode=lookup attaches AWS changes to incidents: it needs incidents.enabled.
+
+Use --debug flag to render out invalid YAML

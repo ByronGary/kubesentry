@@ -2444,6 +2444,265 @@
     },
     {
       "type": "row",
+      "title": "Incidents",
+      "collapsed": false,
+      "id": 48,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 132
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Open incidents by severity",
+      "description": "kubesentry_incidents on the replica that runs the incidents engine (the others report 0): open incidents by their current severity. Empty with incidents off.",
+      "id": 49,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 133
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (severity) (kubesentry_incidents{cluster=~\"$cluster\", namespace=\"$namespace\", pod=~\"$pod\"})",
+          "legendFormat": "{{severity}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Signals per hour by type",
+      "description": "Signals handed to the incidents engine (kubesentry_incident_signals_total): triggers such as request-spike, memory-spike, oom-kill and k8s-event, and context such as deploy, audit-change and cloudtrail-change.",
+      "id": 50,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 133
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (type) (increase(kubesentry_incident_signals_total{cluster=~\"$cluster\", namespace=\"$namespace\", pod=~\"$pod\"}[1h]))",
+          "legendFormat": "{{type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kubernetes events and CloudTrail",
+      "description": "Kubernetes events stored for incidents per second (stored, error), and CloudTrail events and polls per second (fetched, duplicate, kept, throttled, error). error in either is what the incidents alerts watch.",
+      "id": 51,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 133
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (rate(kubesentry_k8s_events_total{cluster=~\"$cluster\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "events {{result}}",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (rate(kubesentry_cloudtrail_events_total{cluster=~\"$cluster\", namespace=\"$namespace\", pod=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "cloudtrail {{result}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Incident log reads per hour",
+      "description": "Container log reads for incident pages and bundles (kubesentry_incident_log_fetches_total), by source (kubernetes: pods/log, cloudwatch: CloudWatch Logs) and result (ok, truncated at the line or byte cap, error).",
+      "id": 52,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 133
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (source, result) (increase(kubesentry_incident_log_fetches_total{cluster=~\"$cluster\", namespace=\"$namespace\", pod=~\"$pod\"}[1h]))",
+          "legendFormat": "{{source}} {{result}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
       "title": "Go runtime",
       "collapsed": false,
       "id": 36,
@@ -2451,7 +2710,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 132
+        "y": 141
       },
       "panels": []
     },
@@ -2468,7 +2727,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 133
+        "y": 142
       },
       "targets": [
         {
@@ -2557,7 +2816,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 133
+        "y": 142
       },
       "targets": [
         {
@@ -2616,7 +2875,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 141
+        "y": 150
       },
       "targets": [
         {
@@ -2675,7 +2934,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 141
+        "y": 150
       },
       "targets": [
         {

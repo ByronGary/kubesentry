@@ -141,6 +141,15 @@ rbac:
     # list agents.kubesentry.io (cluster-wide): node agent health.
     agentsViewer:
       aggregateTo: []
+    # list cloudtrail.kubesentry.io (cluster-wide): the AWS changes attached
+    # to incidents (incidents.cloudtrail), in the incident page and bundle.
+    cloudtrailViewer:
+      aggregateTo: []
+    # get pods/log: an incident's container logs, per namespace. kubesentry
+    # checks the same permission as kubectl logs, which the built-in view role
+    # already grants, so most users need no extra binding.
+    logsViewer:
+      aggregateTo: []
 
 # -- Server listener and tuning flags beyond the ones grouped elsewhere.
 server:
@@ -397,9 +406,11 @@ audit:
     dsnKey: dsn
     # -- -pg-schema: one schema per cluster when clusters share a database.
     schema: kubesentry
-    # -- -pg-max-conns (10 when empty): connections per replica; audit reads
-    # share all but two (writes, maintenance). Size against max_connections
-    # (RDS: by instance class) times replicas.
+    # -- -pg-max-conns (10 when empty): pooled connections per replica; audit
+    # reads share all but two (writes, maintenance). The replica holding a
+    # lock (CloudWatch reader, alerts, incidents) keeps one more connection per
+    # lock. Size max_connections (RDS: by instance class) for replicas times
+    # this, plus three.
     maxConns: null
     # -- -pg-query-timeout (10s when empty): an audit read running longer is
     # cancelled in Postgres and answered 503 + Retry-After.
@@ -511,7 +522,7 @@ alerts:
     labelKey: environment
     labelValue: production
   # -- Owner of findings whose namespace has no owner annotation, and of
-  # cluster-scoped findings (-alerts-default-owner).
+  # cluster-scoped findings (-alerts-default-owner). Incidents use it too.
   defaultOwner: platform
   # -- Alerts are evaluated after view rebuilds, at most this often, and at
   # least this often in a quiet cluster (-alerts-interval).
@@ -555,6 +566,108 @@ alerts:
 # -- kubesentry's URL as users reach it, e.g. https://kubesentry.example.com
 # (-external-url): each alert links to its finding there (kubesentry_url).
 externalURL: ""
+
+# -- Incidents (-incidents, docs/incidents.md): the critical and warning
+# signals of one workload (request, error and memory spikes, restarts, OOM
+# kills, Kubernetes events, alert episodes) grouped into one incident, with the
+# deploys, audit edits, AWS changes and logs around it on one time axis.
+# Dashboard only: incidents never notify. null keeps the server default (in
+# brackets). Durations take Go syntax, and d for days where noted.
+incidents:
+  # -- Needs server.cache (the default). With replicas > 1 it needs
+  # audit.store=postgres: one replica, holding the incidents lock, runs the
+  # engine and the others read the store (the chart refuses otherwise).
+  enabled: false
+  interval: null         # -incident-interval (1m) how often request and memory metrics are scanned
+  maxRange: null         # -incident-max-range (24h) an incident longer than this closes (capped) and continues in a new one; at most 24h
+  retention: null        # -incident-retention (7d) resolved incidents kept; at least 24h; h or d units
+  eventsRetention: null  # -incident-events-retention (48h) Kubernetes events kept; h or d units
+  quiet: null            # -incident-quiet (15m) resolves once no trigger has been active this long
+  lookbehind: null       # -incident-lookbehind (30m) deploys and changes this long before the start attach
+  logLead: null          # -incident-log-lead (5m) logs and events are read from this long before the start
+  logLag: null           # -incident-log-lag (10m) ...and until this long after the end (logs are written late)
+  # -- -incident-namespaces: only these namespaces have incidents. Empty: all
+  # but the system namespaces.
+  namespaces: []
+  # -- -incident-include-system: system namespaces have incidents too.
+  includeSystem: false
+  # -- -incident-app-label: a custom label key that ties workloads into one app
+  # (tags incidents and relates them), e.g. example.com/system.
+  appLabel: ""
+  # -- -incident-app-labels: replaces the label keys incidents are tagged with
+  # (app.kubernetes.io/{name,instance,part-of,component}, app, k8s-app); a
+  # trailing * matches a prefix. Empty keeps the defaults.
+  appLabels: []
+  # -- What opens an incident and how severe it is.
+  thresholds:
+    requestRatio: null      # -incident-request-ratio (2) request rate against its baseline: warning
+    requestCritRatio: null  # -incident-request-crit-ratio (4) critical
+    requestMinRPS: null     # -incident-request-min-rps (1) subjects below this never spike
+    errorRatio: null        # -incident-error-ratio (0.05) share of 5xx responses: warning
+    errorCritRatio: null    # -incident-error-crit-ratio (0.2) critical
+    memoryLimitPct: null    # -incident-memory-limit-pct (85) percent of the memory limit: warning
+    memoryCritPct: null     # -incident-memory-crit-pct (95) critical
+    memoryJumpRatio: null   # -incident-memory-jump-ratio (1.5) without a limit, a jump against the previous scan...
+    memoryJumpMin: null     # -incident-memory-jump-min (128MiB) ...of at least this much
+    spikeRecent: null       # -incident-spike-recent (5m) the recent window a request rate is averaged over
+    spikeBaseline: null     # -incident-spike-baseline (1h) the baseline window before it
+    eventMinCount: null     # -incident-event-min-count (3) BackOff, Unhealthy and the like in 5 minutes
+  # -- -incident-request-sources: built-in Prometheus request profiles to read
+  # (nginx: ingress-nginx per Service; app: http_requests_total per pod).
+  # null keeps both; [] reads none.
+  requestSources: null
+  # -- Request profiles of your own, written to a ConfigMap and read with
+  # -incident-request-profiles-file, besides the built-ins named above (one
+  # with a built-in's name replaces it). Each is {name, metric,
+  # namespaceLabel, namespaceFallbackLabel, serviceLabel or podLabel,
+  # statusLabel, errorRegex}; kubesentry builds the PromQL itself, e.g.
+  #   - name: envoy
+  #     metric: envoy_cluster_upstream_rq_total
+  #     namespaceLabel: namespace
+  #     serviceLabel: service
+  #     statusLabel: response_code
+  requestProfiles: []
+  # -- -incident-alb: read ALB request counts and 5xx from CloudWatch for the
+  # target groups of TargetGroupBindings (AWS Load Balancer Controller).
+  # IAM: cloudwatch:GetMetricData and cloudwatch:ListMetrics.
+  alb: false
+  # -- -incident-event-normal-reasons: Normal Kubernetes event reasons kept
+  # besides every Warning. null keeps the default (SuccessfulRescale); []
+  # keeps Warnings only.
+  eventNormalReasons: null
+  # -- Container logs of an incident, read when someone views them (never stored).
+  logs:
+    # -- -incident-logs (auto): auto (CloudWatch first when group is set, then
+    # pods/log), kubernetes, cloudwatch or off. With kubernetes or auto the
+    # chart grants kubesentry get on pods/log.
+    mode: ""
+    # -- -incident-logs-group: the CloudWatch Logs group of container logs.
+    # With mode cloudwatch it defaults to Container Insights'
+    # /aws/containerinsights/<clusterName>/application. IAM: logs:FilterLogEvents.
+    group: ""
+    # -- -incident-logs-stream-prefix: a stream name prefix template with
+    # {namespace} and {pod}, when streams are named by pod. Empty: a filter
+    # pattern on the kubernetes.namespace_name and pod_name fields.
+    streamPrefix: ""
+    maxLines: null   # -incident-logs-max-lines (2000) lines one read returns at most
+    maxBytes: null   # -incident-logs-max-bytes (1MiB) bytes one read returns at most
+  # -- -incident-redact-patterns: regular expressions (RE2) whose matches are
+  # redacted from logs, event messages, CloudTrail records and bundles,
+  # besides the built-in secret shapes.
+  redactPatterns: []
+  # -- AWS changes attached to incidents as context (needs enabled).
+  cloudtrail:
+    # -- -cloudtrail: "off", lookup (the CloudTrail event history, through
+    # LookupEvents) or logs (a trail delivered to CloudWatch Logs). Quote
+    # "off": unquoted, YAML reads it as false.
+    mode: "off"
+    # -- -cloudtrail-log-group: with mode logs, the trail's log group.
+    logGroup: ""
+    # -- -cloudtrail-region: the region whose CloudTrail is read; defaults to
+    # eks.region.
+    region: ""
+    qps: null    # -cloudtrail-qps (1) LookupEvents calls per second; the account and region allow about 2, shared
+    start: null  # -cloudtrail-start (1h) how far back the first read goes; at most 24h
 
 # -- Node agent DaemonSet: reports the processes inside pods. Needs hostPID,
 # which the Pod Security baseline and restricted levels reject.

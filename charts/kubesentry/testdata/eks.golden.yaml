@@ -307,10 +307,25 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["get", "list", "watch"]
+  # The IRSA role annotations (eks.amazonaws.com/role-arn) that tie CloudTrail
+  # changes to workloads; only ServiceAccounts with one are kept.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
   # Optional: without cert-manager the Certificates page reports it as not installed.
   - apiGroups: ["cert-manager.io"]
     resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
     verbs: ["get", "list", "watch"]
+  # Optional: AWS Load Balancer Controller target groups, for ALB metrics and
+  # CloudTrail changes on incidents.
+  - apiGroups: ["elbv2.k8s.aws"]
+    resources: ["targetgroupbindings"]
+    verbs: ["list", "watch"]
+  # Incidents: Warning events (and the Normal reasons kept), watched by the
+  # replica running the incidents engine.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
   # Per-user scoping asks the API server what each signed-in user may see, and
   # the startup probe checks kubesentry's own access per resource.
   - apiGroups: ["authorization.k8s.io"]
@@ -373,6 +388,46 @@ rules:
   - apiGroups: ["kubesentry.io"]
     resources: ["agents"]
     verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/cloudtrail: the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-cloudtrail-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["cloudtrail"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# An incident's container logs, per namespace: the permission kubectl logs
+# needs, which kubesentry checks for each user. The built-in view role already
+# grants it; this role is for users who have narrower roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-logs-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
 
 ---
 # Source: kubesentry/templates/rbac.yaml
@@ -768,6 +823,10 @@ spec:
             - -cloudwatch-log-group=/aws/eks/prod-eks/cluster
             - -cloudwatch-start=24h
             - -aws-auth=true
+            - -incidents=true
+            - -incident-alb=true
+            - -incident-logs=cloudwatch
+            - -cloudtrail=lookup
           env:
             - name: POD_NAME
               valueFrom:
@@ -1312,6 +1371,48 @@ spec:
               15 minutes: findings are not reaching anyone. /info (alerts.lastError) names the Alertmanager and the error. If
               Alertmanager itself is down, this alert cannot reach you through it either.
             runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryalertmanagerfailing
+        - alert: KubesentryCloudTrailFailing
+          expr: min by (namespace, pod) (kubesentry_dependency_up{namespace="kubesentry",dependency="cloudtrail"}) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read CloudTrail.
+            description: >-
+              {{ $labels.pod }} has failed to read CloudTrail for 15 minutes, so AWS changes (security groups, target
+              groups, node groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycloudtrailfailing
+        # Events that could not be stored, and event lists or watches the API
+        # server refused (403) after the permission probe passed.
+        - alert: KubesentryIncidentEventsFailing
+          expr: |
+            sum by (namespace, pod) (increase(kubesentry_k8s_events_total{namespace="kubesentry",result="error"}[10m])) > 0
+            or
+            sum by (namespace, pod) (increase(kubesentry_kube_requests_total{namespace="kubesentry",resource="events",code="403"}[10m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is losing Kubernetes events for incidents.
+            description: >-
+              For 15 minutes {{ $labels.pod }} has failed to store Kubernetes events, or the API server has refused its event
+              watch. BackOff, Unhealthy and FailedScheduling events stop opening incidents, and incident pages miss their events.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+        - alert: KubesentryIncidentLogsFailing
+          expr: |
+            sum by (namespace, source) (increase(kubesentry_incident_log_fetches_total{namespace="kubesentry",result="error"}[30m])) > 0
+            unless on (namespace, source)
+            sum by (namespace, source) (increase(kubesentry_incident_log_fetches_total{namespace="kubesentry",result=~"ok|truncated"}[30m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read container logs for incidents.
+            description: >-
+              Every read of incident logs from {{ $labels.source }} in the last 30 minutes failed, so incident pages and
+              bundles show no logs. The log panel and the server log name the error: usually a missing permission
+              (pods/log, or logs:FilterLogEvents) or a log group that does not exist.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentlogsfailing
         - alert: KubesentryAgentNodesDropped
           expr: |
             max by (namespace) (kubesentry_agent_nodes_reporting{namespace="kubesentry"})
