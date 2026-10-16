@@ -145,17 +145,20 @@ export function useTimeInteraction(o: TimeInteraction) {
     o.onHover(snapT(t))
     if (a && Math.abs(px - a.px) >= DRAG_PX) setPending(a.t < t ? [a.t, t] : [t, a.t])
   }
-  const finish = (commit: boolean) => {
-    const p = pending
+  // The drag is read from the anchor and the release point, not from `pending`:
+  // React renders pointermove updates later, so the handler may not have seen the latest yet.
+  const finish = (e: PointerEvent<SVGSVGElement> | null) => {
+    const a = anchor.current
     anchor.current = null
     setPending(null)
-    if (commit && p && o.onBrush) {
-      const r = brushRange(p[0], p[1], o.domain)
-      if (r) o.onBrush(r)
-    }
+    if (!e || !a || !o.onBrush) return
+    const px = toSvg(e)
+    if (Math.abs(px - a.px) < DRAG_PX) return
+    const r = brushRange(a.t, timeAt(px, o.domain, o.left, o.width), o.domain)
+    if (r) o.onBrush(r)
   }
-  const onPointerUp = () => finish(true)
-  const onPointerCancel = () => finish(false)
+  const onPointerUp = (e: PointerEvent<SVGSVGElement>) => finish(e)
+  const onPointerCancel = () => finish(null)
   const onPointerLeave = () => {
     if (!anchor.current) o.onHover(null)
   }

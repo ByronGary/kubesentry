@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 import { hiddenNote } from '../access'
 import { ApiError } from '../api'
 import type { Range } from '../chartMath'
@@ -49,11 +49,19 @@ export function LogPanel(p: LogPanelProps) {
   const [source, setSource] = useState<LogSource>('auto')
   const [open, setOpen] = useState<Row | null>(null)
   const [wrap, w] = useWidth()
+  const hatch = `hatch-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
 
   const path = p.access === 'ok' ? logsPath(p.id, { from: p.range?.[0], to: p.range?.[1], pod, container, level, q, source }) : null
   const state = useApi<IncidentLogsResponse>(path)
   const data = state.data
-  const rows = useMemo<Row[]>(() => (data?.lines ?? []).map((l, i) => ({ ...l, i, t: Date.parse(l.time) })), [data])
+  // Sources interleave pods; oldest first reads as one story.
+  const rows = useMemo<Row[]>(
+    () =>
+      (data?.lines ?? [])
+        .map((l, i) => ({ ...l, i, t: Date.parse(l.time) }))
+        .sort((a, b) => (Number.isFinite(a.t) && Number.isFinite(b.t) ? a.t - b.t : 0) || a.i - b.i),
+    [data],
+  )
   const containers = useMemo(() => [...new Set([...rows.map((r) => r.container).filter(Boolean), ...(container ? [container] : [])])].sort(), [rows, container])
   const span = p.range ?? p.domain
   const volume = useMemo(() => logVolume(rows, p.domain, Math.max(12, Math.min(120, Math.floor(w / 9)))), [rows, p.domain, w])
@@ -66,7 +74,7 @@ export function LogPanel(p: LogPanelProps) {
 
   const err = state.error
   const columns: Column<Row>[] = [
-    { key: 'time', header: 'Time', width: 92, title: (r) => formatDateTime(r.time), cell: (r) => (Number.isFinite(r.t) ? clockSeconds.format(r.t) : '-') },
+    { key: 'time', header: 'Time', width: 116, title: (r) => formatDateTime(r.time), cell: (r) => (Number.isFinite(r.t) ? clockSeconds.format(r.t) : '-') },
     {
       key: 'level',
       header: 'Level',
@@ -226,6 +234,12 @@ export function LogPanel(p: LogPanelProps) {
                   const h = s.height - 2
                   return (
                     <g>
+                      <defs>
+                        <pattern id={hatch} width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                          <rect className="vol-hatch-bg" width="4" height="4" />
+                          <line className="vol-hatch" x1="0" y1="0" x2="0" y2="4" />
+                        </pattern>
+                      </defs>
                       {volume.all.map((c, i) => {
                         if (!c) return null
                         const e = volume.errors[i]
@@ -235,7 +249,7 @@ export function LogPanel(p: LogPanelProps) {
                         return (
                           <g key={i}>
                             <rect className="vol" x={x} y={s.height - 1 - hAll} width={Math.max(1, bw - 1)} height={hAll} />
-                            {hErr > 0 && <rect className="vol-err" x={x} y={s.height - 1 - hErr} width={Math.max(1, bw - 1)} height={hErr} />}
+                            {hErr > 0 && <rect className="vol-err" fill={`url(#${hatch})`} x={x} y={s.height - 1 - hErr} width={Math.max(1, bw - 1)} height={hErr} />}
                           </g>
                         )
                       })}

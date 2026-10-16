@@ -144,14 +144,18 @@ export function TimeChart(p: TimeChartProps) {
         .sort((a, b) => b.v - a.v)
     : []
 
-  // End labels beside the coloured lines, kept apart; on a phone the legend above names them.
-  const labelled = lines.filter((l) => l.slot > 0)
-  const endYs = spreadLabels(
-    labelled.map((l) => g.y(l.points[l.points.length - 1][1])),
+  // End labels beside the coloured lines and the threshold labels share the right margin, kept apart;
+  // on a phone the legend above names the lines.
+  const labelled = multi ? lines.filter((l) => l.slot > 0) : []
+  const thresholds = p.thresholds ?? []
+  const marginYs = spreadLabels(
+    [...thresholds.map((t) => g.y(t.value)), ...labelled.map((l) => g.y(l.points[l.points.length - 1][1]))],
     13,
-    m.top + 4,
+    Math.max(6, m.top - 6),
     bottom,
   )
+  const thresholdYs = marginYs.slice(0, thresholds.length)
+  const endYs = marginYs.slice(thresholds.length)
   const showEndLabels = m.right >= 80
   const restCount = lines.filter((l) => l.slot === 0).length
   const brushShown = ia.pending ?? p.brush ?? null
@@ -244,13 +248,13 @@ export function TimeChart(p: TimeChartProps) {
                 d={`${linePath(lines[0].points, g.x, g.y)}L${g.x(lines[0].points[lines[0].points.length - 1][0]).toFixed(1)},${g.y(0)}L${g.x(lines[0].points[0][0]).toFixed(1)},${g.y(0)}Z`}
               />
             )}
-            {(p.thresholds ?? []).map((t) => (
+            {thresholds.map((t, i) => (
               <g key={`${t.label}:${t.value}`}>
                 <line className="limit" x1={m.left} x2={right} y1={g.y(t.value)} y2={g.y(t.value)}>
                   <title>{t.title ?? `${p.format(t.value)} ${t.label}`}</title>
                 </line>
                 {showEndLabels ? (
-                  <text className="limit-label" x={right + 6} y={g.y(t.value)} dominantBaseline="middle">
+                  <text className="limit-label" x={right + 6} y={thresholdYs[i]} dominantBaseline="middle">
                     {p.format(t.value)} {t.label}
                   </text>
                 ) : (

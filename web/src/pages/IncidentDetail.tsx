@@ -13,6 +13,7 @@ import {
   chartLines,
   chartMarks,
   chartThresholds,
+  incidentDomain,
   incidentDuration,
   incidentHref,
   incidentPath,
@@ -75,13 +76,16 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
   const inc = d.incident
   const [hoverT, setHoverT] = useState<number | null>(null)
   const win = windowRange(d.window)
+  const items = useMemo(() => mergeTimeline(d), [d])
+  // The padded window, reaching back to a deploy or change the lookbehind attached; else the data's extent.
   const domain = useMemo<Range>(
-    () => sharedDomain(windowRange(d.window), (d.series ?? []).map((s) => extent(s.points))) ?? [Date.parse(inc.start) - 300_000, Date.now()],
-    [d.window, d.series, inc.start],
+    () =>
+      incidentDomain(windowRange(d.window), items) ??
+      sharedDomain(undefined, (d.series ?? []).map((s) => extent(s.points))) ?? [Date.parse(inc.start) - 300_000, Date.now()],
+    [d.window, d.series, inc.start, items],
   )
   const brush = readRange(route.query, domain)
   const setBrush = (r: Range | null) => setQuery(`/incidents/${encodeURIComponent(id)}`, rangeQuery(r))
-  const items = useMemo(() => mergeTimeline(d), [d])
   const marks = useMemo(() => chartMarks(items), [items])
   const access = sectionAccess(d.sources, { audit: can(info, 'audit'), cloudtrail: can(info, 'cloudtrail'), podLogs: can(info, 'podLogs') })
   const sev = severityGlyph(inc.severity)
@@ -276,7 +280,16 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
 
       <div className="inc-window" role="status">
         <p>
-          Window {formatDateTime(domain[0])} to {formatDateTime(domain[1])}. {pad}
+          {win ? (
+            <>
+              Logs and events are read from {formatDateTime(win[0])} to {formatDateTime(win[1])}. {pad}
+              {domain[0] < win[0] && ` The time axis starts at ${formatDateTime(domain[0])} to show changes attached from before.`}
+            </>
+          ) : (
+            <>
+              Time axis {formatDateTime(domain[0])} to {formatDateTime(domain[1])}. {pad}
+            </>
+          )}
         </p>
         {brush ? (
           <p>
@@ -307,7 +320,7 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
           <div className="inc-charts">
             {mem.lines.length > 0 && (
               <TimeChart
-                title="Memory (working set)"
+                title={mem.lines.length === 1 ? `Memory (working set) of ${mem.lines[0].label}` : 'Memory (working set)'}
                 summary={`Working-set memory of ${plural(mem.lines.length, 'one container', `${mem.lines.length} containers`)} around the incident.`}
                 lines={mem.lines}
                 format={formatBytes}
@@ -318,10 +331,14 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
               />
             )}
             {req.lines.length > 0 && (
-              <TimeChart title="Requests" summary="Request rate around the incident." lines={req.lines} format={formatRate} ticks={rateAxis} thresholds={req.thresholds} spans={req.spans} height={170} {...shared} />
+              <TimeChart
+                title={req.lines.length === 1 ? `Requests to ${req.lines[0].label}` : 'Requests'}
+                summary="Request rate around the incident." lines={req.lines} format={formatRate} ticks={rateAxis} thresholds={req.thresholds} spans={req.spans} height={170} {...shared} />
             )}
             {errs.lines.length > 0 && (
-              <TimeChart title="Error rate (5xx share)" summary="Share of requests that failed around the incident." lines={errs.lines} format={formatPercent} ticks={rateAxis} thresholds={errs.thresholds} spans={errs.spans} height={150} {...shared} />
+              <TimeChart
+                title={errs.lines.length === 1 ? `Error rate (5xx share) of ${errs.lines[0].label}` : 'Error rate (5xx share)'}
+                summary="Share of requests that failed around the incident." lines={errs.lines} format={formatPercent} ticks={rateAxis} thresholds={errs.thresholds} spans={errs.spans} height={150} {...shared} />
             )}
             {req.lines.length === 0 && (
               <p className="muted small">

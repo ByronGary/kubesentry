@@ -341,6 +341,19 @@ export function windowRange(w: IncidentDetail['window'] | undefined): Range | un
   return Number.isNaN(a) || Number.isNaN(b) || b <= a ? undefined : [a, b]
 }
 
+/**
+ * The time axis an incident's charts, lanes and logs share: its padded
+ * window, reaching back to the earliest thing attached to it (a deploy or a
+ * change caught by the lookbehind starts before the window), with a minute of
+ * margin. It reaches back at most 24 hours before the window.
+ */
+export function incidentDomain(window: Range | undefined, items: readonly Pick<TimelineItem, 't'>[], margin = 60_000): Range | undefined {
+  if (!window) return undefined
+  let lo = window[0]
+  for (const i of items) if (Number.isFinite(i.t) && i.t - margin < lo) lo = i.t - margin
+  return [Math.max(lo, window[0] - MAX_RANGE_HOURS * 3_600_000), window[1]]
+}
+
 /** "5 min", "1 h", "1 h 30 min", "45 s". */
 export function shortSpan(ms: number): string {
   if (!Number.isFinite(ms) || ms <= 0) return '0 min'
@@ -499,8 +512,8 @@ function ms(s: string | undefined): number | undefined {
   return Number.isNaN(t) ? undefined : t
 }
 
-/** What a signal's attributes add to its title: the image change, the replica change, how often. */
-export function signalDetail(s: Pick<IncidentSignal, 'type' | 'attrs' | 'count' | 'role'>): string | undefined {
+/** What a signal's attributes add to its title: the image change, the replica change, how often. Nothing the title already says. */
+export function signalDetail(s: Pick<IncidentSignal, 'type' | 'attrs' | 'count' | 'role'> & { title?: string }): string | undefined {
   const a = s.attrs ?? {}
   const parts: string[] = []
   if (s.type === 'deploy') {
@@ -509,8 +522,11 @@ export function signalDetail(s: Pick<IncidentSignal, 'type' | 'attrs' | 'count' 
   }
   if (s.type === 'scale' && a.from !== undefined && a.to !== undefined) parts.push(`${a.from} → ${a.to} replicas`)
   if (s.type === 'cloudtrail-change' && a.region) parts.push(a.region)
-  if (s.count && s.count > 1) parts.push(`${s.count} times`)
-  return parts.length ? parts.join(' · ') : undefined
+  const title = (s.title ?? '').toLowerCase()
+  // "212 error log lines" already says how often.
+  if (s.count && s.count > 1 && !new RegExp(`(^|\\D)${s.count}(\\D|$)`).test(title)) parts.push(`${s.count} times`)
+  const fresh = parts.filter((p) => !title.includes(p.toLowerCase()))
+  return fresh.length ? fresh.join(' · ') : undefined
 }
 
 /**
@@ -584,7 +600,7 @@ export function mergeTimeline(d: Pick<IncidentDetail, 'signals' | 'events' | 'au
       role: s.role,
       type: s.type,
       title: s.title || m.label,
-      detail: signalDetail(s),
+      detail: signalDetail({ ...s, title: s.title || m.label }),
       mark: m.mark,
     })
   }

@@ -9,6 +9,7 @@ import {
   clampWindow,
   filterQuery,
   incidentDuration,
+  incidentDomain,
   incidentHref,
   incidentsPath,
   inRange,
@@ -215,6 +216,13 @@ describe('the brushed range in the address', () => {
     expect(readRange(new URLSearchParams(''), win)).toBeNull()
     expect(readRange(new URLSearchParams(`from=${T0}&to=${T0 + MIN}`), undefined)).toBeNull()
   })
+  it('widens the shared axis back to a deploy caught by the lookbehind, at most 24 hours', () => {
+    const w: [number, number] = [T0 + 15 * MIN, T0 + 60 * MIN]
+    expect(incidentDomain(w, [{ t: T0 }, { t: T0 + 30 * MIN }])).toEqual([T0 - MIN, T0 + 60 * MIN])
+    expect(incidentDomain(w, [{ t: T0 + 20 * MIN }])).toEqual(w)
+    expect(incidentDomain(w, [{ t: T0 - 48 * 60 * MIN }])).toEqual([T0 + 15 * MIN - 24 * 60 * MIN, T0 + 60 * MIN])
+    expect(incidentDomain(undefined, [{ t: T0 }])).toBeUndefined()
+  })
   it('reads the padded window', () => {
     expect(windowRange({ from: iso(0), to: iso(10) })).toEqual([T0, T0 + 10 * MIN])
     expect(windowRange({ from: iso(10), to: iso(0) })).toBeUndefined()
@@ -382,6 +390,10 @@ describe('mergeTimeline', () => {
     expect(signalDetail({ type: 'scale', role: 'context', attrs: { from: '2', to: '6' } })).toBe('2 → 6 replicas')
     expect(signalDetail({ type: 'restart', role: 'trigger', count: 4 })).toBe('4 times')
     expect(signalDetail({ type: 'alert', role: 'trigger' })).toBeUndefined()
+    // Not what the title already says.
+    expect(signalDetail({ type: 'deploy', role: 'context', title: 'api rolled out revision 7: app: v1 → v2', attrs: { images: 'app: v1 → v2' } })).toBeUndefined()
+    expect(signalDetail({ type: 'log-errors', role: 'context', title: '212 error log lines', count: 212 })).toBeUndefined()
+    expect(signalDetail({ type: 'restart', role: 'trigger', title: 'api-1 restarted (exit 137)', count: 3 })).toBe('3 times')
   })
   it('copes with an empty detail', () => {
     expect(mergeTimeline({ signals: [], events: [] })).toEqual([])
