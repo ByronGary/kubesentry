@@ -156,6 +156,13 @@ rbac:
     # itself and never writes to the cluster or to Alertmanager's silences.
     alertsResponder:
       aggregateTo: []
+    # create investigations.kubesentry.io: start AI investigations of the
+    # incidents one can see (incidents.investigator), per namespace through a
+    # RoleBinding; node and cluster incidents need a ClusterRoleBinding. Each
+    # run sends a redacted digest of the incident to the model provider, so
+    # the default aggregates it into no role.
+    investigator:
+      aggregateTo: []
 
 # -- Server listener and tuning flags beyond the ones grouped elsewhere.
 server:
@@ -725,6 +732,41 @@ incidents:
     region: ""
     qps: null    # -cloudtrail-qps (1) LookupEvents calls per second; the account and region allow about 2, shared
     start: null  # -cloudtrail-start (1h) how far back the first read goes; at most 24h
+  # -- AI investigator (needs enabled): an agent that reads a redacted digest
+  # of one incident, pulls more evidence through read-only tools limited to
+  # the starting user's permissions, and reports a root cause, a timeline and
+  # read-only checks. Off by default: each run sends incident data to the
+  # model provider. Starting a run needs create on
+  # investigations.kubesentry.io (rbac.viewerRoles.investigator).
+  # docs/contracts.md "AI investigator"; Bedrock IAM in docs/deploy-eks.md.
+  investigator:
+    enabled: false
+    # -- -investigator: anthropic (the Anthropic API) or bedrock (Amazon Bedrock).
+    provider: anthropic
+    # -- -investigator-egress-ack: true accepts that a redacted digest of each
+    # investigated incident, and the logs, events, audit and CloudTrail
+    # records the starting user may see, go to the provider. Required.
+    acknowledgeDataEgress: false
+    # -- -investigator-model: empty uses claude-opus-5-5 (anthropic) or
+    # anthropic.claude-opus-5-5 (bedrock; an inference-profile ID or ARN works too).
+    model: ""
+    effort: null      # -investigator-effort (high): low, medium, high, xhigh or max
+    region: ""        # -investigator-region (bedrock); empty: eks.region, then AWS_REGION
+    bedrockAPI: ""    # -investigator-bedrock-api (mantle): mantle (bedrock-mantle Messages API) or runtime (InvokeModel)
+    endpoint: ""      # -investigator-endpoint: a proxy or VPC endpoint URL (Bedrock mantle: including /anthropic)
+    fallback: ""      # -investigator-fallback (auto): retry a declined turn on another model; off, or a model ID
+    timeout: null     # -investigator-timeout (10m) one investigation at most
+    limits:
+      perHour: null       # -investigator-per-hour (10) runs one user may start per hour; cache hits are free
+      perHourTotal: null  # -investigator-per-hour-total (60) runs everyone together may start per hour
+      concurrency: null   # -investigator-concurrency (2) runs one replica runs at once
+      maxTurns: null      # -investigator-max-turns (16) model turns per run
+      maxToolCalls: null  # -investigator-max-tool-calls (24) tool calls per run
+      maxTokens: null     # -investigator-max-tokens (1500000) tokens per run, every kind summed
+    # -- provider anthropic: the Secret holding the API key (set as
+    # ANTHROPIC_API_KEY in the server's environment), and its key.
+    existingSecret: ""
+    apiKeyKey: api-key
 
 # -- Node agent DaemonSet: reports the processes inside pods. Needs hostPID,
 # which the Pod Security baseline and restricted levels reject.
@@ -837,7 +879,7 @@ networkPolicy:
     # -- DNS to kube-dns / CoreDNS in kube-system.
     dns: true
     # -- 443 (and 6443) for the Kubernetes API server and AWS APIs (STS,
-    # CloudWatch Logs, AMP) and the IdP. 0.0.0.0/0 unless you route AWS APIs
+    # CloudWatch Logs, AMP, Bedrock), the IdP and the investigator's model API. 0.0.0.0/0 unless you route AWS APIs
     # through VPC endpoints and know the API server's addresses.
     https:
       toCIDRs: ["0.0.0.0/0"]

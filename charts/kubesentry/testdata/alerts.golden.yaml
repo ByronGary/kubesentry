@@ -301,6 +301,25 @@ rules:
 
 ---
 # Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/investigations: start AI investigations of the incidents one can see (incidents.investigator): bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and node incidents; each run sends a redacted digest of the incident to the model provider.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-investigator
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["investigations"]
+    verbs: ["create"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
 # An incident's container logs, per namespace: the permission kubectl logs
 # needs, which kubesentry checks for each user. The built-in view role already
 # grants it; this role is for users who have narrower roles.

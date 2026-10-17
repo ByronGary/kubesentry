@@ -17,7 +17,7 @@ Next, in rough order: the stress-run fixes (SubjectAccessReview budget at 1k+ ne
 ## Conventions
 - Module path is `github.com/ByronGary/kubesentry` (repo https://github.com/ByronGary/kubesentry).
 - Commits in this project carry no Claude co-author or "Generated with Claude" trailer.
-- Only `internal/kube` imports client-go, only `internal/pgstore` pgx, only `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**` and `internal/llm` the AWS SDK, and only `internal/llm` the Anthropic SDK. Everything else is stdlib, so tests need no cluster and no model. Keep it that way.
+- Only `internal/kube` imports client-go, only `internal/pgstore` pgx, only `internal/cloudwatch`, `internal/awsauth`, `internal/aws/**` and `internal/llm` the AWS SDK, and only `internal/llm` the Anthropic SDK (`internal/depcheck`'s test enforces all of these). Everything else is stdlib, so tests need no cluster and no model. Keep it that way.
 - Handlers serve the snapshot view filtered by the caller's scope (`internal/api/views.go`); they never list the cluster or run detectors per request. Derive per-view data with `View.Memo`, never mutate a view, and list every capability a cached route depends on in `cachedRoutes`. The authorization leak test (`TestNoAuthorizationLeaks`) must cover any new list route.
 - Postgres migrations (`internal/pgstore/migrations`) are forward-only, and each runs once under an advisory lock. Index builds on `audit_events` block writes while they run. That is fine for a new store, but a migration that adds an index to a populated store should build it per partition with `CREATE INDEX CONCURRENTLY` (outside the migration transaction), then attach it to an `ON ONLY` parent index.
 - Detectors work on plain `internal/model` types.

@@ -201,7 +201,8 @@
             "agentsViewer": { "$ref": "#/definitions/viewerRole" },
             "cloudtrailViewer": { "$ref": "#/definitions/viewerRole" },
             "logsViewer": { "$ref": "#/definitions/viewerRole" },
-            "alertsResponder": { "$ref": "#/definitions/viewerRole" }
+            "alertsResponder": { "$ref": "#/definitions/viewerRole" },
+            "investigator": { "$ref": "#/definitions/viewerRole" }
           }
         }
       }
@@ -700,6 +701,36 @@
               "pattern": "^([0-9]*[1-9][0-9]*(\\.[0-9]+)?|[0-9]+\\.[0-9]*[1-9][0-9]*)$"
             },
             "start": { "$ref": "#/definitions/durationOrNull" }
+          }
+        },
+        "investigator": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "provider": { "enum": ["anthropic", "bedrock"] },
+            "acknowledgeDataEgress": { "type": "boolean" },
+            "model": { "type": "string" },
+            "effort": { "enum": ["low", "medium", "high", "xhigh", "max", null] },
+            "region": { "type": "string", "pattern": "^([a-z]{2}(-[a-z]+)+-[0-9])?$" },
+            "bedrockAPI": { "enum": ["", "mantle", "runtime"] },
+            "endpoint": { "type": "string", "pattern": "^(https?://[^\\s/]+(/\\S*)?)?$" },
+            "fallback": { "type": "string", "pattern": "^\\S*$" },
+            "timeout": { "$ref": "#/definitions/durationOrNull" },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "perHour": { "type": ["integer", "null"], "minimum": 1 },
+                "perHourTotal": { "type": ["integer", "null"], "minimum": 1 },
+                "concurrency": { "type": ["integer", "null"], "minimum": 1 },
+                "maxTurns": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 },
+                "maxToolCalls": { "type": ["integer", "null"], "minimum": 1, "maximum": 200 },
+                "maxTokens": { "type": ["integer", "null"], "minimum": 10000 }
+              }
+            },
+            "existingSecret": { "type": "string" },
+            "apiKeyKey": { "type": "string", "minLength": 1 }
           }
         }
       }

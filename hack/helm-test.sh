@@ -107,6 +107,9 @@ lint eks -f "$CHART/examples/values-eks.yaml"
 lint dashboards --set metrics.grafanaDashboards.enabled=true
 lint alerts -f "$TESTDATA/alerts.values.yaml"
 lint incidents -f "$TESTDATA/incidents.values.yaml"
+lint investigator -f "$TESTDATA/investigator.values.yaml"
+lint investigator-bedrock -f "$TESTDATA/incidents.values.yaml" --set incidents.investigator.enabled=true \
+  --set incidents.investigator.provider=bedrock --set incidents.investigator.acknowledgeDataEgress=true
 
 echo "== golden renders"
 golden default
@@ -120,6 +123,9 @@ golden alerts -f "$TESTDATA/alerts.values.yaml"
 # Incidents with every value set: CloudWatch logs then pods/log, CloudTrail
 # lookup, a request profile ConfigMap, the read-only RBAC and the rules.
 golden incidents -f "$TESTDATA/incidents.values.yaml"
+# The AI investigator on the Anthropic API: the key from a Secret, every
+# value set, the investigator role aggregated into admin.
+golden investigator -f "$TESTDATA/investigator.values.yaml"
 
 echo "== refused configurations"
 # Two replicas would each keep a partial, different audit history.
@@ -156,6 +162,16 @@ refuses schema-allowed-origins --set 'server.allowedOrigins={portal.example.com}
 refuses schema-digest-at --set 'alerts.digests.at=9am'
 # An incident covers at most 24 hours.
 refuses schema-incidents-max-range --set incidents.enabled=true --set incidents.maxRange=48h
+# The investigator sends incident data to the provider only when acknowledged...
+refuses guardrail-investigator-ack --set incidents.enabled=true --set incidents.investigator.enabled=true \
+  --set incidents.investigator.existingSecret=anthropic
+# ...investigates incidents...
+refuses guardrail-investigator-incidents --set incidents.investigator.enabled=true \
+  --set incidents.investigator.acknowledgeDataEgress=true --set incidents.investigator.existingSecret=anthropic
+# ...and on the Anthropic API needs the key's Secret.
+refuses guardrail-investigator-secret --set incidents.enabled=true --set incidents.investigator.enabled=true \
+  --set incidents.investigator.acknowledgeDataEgress=true
+refuses schema-investigator-provider --set incidents.investigator.provider=openai
 
 if [ "$failed" -ne 0 ]; then
   echo "helm tests FAILED"

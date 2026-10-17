@@ -84,6 +84,7 @@ kubesentry calls these AWS APIs, all with the pod's own role:
 - CloudWatch Logs, for the audit log and, with incidents, container logs and a CloudTrail trail
 - AMP, for metrics
 - with incidents: CloudWatch metrics for the ALB, and CloudTrail's event history
+- with the AI investigator on Bedrock: Claude through Amazon Bedrock ([below](#ai-investigator-on-amazon-bedrock))
 - RDS IAM authentication, which is optional and only applies when you use it
 
 The agent needs no AWS access.
@@ -149,6 +150,84 @@ Replace the region, account, cluster name and workspace ID.
 - **`logs:FilterLogEvents`** on the container log group (`incidents.logs`: Container Insights' `/aws/containerinsights/<cluster>/application` by default with `mode: cloudwatch`, or `logs.group`). Add the trail's group only with `incidents.cloudtrail.mode: logs`. If the trail is in another region (`cloudtrail.region`), use that region in its ARN.
 - **`cloudwatch:GetMetricData`** and **`cloudwatch:ListMetrics`** for `incidents.alb`. Both are evaluated against `*`. The query is a `SEARCH` expression over `AWS/ApplicationELB`, and whether `SEARCH` needs `ListMetrics` as well is not settled, so grant both.
 - **`cloudtrail:LookupEvents`** for `incidents.cloudtrail.mode: lookup`. It supports no resource scoping. It reads the event history of the role's account in one region (`cloudtrail.region`, default `eks.region`). **The limit of about 2 calls per second is shared per account and region** by every caller: the console, other tools, other kubesentry installs. kubesentry uses 1 by default (`cloudtrail.qps`) and backs off when throttled. With other heavy users of the history, lower it or read a trail from CloudWatch Logs instead.
+
+### AI investigator on Amazon Bedrock
+
+The investigator (`incidents.investigator`, off by default) sends a redacted digest of an incident, and the logs, events, audit and CloudTrail records the starting user may see, to the model provider, then reads its report. With `provider: bedrock` that provider is Claude in Amazon Bedrock, called with the pod's role. Nothing else changes for kubesentry's other AWS calls.
+
+**Model access.** In the Bedrock console of the region you use, request access to Anthropic's Claude Opus 5.5 (Model access; the first Anthropic model in an account also asks for the use-case form). The investigator also uses Claude Opus 5 as its refusal fallback (below), so request access to it too, or set `fallback: "off"`.
+
+**Which Bedrock API.** `bedrockAPI` picks one of two endpoints; both take the Anthropic Messages API shape from the official Go SDK, stream, and sign with SigV4 using the pod's role.
+
+| `bedrockAPI` | Endpoint | Model ID | IAM action |
+|---|---|---|---|
+| `mantle` (default) | `https://bedrock-mantle.<region>.api.aws/anthropic/v1/messages` | `anthropic.claude-opus-5-5` | `bedrock-mantle:CreateInference` on `arn:aws:bedrock-mantle:<region>:<account>:project/*` |
+| `runtime` | `https://bedrock-runtime.<region>.amazonaws.com/model/<model>/invoke-with-response-stream` | `anthropic.claude-opus-5-5`, an inference profile such as `us.anthropic.claude-opus-5-5` or `global.anthropic.claude-opus-5-5`, or a profile ARN | `bedrock:InvokeModelWithResponseStream` on the foundation-model and inference-profile ARNs |
+
+With `runtime`, models launched for cross-Region inference only answer through an inference profile: set `model` to the profile ID (`us.anthropic.claude-opus-5-5`) or ARN. With a profile, the role needs the action on the profile and on the foundation model in every Region the profile routes to.
+
+```json
+{
+  "Sid": "InvestigatorBedrockMantle",
+  "Effect": "Allow",
+  "Action": ["bedrock-mantle:CreateInference"],
+  "Resource": "arn:aws:bedrock-mantle:us-east-1:111122223333:project/*",
+  "Condition": {
+    "StringLike": { "bedrock-mantle:Model": ["anthropic.claude-opus-5-5", "anthropic.claude-opus-5"] }
+  }
+},
+{
+  "Sid": "InvestigatorBedrockRuntime",
+  "Effect": "Allow",
+  "Action": ["bedrock:InvokeModelWithResponseStream", "bedrock:InvokeModel"],
+  "Resource": [
+    "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-opus-5-5",
+    "arn:aws:bedrock:us-east-1:111122223333:inference-profile/us.anthropic.claude-opus-5",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5-5",
+    "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-5"
+  ]
+}
+```
+
+Keep the statement for the API you use. The `bedrock-mantle:Model` condition key limits which models the role may call; drop it if your account's Mantle policy does not evaluate it. The AWS managed policy `AmazonBedrockMantleInferenceAccess` grants Mantle inference more broadly. kubesentry streams every turn, so `bedrock:InvokeModel` (non-streaming) is only there for tools you may run by hand.
+
+**Refusal fallback.** Claude's safety classifiers can decline a request. With `fallback: auto` (the default) the investigator retries a declined turn on Claude Opus 5 through the SDK's client-side fallback: `anthropic.claude-opus-5`, or the same inference-profile prefix as the model (`us.anthropic.claude-opus-5`). An inference-profile ARN has no automatic fallback; name one with `fallback: <model ID>`, or turn it off with `fallback: "off"` (a declined turn then ends the run as refused). The run's progress notes which turns the fallback model answered.
+
+**Credentials.** The investigator uses the same role as the rest of kubesentry: IRSA or Pod Identity ([below](#irsa-or-eks-pod-identity)) work unchanged. A Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` (through `extraEnv` from a Secret) is used instead of the role when set; the role is the better choice.
+
+**Private networking.** Without a route to the internet, create the interface VPC endpoint for the API you use, with private DNS: `com.amazonaws.<region>.bedrock-mantle` (DNS `bedrock-mantle.<region>.api.aws`) or `com.amazonaws.<region>.bedrock-runtime` (DNS `bedrock-runtime.<region>.amazonaws.com`), besides STS (`com.amazonaws.<region>.sts`, for IRSA) or EKS Auth (`com.amazonaws.<region>.eks-auth`, for Pod Identity). Without private DNS, point `endpoint` at the endpoint's DNS name (for Mantle including `/anthropic`).
+
+**Network policy.** The investigator connects out on 443, which `networkPolicy.egress.https` already allows (`0.0.0.0/0` by default). If you narrow `toCIDRs`, include the Bedrock VPC endpoint's ENIs, or, for `provider: anthropic`, the route to `api.anthropic.com` (an egress proxy through `HTTPS_PROXY` in `extraEnv` works too).
+
+```yaml
+incidents:
+  enabled: true
+  investigator:
+    enabled: true
+    provider: bedrock
+    acknowledgeDataEgress: true
+    bedrockAPI: mantle           # or runtime, with model: us.anthropic.claude-opus-5-5
+    # region: us-east-1          # default eks.region
+rbac:
+  viewerRoles:
+    investigator:
+      aggregateTo: []            # bind <release>-investigator to the people who may start runs
+```
+
+With `provider: anthropic` instead, create the key's Secret first and name it; kubesentry reads it as `ANTHROPIC_API_KEY` and never from a file or flag:
+
+```bash
+kubectl -n kubesentry create secret generic kubesentry-anthropic --from-literal=api-key="$ANTHROPIC_API_KEY"
+```
+
+```yaml
+incidents:
+  investigator:
+    enabled: true
+    provider: anthropic
+    acknowledgeDataEgress: true
+    existingSecret: kubesentry-anthropic
+```
 
 Add these statements only for the features that use them:
 
@@ -602,6 +681,7 @@ With `egress.enabled`, the pods may reach only:
 - the VPC subnets that hold the cluster's API server endpoint ENIs
 - the cluster's service CIDR, since CNIs differ in whether they see the `kubernetes` Service's ClusterIP or the translated address
 - your VPC endpoints for STS, CloudWatch Logs and AMP, and with incidents CloudWatch (`com.amazonaws.<region>.monitoring`) and CloudTrail
+- with the AI investigator, the Bedrock endpoint it uses (`com.amazonaws.<region>.bedrock-mantle` or `bedrock-runtime`), or the route to `api.anthropic.com`
 
 `kubectl port-forward` does not cross the pod network, so the break-glass path (token mode, port 8080) keeps working under any policy. With the sidecar there is no TCP port to forward to kubesentry itself: see the break-glass step in section 14.
 
@@ -746,3 +826,4 @@ helm rollback kubesentry <revision> -n kubesentry
 10. **Break-glass:** with the sidecar, kubesentry listens only on the Unix socket inside the pod, so neither the token nor forged identity headers reach it from outside: `kubectl -n kubesentry port-forward deploy/kubesentry 8080` fails to connect. When SSO is down, `helm upgrade --reuse-values --set oauth2Proxy.enabled=false` switches to token mode on port 8080; then that port-forward with the API token from `kubectl -n kubesentry get secret kubesentry-api -o jsonpath='{.data.token}' | base64 -d` reaches `/api/v1/info`. Store the token in your vault, or set `tokens.api.enabled: false` if you do not want one.
 11. **Pod Security:** `kubectl label --dry-run=server --overwrite namespace kubesentry pod-security.kubernetes.io/enforce=restricted` prints no warnings.
 12. **Incidents:** `GET /api/v1/info` shows `incidents.enabled`, and `incidents.sources` lists `ok` for `events`, `memory`, `logs:cloudwatch`, `cloudtrail` and the request sources in use (`absent` where there are no such metrics). With CloudTrail, an `error` names the missing IAM action. On the Incidents page, an incident's log panel shows lines, and a CloudTrail viewer sees the AWS changes lane.
+13. **Investigator** (when enabled): `GET /api/v1/info` shows `investigator` with the provider, model and effort. As someone bound to `<release>-investigator` in a namespace, start an investigation of one of its incidents: `kubesentry_llm_requests_total` counts `200`s, and the run completes with a report. A `403` from Bedrock names the missing IAM action or model access.

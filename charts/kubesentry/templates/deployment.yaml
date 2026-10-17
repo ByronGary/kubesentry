@@ -164,6 +164,14 @@ spec:
                   name: {{ .Values.prometheus.bearerTokenSecret.name }}
                   key: {{ .Values.prometheus.bearerTokenSecret.key }}
             {{- end }}
+            {{- $ivr := .Values.incidents.investigator }}
+            {{- if and .Values.incidents.enabled $ivr.enabled (eq $ivr.provider "anthropic") }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $ivr.existingSecret }}
+                  key: {{ $ivr.apiKeyKey }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -1,0 +1,31 @@
+# The investigator golden case (hack/helm-test.sh): incidents on one replica
+# with the memory store, and the AI investigator on the Anthropic API with
+# every value set; the API key comes from a Secret, the investigator role is
+# aggregated into admin.
+clusterName: prod-eks
+eks:
+  region: us-east-1
+rbac:
+  viewerRoles:
+    investigator:
+      aggregateTo: [admin]
+incidents:
+  enabled: true
+  investigator:
+    enabled: true
+    provider: anthropic
+    acknowledgeDataEgress: true
+    model: claude-opus-5-5
+    effort: high
+    endpoint: https://llm-proxy.internal.example.com
+    fallback: "off"
+    timeout: 15m
+    limits:
+      perHour: 5
+      perHourTotal: 30
+      concurrency: 1
+      maxTurns: 12
+      maxToolCalls: 20
+      maxTokens: 1000000
+    existingSecret: kubesentry-anthropic
+    apiKeyKey: api-key

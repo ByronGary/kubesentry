@@ -250,6 +250,18 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- else if ne $ctMode "off" -}}
 {{- fail (printf "kubesentry: incidents.cloudtrail.mode=%s attaches AWS changes to incidents: it needs incidents.enabled." $ctMode) -}}
 {{- end -}}
+{{- $ivr := $inc.investigator -}}
+{{- if $ivr.enabled -}}
+{{- if not $ivr.acknowledgeDataEgress -}}
+{{- fail (printf "kubesentry: incidents.investigator sends a redacted digest of each investigated incident, and the logs, events, audit and CloudTrail records the starting user may see, to %s. Set incidents.investigator.acknowledgeDataEgress=true to accept that." $ivr.provider) -}}
+{{- end -}}
+{{- if not $inc.enabled -}}
+{{- fail "kubesentry: incidents.investigator investigates incidents: it needs incidents.enabled." -}}
+{{- end -}}
+{{- if and (eq $ivr.provider "anthropic") (not $ivr.existingSecret) -}}
+{{- fail "kubesentry: incidents.investigator.provider=anthropic needs incidents.investigator.existingSecret, a Secret holding the Anthropic API key under incidents.investigator.apiKeyKey (the server reads it as ANTHROPIC_API_KEY)." -}}
+{{- end -}}
+{{- end -}}
 {{- if and (gt (int $v.replicas) 1) (eq $v.audit.store "memory") $sources -}}
 {{- fail (printf "kubesentry: replicas=%d with audit.store=memory and audit sources enabled (%s): each replica would keep a different, partial audit history. Set audit.store=postgres with audit.postgres.existingSecret, or replicas=1." (int $v.replicas) $sources) -}}
 {{- end -}}
@@ -494,6 +506,23 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- with $ct.region }}{{ $a = append $a (printf "-cloudtrail-region=%s" .) }}{{ end -}}
 {{- if not (kindIs "invalid" $ct.qps) }}{{ $a = append $a (printf "-cloudtrail-qps=%s" (include "kubesentry.scalar" $ct.qps)) }}{{ end -}}
 {{- with $ct.start }}{{ $a = append $a (printf "-cloudtrail-start=%s" .) }}{{ end -}}
+{{- end -}}
+{{- $ivr := $inc.investigator -}}
+{{- if $ivr.enabled -}}
+{{- $a = append $a (printf "-investigator=%s" $ivr.provider) -}}
+{{- $a = append $a "-investigator-egress-ack=true" -}}
+{{- with $ivr.model }}{{ $a = append $a (printf "-investigator-model=%s" .) }}{{ end -}}
+{{- with $ivr.effort }}{{ $a = append $a (printf "-investigator-effort=%s" .) }}{{ end -}}
+{{- with $ivr.region }}{{ $a = append $a (printf "-investigator-region=%s" .) }}{{ end -}}
+{{- if eq $ivr.provider "bedrock" }}{{ with $ivr.bedrockAPI }}{{ $a = append $a (printf "-investigator-bedrock-api=%s" .) }}{{ end }}{{ end -}}
+{{- with $ivr.endpoint }}{{ $a = append $a (printf "-investigator-endpoint=%s" .) }}{{ end -}}
+{{- with $ivr.fallback }}{{ $a = append $a (printf "-investigator-fallback=%s" .) }}{{ end -}}
+{{- with $ivr.timeout }}{{ $a = append $a (printf "-investigator-timeout=%s" .) }}{{ end -}}
+{{- $lflags := dict "perHour" "investigator-per-hour" "perHourTotal" "investigator-per-hour-total" "concurrency" "investigator-concurrency" "maxTurns" "investigator-max-turns" "maxToolCalls" "investigator-max-tool-calls" "maxTokens" "investigator-max-tokens" -}}
+{{- range $key, $flag := $lflags -}}
+{{- $val := index $ivr.limits $key -}}
+{{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- range $v.extraArgs }}{{ $a = append $a . }}{{ end -}}
