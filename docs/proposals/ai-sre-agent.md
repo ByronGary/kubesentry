@@ -99,6 +99,28 @@ A patch that fails any check is shown with the reason, and the "Open draft PR" b
 - **Credentials:** a GitHub App installed on the allowed repos (preferred: per-repo, short-lived tokens, a bot identity), or a fine-grained token with `contents:write` and `pull_requests:write` on those repos only. Without one, the button is hidden and the diff can be copied or downloaded.
 - **Branch protection, review rules and CODEOWNERS** apply as for any PR. kubesentry never pushes to the default branch and never merges.
 
+## Project profiles and memory
+
+Without memory, every run rediscovers how an app is laid out, which costs turns and tokens. A **project profile** per app gives each run a head start, and past reports let the agent recognise a repeat.
+
+**The profile** (one per ArgoCD Application, or per workload root without ArgoCD), at most 8 KiB:
+- **How it's mapped:** the repo, path and deployed revision; the chart and value files; the Dockerfile; the main config files (where limits, probes and environment are set).
+- **How it's built and deployed:** the image name and build workflow file, ArgoCD sync policy, and environments seen (from Application names or namespaces).
+- **Who and what:** owner (the alerting owner rules), runbook links (`kubesentry.io/runbook` annotation or a `RUNBOOK.md` in the repo), dependencies seen in the topology map (Services it calls and is called by).
+- **Known issues:** the last 10 incidents and investigations for the app, each as one line with its root cause and date.
+
+**How it's kept:**
+- **Generated** by a short agent run, with a budget of a few turns, the first time an app is investigated or when an owner asks for it. That run uses only the read tools, and its output goes through the same egress filter and validation as a report.
+- **Refreshed** when the deployed revision changes in a way that touches the mapped files (checked through the commit history, so an unrelated commit doesn't trigger a run), and at most once a day per app.
+- **Stored** in kubesentry (Postgres table `app_profiles`, or memory), with the revision it describes. It holds summaries and file paths, never copies of source files.
+- **Shown** on the app's page, editable by its owner. Edits are kept across refreshes, so people can correct it.
+
+**How runs use it:**
+- The profile goes into the first message next to the digest, marked as kubesentry's own notes (not cluster data) but still checked against what the tools show: when the profile and the repo disagree, the repo wins and the profile is refreshed.
+- New tool `recall_incidents`: past reports for the same app or for apps sharing a dependency, searched by signal types and error templates, so the agent can say "this matches the incident of 3 October, fixed by raising the memory limit". Only reports the caller may read are returned, by the same frozen-access rule as everything else.
+
+**What it is not:** no training or fine-tuning, no vector index of source code, no copy of repos. If profiles are turned off (`-sre-profiles=false`), runs work as before, only slower.
+
 ## Proactive reviews (phase 2)
 
 Opt-in, scheduled like the standing digests, per owner. The agent reviews each owner's applications for:
@@ -128,6 +150,7 @@ It produces one report per owner, with suggested diffs. These are never opened a
 | `internal/gitprovider`, `internal/gitprovider/github` | `Repo` interface (read file, list, search, history, create branch/commit/draft PR) and the GitHub REST client | stdlib (`net/http`, JWT signing for the GitHub App with `crypto`) |
 | `internal/kube` | ArgoCD Application/ApplicationSet informers; keep Helm's labels and annotations | client-go (already) |
 | `internal/argocd` | optional ArgoCD API client for diffs | stdlib |
+| `internal/investigate/profile` | profile generation, refresh rules, `recall_incidents`; the `app_profiles` store in `internal/pgstore` | stdlib (pgx only in pgstore) |
 | `internal/patch` | unified-diff parse and apply, path rules | stdlib |
 | render sandbox | `helm template`, `kustomize build`, kubeconform as subprocesses with a timeout, no network, a temp dir | external binaries in the image (optional) |
 
@@ -136,7 +159,7 @@ It produces one report per owner, with suggested diffs. These are never opened a
 | Phase | Delivers |
 |---|---|
 | A | ArgoCD informers and `get_argocd_app` / `get_helm_release`; alerts and questions as triggers; the Ask box on namespace and app pages |
-| B | GitHub read tools, repo mapping, `propose_change` with patch validation; diffs in the UI |
+| B | GitHub read tools, repo mapping, `propose_change` with patch validation; diffs in the UI; **project profiles** (generate, refresh on relevant revisions, owner edits) and `recall_incidents` |
 | C | Draft PRs through a GitHub App; the `pullrequests` capability; PR audit |
 | D | Render-and-lint validation, the ArgoCD diff API, proactive reviews |
 
@@ -147,6 +170,7 @@ It produces one report per owner, with suggested diffs. These are never opened a
 3. **ArgoCD API access for field-level diffs.** Is a read-only ArgoCD account acceptable?
 4. **Proactive reviews:** wanted, and how often?
 5. **Who may open PRs:** the same people who may investigate, or a narrower group?
+6. **Project profiles:** generated automatically on first investigation (proposed), or only when an owner asks?
 
 ## Risks
 
@@ -154,4 +178,5 @@ It produces one report per owner, with suggested diffs. These are never opened a
 - **Suggestions that look right and are wrong.** Validation proves a patch applies and renders, not that it is correct. Reviews stay human.
 - **Repo mapping** fails for workloads without ArgoCD or annotations; the agent then says so and stays diagnostic.
 - **GitHub API rate limits** (code search especially) on large organisations.
+- **Stale or wrong profiles** could mislead a run. The repo wins on conflict, profiles record their revision, and owners can edit them.
 - **ArgoCD versions** differ in API shape; only the Application CRD fields are relied on in phase A.
