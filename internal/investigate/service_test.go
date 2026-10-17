@@ -566,3 +566,44 @@ func TestMemoryStore(t *testing.T) {
 		t.Errorf("update a missing run: %v", err)
 	}
 }
+
+// A reply a refusal fallback served is recorded as a note naming the model
+// that answered, and every request names its run (the client-side
+// fallback keeps a run on the model that accepted it).
+func TestServiceRecordsFallbackModel(t *testing.T) {
+	served := func(turn investigatetest.Turn) investigatetest.Turn {
+		return func(ctx context.Context, req *investigate.Request) (*investigate.Response, error) {
+			resp, err := turn(ctx, req)
+			if resp != nil {
+				resp.ServedBy = "claude-opus-5"
+			}
+			return resp, err
+		}
+	}
+	llm := investigatetest.New(
+		served(investigatetest.Tools(investigatetest.Call{Name: investigate.ToolGetLogs, Input: map[string]any{"level": "error"}})),
+		investigatetest.SubmitFromRefs(func(refs []string) any { return investigatetest.Report(refs...) }),
+	)
+	svc := newService(t, llm, source(), nil)
+	inv := startAndWait(t, svc, allAccess)
+	if inv.Status != investigate.Completed {
+		t.Fatalf("investigation %+v", inv)
+	}
+	notes := 0
+	for _, s := range inv.Steps {
+		if s.Kind == investigate.StepNote && strings.Contains(s.Text, "the fallback model claude-opus-5 answered") {
+			notes++
+			if !strings.HasPrefix(s.Text, "turn 1: "+investigate.DefaultModel+" declined") {
+				t.Errorf("note %q", s.Text)
+			}
+		}
+	}
+	if notes != 1 {
+		t.Errorf("%d fallback notes:\n%s", notes, stepTexts(inv.Steps))
+	}
+	for i, r := range llm.Requests() {
+		if r.Conversation != inv.ID {
+			t.Errorf("request %d names conversation %q, want %q", i, r.Conversation, inv.ID)
+		}
+	}
+}

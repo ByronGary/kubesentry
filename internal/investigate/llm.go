@@ -72,6 +72,11 @@ type Request struct {
 	// OutputSchema asks for a JSON reply matching it (structured output);
 	// only on the fallback final turn.
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+	// Conversation names the run the request belongs to. It is not sent:
+	// an adapter whose refusal fallback is client-side keeps a run on the
+	// model that accepted it, keyed by this (the server-side fallback does
+	// the same by itself).
+	Conversation string `json:"conversation,omitempty"`
 }
 
 // ToolDef declares one tool.
@@ -122,6 +127,11 @@ type Response struct {
 	Refusal   *Refusal `json:"refusal,omitempty"`
 	Usage     Usage    `json:"usage"`
 	RequestID string   `json:"requestId,omitempty"`
+	// ServedBy is the model that produced the reply when a refusal
+	// fallback served it (the requested model declined and another model
+	// answered); empty when the requested model answered. Usage then
+	// counts every attempt.
+	ServedBy string `json:"servedBy,omitempty"`
 }
 
 // Refusal is the model declining (stop_reason "refusal", stop_details).

@@ -345,7 +345,7 @@ func (s *Service) run(ctx context.Context, j *job, tb *toolbox, digest []byte) {
 	ctx, cancelT := context.WithTimeoutCause(ctx, s.o.Timeout, errTimeout)
 	defer cancelT()
 	provider, model := s.Provider(), s.o.Model
-	a := &agent{llm: s.c.LLM, tb: tb, o: s.o, now: s.now, p: j.p, digest: digest, hooks: agentHooks{
+	a := &agent{llm: s.c.LLM, tb: tb, o: s.o, now: s.now, p: j.p, digest: digest, conv: j.inv.ID, hooks: agentHooks{
 		onTokens: func(u Usage) {
 			if h := s.c.Hooks.OnTokens; h != nil {
 				h(provider, model, u)

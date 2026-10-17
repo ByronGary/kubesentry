@@ -151,6 +151,8 @@ type agent struct {
 	msgs   []Message
 	calls  int // tool calls counted against the budget (submit_report excluded)
 	digest []byte
+	// conv names the run to the model adapter (Request.Conversation).
+	conv string
 }
 
 // outcome is how a run ended.
@@ -196,7 +198,7 @@ func (a *agent) request(ph phase, maxTokens int) *Request {
 	last.Content = append([]Block(nil), last.Content...)
 	last.Content[len(last.Content)-1].Cache = true
 	req := &Request{Model: a.o.Model, Effort: a.o.Effort, System: systemPrompt, CacheSystem: true, Tools: a.defs, Messages: msgs,
-		MaxTokens: maxTokens}
+		MaxTokens: maxTokens, Conversation: a.conv}
 	if ph == phaseFinal {
 		req.ToolChoiceNone = true
 		req.OutputSchema = ReportSchema()
@@ -464,6 +466,10 @@ func (a *agent) send(ctx context.Context, req *Request) (*Response, error) {
 		what = plural(calls, "tool call", "tool calls")
 	}
 	a.p.step(Step{At: a.now(), Kind: StepTurn, Text: fmt.Sprintf("turn %d: %s (%d tokens)", n, what, resp.Usage.Total())})
+	if resp.ServedBy != "" {
+		a.note("turn %d: %s declined; the fallback model %s answered", n, defaultEgress.Line(req.Model, 200),
+			defaultEgress.Line(resp.ServedBy, 200))
+	}
 	a.persist()
 	return resp, nil
 }
