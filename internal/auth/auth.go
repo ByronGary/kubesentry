@@ -74,6 +74,11 @@ var (
 	// cluster-wide. kubesentry never writes to the cluster or to
 	// Alertmanager's silences: this is its own actions log.
 	UpdateAlerts = Capability{Verb: "update", Group: "kubesentry.io", Resource: "alerts", Namespaced: true}
+	// InvestigateIncidents lets a caller start AI investigations of the
+	// incidents they can see in a namespace; node and cluster incidents
+	// need it cluster-wide. A run sends a redacted digest of the incident,
+	// and what the caller may read inside it, to the model provider.
+	InvestigateIncidents = Capability{Verb: "create", Group: "kubesentry.io", Resource: "investigations", Namespaced: true}
 )
 
 // Scope is the set of namespaces a capability is granted in.

@@ -259,6 +259,7 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	// (ViewAudit there), never the cluster's (no ViewClusterAudit) nor the
 	// agents' (no ViewAgents).
 	s.Alerts.(*staticAlerts).set(append(tenantFindings(), gatedFindings()...))
+	runs := seedInvestigations(t, s) // one run per incident
 	h := s.Handler()
 	routes := []string{
 		"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/security?view=summary",
@@ -474,11 +475,30 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	if ov.Incidents == nil || ov.Incidents.Open.Critical+ov.Incidents.Open.Warning != inc.Counts.Open {
 		t.Errorf("alice's overview incidents %+v, her list counts %+v", ov.Incidents, inc.Counts)
 	}
+	// Investigations: of her incident only (team-b's and the node's are not
+	// found), and none at all for carol.
+	for _, page := range allPages(t, h, "alice", invPath(incidentID("team-a"))) {
+		var list investigationsResponse
+		_ = json.Unmarshal(page, &list)
+		if nss, _ := namespacesIn(page); len(nss) > 0 || len(list.Items) != 1 || list.Items[0].ID != runs[incidentID("team-a")] || list.Hidden != 0 {
+			t.Errorf("alice's investigations %s", page)
+		}
+	}
+	if rec := getAs(t, h, "alice", invPath(incidentID("team-a"), "/", runs[incidentID("team-a")]), nil); rec.Code != 200 {
+		t.Errorf("alice's own investigation = %d", rec.Code)
+	}
+	for _, path := range []string{invPath(incidentID("team-a")), invPath(incidentID("team-a"), "/", runs[incidentID("team-a")])} {
+		if rec := getAs(t, h, "carol", path, nil); rec.Code != 404 {
+			t.Errorf("%s as carol = %d, want 404", path, rec.Code)
+		}
+	}
 
 	// Single objects elsewhere are not found, rather than forbidden.
 	for _, path := range []string{"/api/v1/map?namespace=team-b", "/api/v1/pods/team-b/web-0/diagnostics", "/api/v1/pods/team-b/web-0/processes", "/api/v1/nodes/n9",
 		"/api/v1/incidents/" + incidentID("team-b"), "/api/v1/incidents/" + incidentID("team-b") + "/logs", "/api/v1/incidents/" + incidentID("team-b") + "/bundle",
-		"/api/v1/incidents/" + nodeIncidentID} {
+		"/api/v1/incidents/" + nodeIncidentID,
+		invPath(incidentID("team-b")), invPath(incidentID("team-b"), "/", runs[incidentID("team-b")]), invPath(nodeIncidentID),
+		invPath(incidentID("team-a"), "/", runs[incidentID("team-b")])} {
 		if rec := getAs(t, h, "alice", path, nil); rec.Code != 404 {
 			t.Errorf("%s as alice = %d, want 404", path, rec.Code)
 		}

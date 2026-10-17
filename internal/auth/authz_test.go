@@ -279,7 +279,7 @@ func TestUnrestrictedSkipsReviews(t *testing.T) {
 		t.Fatal("not allowed")
 	}
 	caps := a.Capabilities(ctx, id)
-	if len(caps) != len(uiCapabilities) || len(caps) != 12 {
+	if len(caps) != len(uiCapabilities) || len(caps) != 13 {
 		t.Fatalf("caps %v", caps)
 	}
 	for k, v := range caps {
@@ -524,6 +524,7 @@ func TestCapabilities(t *testing.T) {
 	want := map[string]bool{
 		"nodes": true, "pvs": false, "storageClasses": false, "clusterRBAC": false, "clusterIssuers": false,
 		"agents": false, "clusterAudit": false, "processes": true, "audit": false, "podLogs": true, "cloudtrail": true, "alertsUpdate": false,
+		"investigate": false,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v\nwant %v", got, want)

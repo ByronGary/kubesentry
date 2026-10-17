@@ -158,6 +158,10 @@ type Server struct {
 	// IncidentStore, if set, serves list ranges older than the incidents
 	// board (up to the retention); without it the board answers them.
 	IncidentStore incidents.Store
+	// Investigations, if set with Incidents, serves the AI investigator's
+	// routes under /api/v1/incidents/{id}/investigations and /info's
+	// investigator.
+	Investigations InvestigationsService
 
 	cacheOnce sync.Once
 	recheckMu sync.Mutex
@@ -402,6 +406,9 @@ func (s *Server) apiRoutes() http.Handler {
 		s.routeCapped(mux, incidentRoute, "incident", long, expensive, s.incidentDetail)
 		s.routeCapped(mux, incidentLogsRoute, "incident_logs", long, expensive, s.incidentLogs)
 		s.routeCapped(mux, incidentBundleRoute, "incident_bundle", long, expensive, s.incidentBundle)
+		if s.Investigations != nil {
+			s.investigationRoutes(mux, t, long)
+		}
 	}
 	return withAuthzMemo(mux)
 }
