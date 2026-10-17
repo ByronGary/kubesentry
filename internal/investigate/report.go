@@ -3,7 +3,6 @@ package investigate
 import (
 	"encoding/json"
 	"errors"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -208,60 +207,4 @@ func finishReport(r *Report, led *Ledger, eg *Egress, from, to time.Time) (*Repo
 		out.Unverified = nil
 	}
 	return out, evidence
-}
-
-var awsService = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-
-// ReadOnlyCommand reports whether a suggested command is one of the
-// read-only forms kubesentry lets a report suggest: kubectl get, describe,
-// logs, top, events, explain, auth can-i, rollout history, rollout status,
-// api-resources, version; cmctl status; helm status, history, get; and aws
-// <service> describe-*, get-*, list-*, lookup-*. It refuses anything with
-// ; | & $ ` < > or a control character (a newline included), so nothing
-// can be chained, substituted or redirected.
-func ReadOnlyCommand(cmd string) bool {
-	if strings.ContainsAny(cmd, ";|&$`<>") {
-		return false
-	}
-	for _, r := range cmd {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			return false
-		}
-	}
-	f := strings.Fields(cmd)
-	if len(f) < 2 {
-		return false
-	}
-	sub := func(i int) string {
-		if i < len(f) {
-			return f[i]
-		}
-		return ""
-	}
-	switch f[0] {
-	case "kubectl":
-		switch f[1] {
-		case "get", "describe", "logs", "top", "events", "explain", "api-resources", "version":
-			return true
-		case "auth":
-			return sub(2) == "can-i"
-		case "rollout":
-			return sub(2) == "history" || sub(2) == "status"
-		}
-	case "cmctl":
-		return f[1] == "status"
-	case "helm":
-		return f[1] == "status" || f[1] == "history" || f[1] == "get"
-	case "aws":
-		op := sub(2)
-		if !awsService.MatchString(f[1]) {
-			return false
-		}
-		for _, p := range []string{"describe-", "get-", "list-", "lookup-"} {
-			if strings.HasPrefix(op, p) && len(op) > len(p) {
-				return true
-			}
-		}
-	}
-	return false
 }
