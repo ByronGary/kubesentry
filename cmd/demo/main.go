@@ -19,12 +19,18 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
+	delay := flag.Duration("investigator-delay", demo.DefaultInvestigatorDelay,
+		"how long each turn of the scripted demo investigator takes (it never calls a model)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := demo.NewServer(ctx, web.Handler())
+	d := *delay
+	if d <= 0 {
+		d = -1 // none
+	}
+	srv, err := demo.NewServerWith(ctx, web.Handler(), demo.Options{InvestigatorDelay: d})
 	if err != nil {
 		slog.Error("build demo server", "err", err)
 		os.Exit(1)
