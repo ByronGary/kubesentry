@@ -435,18 +435,23 @@ func response(msg *anthropic.BetaMessage, reqID string) *investigate.Response {
 	out.Usage = investigate.Usage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens,
 		CacheWrite: u.CacheCreationInputTokens}
 	served := seam
-	if len(u.Iterations) > 0 {
+	for _, it := range u.Iterations {
+		if it.Type == "fallback_message" {
+			served = true
+		}
+	}
+	if served || len(u.Iterations) > 1 {
 		// Every attempt of a fallback chain: the top-level usage covers
-		// only the one that produced the message.
+		// only the one that produced the message. A single attempt keeps
+		// the top-level usage, which the stream's last delta completes.
 		var sum investigate.Usage
 		for _, it := range u.Iterations {
 			sum.Add(investigate.Usage{Input: it.InputTokens, Output: it.OutputTokens, CacheRead: it.CacheReadInputTokens,
 				CacheWrite: it.CacheCreationInputTokens})
-			if it.Type == "fallback_message" {
-				served = true
-			}
 		}
-		out.Usage = sum
+		if sum.Total() > 0 {
+			out.Usage = sum
+		}
 	}
 	if served && msg.StopReason != anthropic.BetaStopReasonRefusal {
 		out.ServedBy = string(msg.Model)

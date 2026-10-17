@@ -42,7 +42,10 @@ func turnEvents(model, stop string) []event {
 	return []event{
 		{"message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"` + model +
 			`","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":120,"output_tokens":1,` +
-			`"cache_creation_input_tokens":2000,"cache_read_input_tokens":30000}}}`},
+			`"cache_creation_input_tokens":2000,"cache_read_input_tokens":30000,` +
+			// A single attempt's ledger, as message_start has it: the
+			// top-level usage, completed by message_delta, is what counts.
+			`"iterations":[{"type":"message","input_tokens":120,"output_tokens":1}]}}}`},
 		{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}`},
 		{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"` + signature + `"}}`},
 		{"content_block_stop", `{"type":"content_block_stop","index":0}`},
