@@ -864,11 +864,14 @@ func (r *Runner) Detail(ctx context.Context, id string, o DetailOptions) (Detail
 			d.Warnings = append(d.Warnings, "metrics: "+err.Error())
 			d.Sources["series"] = "error: " + err.Error()
 		} else {
-			d.Series = ss
+			d.Series = r.red.Series(ss)
 			d.Sources["series"] = "ok"
 		}
 	}
 	d.Thresholds = thresholdsOf(sigs)
+	for i := range d.Thresholds {
+		d.Thresholds[i].Label = r.red.String(d.Thresholds[i].Label)
+	}
 	board, _ := r.board.Snapshot()
 	d.Related = Related(in, board, r.o.AppLabel, now)
 	for k, v := range r.Sources() {
@@ -877,6 +880,46 @@ func (r *Runner) Detail(ctx context.Context, id string, o DetailOptions) (Detail
 		}
 	}
 	return d, true, nil
+}
+
+// Series returns an incident's metric series in [from, to], clamped to its
+// padded window (zero times: the whole window), at the step SeriesStep
+// gives that range, so a narrower range is finer. Labels are redacted.
+// Without a series source there are none. ErrNotFound reports an unknown
+// incident.
+func (r *Runner) Series(ctx context.Context, id string, from, to time.Time) ([]Series, error) {
+	in, _, ok, err := r.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if r.c.Series == nil {
+		return nil, nil
+	}
+	wf, wt := in.Window(r.o.LogLead, r.o.LogLag, r.o.Now())
+	if from.IsZero() || from.Before(wf) {
+		from = wf
+	}
+	if to.IsZero() || to.After(wt) {
+		to = wt
+	}
+	if !to.After(from) {
+		return nil, nil
+	}
+	ss, err := r.series(ctx, &in, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return r.red.Series(ss), nil
+}
+
+// Events reads the stored Kubernetes events as they are kept: neither
+// redacted nor gated by any caller's permissions (the API and the
+// investigator do both).
+func (r *Runner) Events(ctx context.Context, q EventQuery) ([]StoredEvent, error) {
+	return r.c.Events.Events(ctx, q)
 }
 
 func (r *Runner) series(ctx context.Context, in *Incident, from, to time.Time) ([]Series, error) {

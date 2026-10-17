@@ -35,6 +35,18 @@ func TestRedactor(t *testing.T) {
 		{"account acct-123456 billed", "account [REDACTED] billed"},
 		{"tokens: 5, secretName: tls", "tokens: 5, secretName: tls"},
 		{"nothing to see", "nothing to see"},
+		// GitHub, Slack, Anthropic and Stripe tokens, named AWS secret keys.
+		{"git ghp_abcdefghijklmnopqrstuvwxyz0123456789 ok", "git [REDACTED] ok"},
+		{"oauth gho_ABCDEFGHIJKLMNOPQRSTuvwx done", "oauth [REDACTED] done"},
+		{"pat github_pat_11ABCDEFG0123456789_abcdefghijkl end", "pat [REDACTED] end"},
+		{"slack xoxb-1234567890-abcdefghij posted", "slack [REDACTED] posted"},
+		{"slack xoxp-123-456-789-abcdef0123", "slack [REDACTED]"},
+		{"key sk-ant-api03-AbCdEf_GhIj-KlMn used", "key [REDACTED] used"},
+		{"stripe sk_live_51Habcdefghij charged", "stripe [REDACTED] charged"},
+		{"aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY x", "aws_secret_access_key=[REDACTED] x"},
+		{`AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG"`, `AWS_SECRET_ACCESS_KEY: "[REDACTED]"`},
+		// Prefixes alone, and words that only start alike, stay.
+		{"ghp_short sk_live_ xoxz-abcdefghijkl sk-ant-", "ghp_short sk_live_ xoxz-abcdefghijkl sk-ant-"},
 	}
 	for _, c := range cases {
 		if got := r.String(c.in); got != c.want {
@@ -135,6 +147,34 @@ func TestBundle(t *testing.T) {
 	}
 	if got := strings.Join(kinds, ","); got != "header,signal,signal,signal,metric,event,log,audit,cloudtrail" {
 		t.Errorf("records = %s", got)
+	}
+}
+
+// Signal tags, incident tags and metric series labels are redacted too
+// (a tag or label can carry anything); the input is left alone.
+func TestBundleRedactsTagsAndLabels(t *testing.T) {
+	in := bundleInput()
+	in.Incident.Tags = map[string]string{"team": "xoxb-1234567890-incidenttag"}
+	in.Signals[0].Tags = map[string]string{"app": "api", "deploy-token": "sk-ant-api03-signaltag0001"}
+	in.Metrics = []Series{{Metric: "requests", Label: "api?key=ghp_abcdefghijklmnopqrstuvwxyz0123456789", Unit: "rps", Points: [][2]float64{{1, 2}}}}
+	b := BuildBundle(in, nil)
+	var buf bytes.Buffer
+	if err := b.WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"incidenttag", "signaltag0001", "ghp_abcdefghij"} {
+		if strings.Contains(buf.String(), secret) {
+			t.Errorf("bundle leaks %q", secret)
+		}
+	}
+	if b.Signals[0].Tags["app"] != "api" || b.Metrics[0].Label != "api?key=[REDACTED]" || b.Incident.Tags["team"] != Redacted {
+		t.Errorf("tags %v, label %q, incident tags %v", b.Signals[0].Tags, b.Metrics[0].Label, b.Incident.Tags)
+	}
+	if !strings.Contains(in.Metrics[0].Label, "ghp_") || !strings.Contains(in.Signals[0].Tags["deploy-token"], "sk-ant-") {
+		t.Error("the input was changed")
+	}
+	if (*Redactor)(nil).Series(nil) != nil {
+		t.Error("Series(nil) is not nil")
 	}
 }
 

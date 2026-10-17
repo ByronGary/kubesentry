@@ -167,6 +167,7 @@ func BuildBundle(in BundleInput, red *Redactor) *Bundle {
 		Window: BundleWindow{From: in.From, To: in.To}, Truncated: map[string]bool{}}}
 	inc := CloneIncident(in.Incident)
 	inc.Title = red.String(inc.Title)
+	inc.Tags = red.Map(inc.Tags)
 	b.Incident = inc
 	if len(in.Omitted) > 0 {
 		b.Omitted = make(map[string]string, len(in.Omitted))
@@ -188,7 +189,7 @@ func BuildBundle(in BundleInput, red *Redactor) *Bundle {
 		b.Signals = append(b.Signals, BundleSignalOf(s))
 		if s.Type == TypeCloudTrailChange && !seenCT[s.ID] {
 			seenCT[s.ID] = true
-			b.CloudTrail = append(b.CloudTrail, cloudTrailRecord(&s))
+			b.CloudTrail = append(b.CloudTrail, CloudTrailOf(&s))
 		}
 	}
 	if len(b.CloudTrail) > BundleMaxCloudTrail {
@@ -198,7 +199,7 @@ func BuildBundle(in BundleInput, red *Redactor) *Bundle {
 
 	b.Metrics = []Series{}
 	if !omitted(SectionMetrics) {
-		b.Metrics = append(b.Metrics, in.Metrics...)
+		b.Metrics = append(b.Metrics, red.Series(in.Metrics)...)
 	}
 
 	b.Events = []BundleEvent{}
@@ -257,7 +258,9 @@ func BuildBundle(in BundleInput, red *Redactor) *Bundle {
 	return b
 }
 
-func cloudTrailRecord(s *Signal) BundleCloudTrail {
+// CloudTrailOf is the CloudTrail record a cloudtrail-change signal carries (its
+// raw record as the signal keeps it: redacted, cut to MaxAttrLen).
+func CloudTrailOf(s *Signal) BundleCloudTrail {
 	split := func(v string) []string {
 		if v == "" {
 			return nil

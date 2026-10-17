@@ -9,7 +9,8 @@ import (
 // Redactor removes secrets from text before kubesentry shows or bundles it:
 // log lines, event messages, CloudTrail records, the bundle. It is best
 // effort: it knows the common shapes (AWS access keys, key=value secrets,
-// bearer tokens, JWTs, PEM private keys, credentials in URLs) plus the
+// bearer tokens, JWTs, PEM private keys, credentials in URLs, GitHub, Slack,
+// Anthropic and Stripe tokens, named AWS secret access keys) plus the
 // configured patterns. It is safe for concurrent use.
 type Redactor struct {
 	rules []rule
@@ -42,6 +43,18 @@ var builtinRules = []rule{
 	{regexp.MustCompile(`\b(?:AKIA|ASIA)[0-9A-Z]{16}\b`), Redacted, []string{"akia", "asia"}},
 	// user:password@ in URLs.
 	{regexp.MustCompile(`(://)[^/\s:@]+:[^/\s@]+@`), "${1}" + Redacted + "@", []string{"://"}},
+	// AWS secret access keys given by name (the key=value rule above does
+	// not see "secret" followed by "_access_key").
+	{regexp.MustCompile(`(?i)(aws_secret_access_key)(["']?\s*[:=]\s*["']?)[^\s"',;&}]+`), "${1}${2}" + Redacted, []string{"aws_secret_access_key"}},
+	// GitHub personal, OAuth and fine-grained tokens.
+	{regexp.MustCompile(`\bgh[po]_[A-Za-z0-9]{20,}`), Redacted, []string{"ghp_", "gho_"}},
+	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`), Redacted, []string{"github_pat_"}},
+	// Slack bot, app, user and refresh tokens.
+	{regexp.MustCompile(`\bxox[abpr]-[A-Za-z0-9-]{8,}`), Redacted, []string{"xox"}},
+	// Anthropic API keys.
+	{regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{8,}`), Redacted, []string{"sk-ant-"}},
+	// Stripe live secret keys.
+	{regexp.MustCompile(`\bsk_live_[A-Za-z0-9]{8,}`), Redacted, []string{"sk_live_"}},
 }
 
 // NewRedactor returns a redactor with the built-in rules plus extra
@@ -96,12 +109,28 @@ func (r *Redactor) Map(m map[string]string) map[string]string {
 	return out
 }
 
-// Signal returns s with its title and attributes redacted.
+// Signal returns s with its title, tags and attributes redacted.
 func (r *Redactor) Signal(s Signal) Signal {
 	s = CloneSignal(s)
 	s.Title = r.String(s.Title)
+	s.Tags = r.Map(s.Tags)
 	s.Attrs = r.Map(s.Attrs)
 	return s
+}
+
+// Series returns a copy of ss with every label redacted (a label is a pod,
+// container or service name, which can carry anything). The points are
+// shared with ss.
+func (r *Redactor) Series(ss []Series) []Series {
+	if ss == nil {
+		return nil
+	}
+	out := make([]Series, len(ss))
+	for i, s := range ss {
+		s.Label = r.String(s.Label)
+		out[i] = s
+	}
+	return out
 }
 
 func containsAny(s string, subs []string) bool {

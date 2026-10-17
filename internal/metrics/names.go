@@ -121,6 +121,31 @@ var (
 	IncidentSourceUp = NewGaugeVec("kubesentry_incident_source_up", "Whether an incidents source works (1) or fails (0); absent sources have no sample.", "source")
 	// IncidentsLeader is 1 on the replica that runs the incidents engine.
 	IncidentsLeader = NewGauge("kubesentry_incidents_leader", "1 on the replica that runs the incidents engine.")
+
+	// Investigations counts AI investigations by how they ended or why they
+	// did not start. Labels: provider ("anthropic", "bedrock", "demo"),
+	// result ("completed", "refused", "failed", "timeout", "budget",
+	// "cancelled", "cached", "quota", "busy"). investigate.Hooks.OnResult.
+	Investigations = NewCounterVec("kubesentry_investigations_total", "AI investigations by provider and result.", "provider", "result")
+	// InvestigationsRunning is the investigations running on this replica.
+	// investigate.Hooks.OnRunning.
+	InvestigationsRunning = NewGauge("kubesentry_investigations_running", "AI investigations running on this replica.")
+	// InvestigationDuration observes how long finished investigations ran.
+	// investigate.Hooks.OnDuration.
+	InvestigationDuration = NewHistogram("kubesentry_investigation_duration_seconds", "How long AI investigations ran.",
+		[]float64{10, 30, 60, 120, 240, 420, 600, 900})
+	// InvestigationTokens counts model tokens. Labels: provider, model, kind
+	// ("input", "output", "cache_read", "cache_write").
+	// investigate.Hooks.OnTokens.
+	InvestigationTokens = NewCounterVec("kubesentry_investigation_tokens_total", "Model tokens used by AI investigations by kind.", "provider", "model", "kind")
+	// InvestigationToolCalls counts the investigator's tool calls. Labels:
+	// tool (the tool name, "unknown" for a made-up one), result ("ok",
+	// "error", "denied", "invalid"). investigate.Hooks.OnToolCall.
+	InvestigationToolCalls = NewCounterVec("kubesentry_investigation_tool_calls_total", "AI investigator tool calls by tool and result.", "tool", "result")
+	// LLMRequests counts requests to the model provider, retries included.
+	// Labels: provider, code (HTTP status, or "error" without one). Counted
+	// by internal/llm.
+	LLMRequests = NewCounterVec("kubesentry_llm_requests_total", "Requests to the model provider by status code.", "provider", "code")
 )
 
 func init() { Default.RegisterRuntime() }

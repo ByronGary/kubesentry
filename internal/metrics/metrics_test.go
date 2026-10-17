@@ -223,6 +223,8 @@ func TestDefaultRegistry(t *testing.T) {
 		"kubesentry_alerts_queue_depth", "kubesentry_alerts_evaluation_seconds", "kubesentry_alerts_leader",
 		"kubesentry_incidents", "kubesentry_incident_signals_total", "kubesentry_k8s_events_total", "kubesentry_cloudtrail_events_total",
 		"kubesentry_incident_log_fetches_total", "kubesentry_incident_source_up", "kubesentry_incidents_leader",
+		"kubesentry_investigations_total", "kubesentry_investigations_running", "kubesentry_investigation_duration_seconds",
+		"kubesentry_investigation_tokens_total", "kubesentry_investigation_tool_calls_total", "kubesentry_llm_requests_total",
 	} {
 		Default.mu.Lock()
 		_, ok := Default.metrics[name]

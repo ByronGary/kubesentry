@@ -143,6 +143,18 @@ func TestRunnerLeads(t *testing.T) {
 	if err := b.WriteNDJSON(&buf); err != nil || !strings.Contains(buf.String(), `"kind":"log"`) {
 		t.Errorf("ndjson: %v", err)
 	}
+	// Series and Events serve the investigator's tools: series clamped to
+	// the padded window, events as stored.
+	ss, err := r.Series(context.Background(), id, d.From.Add(-time.Hour), time.Time{})
+	if err != nil || len(ss) != 1 || ss[0].Points[0][0] != float64(d.From.UnixMilli()) {
+		t.Errorf("series: %+v %v", ss, err)
+	}
+	if _, err := r.Series(context.Background(), "nope", time.Time{}, time.Time{}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("series of an unknown incident: %v", err)
+	}
+	if evs, err := r.Events(context.Background(), EventQuery{Namespace: "shop"}); err != nil || len(evs) != 1 || evs[0].UID != "e1" {
+		t.Errorf("events: %+v %v", evs, err)
+	}
 	// A kick with a new view runs the differ: the crash loop ends.
 	ok2 := withPod(inv, "api-7d9f-b", func(p *model.Pod) { p.Containers[0].State, p.Containers[0].Reason = "running", "" })
 	cur.Store(view(ok2, now))
