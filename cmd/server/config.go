@@ -99,8 +99,9 @@ type config struct {
 	cloudwatchEndpoint  string
 	awsRegion           string
 
-	alerts    alertsConfig    // alerts.go: -alerts, -alertmanager-*, -alerts-*, -external-url
-	incidents incidentsConfig // incidents.go: -incidents, -incident-*, -cloudtrail*
+	alerts       alertsConfig       // alerts.go: -alerts, -alertmanager-*, -alerts-*, -external-url
+	incidents    incidentsConfig    // incidents.go: -incidents, -incident-*, -cloudtrail*
+	investigator investigatorConfig // investigator.go: -investigator*
 }
 
 // parseFlags reads the server's flags from args.
@@ -231,6 +232,7 @@ func parseFlags(args []string, out io.Writer) (*config, error) {
 
 	c.alerts.register(fs, dur)
 	c.incidents.register(fs, dur)
+	c.investigator.register(fs, dur)
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -321,7 +323,10 @@ func (c *config) validate() error {
 	if err := c.alerts.validate(c); err != nil {
 		return err
 	}
-	return c.incidents.validate(c)
+	if err := c.incidents.validate(c); err != nil {
+		return err
+	}
+	return c.investigator.validate(c)
 }
 
 // policy builds the detectors' policy from the flags. The server's own

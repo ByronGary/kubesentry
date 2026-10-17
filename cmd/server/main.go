@@ -225,6 +225,9 @@ func run(cfg *config) error {
 		}()
 	}
 
+	// onStop runs when shutdown starts, before the listeners stop.
+	var onStop []func(context.Context)
+
 	var auditStore audit.Store
 	if ing, ok := srv.Audit.(*audit.Ingester); ok {
 		auditStore = ing.Active()
@@ -246,10 +249,23 @@ func run(cfg *config) error {
 		if cfg.auditStore != "postgres" {
 			slog.Warn("incidents with the memory store: run one replica; with more, each would keep incidents of its own (use -audit-store=postgres)")
 		}
-		_, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
+		runner, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
 			pg: pg, audit: auditStore, alerts: alertsRunner, cw: cwl}.start(ctx, srv)
 		if err != nil {
 			return fmt.Errorf("incidents: %w", err)
+		}
+		if cfg.investigator.enabled() {
+			svc, err := investigatorSetup{cfg: cfg, runner: runner, current: current, pg: pg}.start(ctx, srv)
+			if err != nil {
+				return fmt.Errorf("investigator: %w", err)
+			}
+			// At SIGTERM: no new runs, and this replica's running ones are
+			// stopped and stored as interrupted while the listeners drain.
+			onStop = append(onStop, func(ctx context.Context) {
+				if err := svc.Shutdown(ctx); err != nil {
+					slog.Warn("investigations still writing at shutdown", "err", err)
+				}
+			})
 		}
 	}
 
@@ -260,13 +276,14 @@ func run(cfg *config) error {
 		return nil
 	}})
 
-	return serve(ctx, stop, cfg, srv)
+	return serve(ctx, stop, cfg, srv, onStop...)
 }
 
-// serve runs the listeners. On a signal it fails readiness, waits the drain
-// delay so load balancers stop sending traffic, then shuts the listeners
-// down, letting requests in flight finish.
-func serve(ctx context.Context, stop context.CancelFunc, cfg *config, srv *api.Server) error {
+// serve runs the listeners. On a signal it fails readiness, runs onStop
+// (within the shutdown timeout) while it waits the drain delay so load
+// balancers stop sending traffic, then shuts the listeners down, letting
+// requests in flight finish.
+func serve(ctx context.Context, stop context.CancelFunc, cfg *config, srv *api.Server, onStop ...func(context.Context)) error {
 	var draining atomic.Bool
 	if r := srv.Ready; r != nil {
 		srv.Ready = func() bool { return !draining.Load() && r() }
@@ -338,7 +355,13 @@ func serve(ctx context.Context, stop context.CancelFunc, cfg *config, srv *api.S
 	stop() // a second signal kills at once
 	draining.Store(true)
 	slog.Info("shutting down", "drain", cfg.shutdownDrain, "timeout", cfg.shutdownTimeout)
-	time.Sleep(cfg.shutdownDrain)
+	drained := time.After(cfg.shutdownDrain)
+	octx, ocancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
+	for _, f := range onStop {
+		f(octx)
+	}
+	ocancel()
+	<-drained
 	sctx, cancel := context.WithTimeout(context.Background(), cfg.shutdownTimeout)
 	defer cancel()
 	for _, hs := range servers {
