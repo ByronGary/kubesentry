@@ -153,7 +153,7 @@ Replace the region, account, cluster name and workspace ID.
 
 ### AI investigator on Amazon Bedrock
 
-The investigator (`incidents.investigator`, off by default) sends a redacted digest of an incident, and the logs, events, audit and CloudTrail records the starting user may see, to the model provider, then reads its report. With `provider: bedrock` that provider is Claude in Amazon Bedrock, called with the pod's role. Nothing else changes for kubesentry's other AWS calls.
+The investigator (`incidents.investigator`, off by default) sends a redacted digest of an incident, and the logs, events, audit and CloudTrail records the starting user may see, to the model provider, then reads its report. The recommended setup, and the chart's default provider, is `bedrock`: Claude in Amazon Bedrock in your own account, called with the pod's role through an interface VPC endpoint, so requests stay in the account and off the public internet. Nothing else changes for kubesentry's other AWS calls. The full guide, with the endpoint policy, verification steps and a "keep it private" checklist, is [docs/investigator.md](investigator.md).
 
 **Model access.** In the Bedrock console of the region you use, request access to Anthropic's Claude Opus 5.5 (Model access; the first Anthropic model in an account also asks for the use-case form). The investigator also uses Claude Opus 5 as its refusal fallback (below), so request access to it too, or set `fallback: "off"`.
 
@@ -195,7 +195,7 @@ Keep the statement for the API you use. The `bedrock-mantle:Model` condition key
 
 **Credentials.** The investigator uses the same role as the rest of kubesentry: IRSA or Pod Identity ([below](#irsa-or-eks-pod-identity)) work unchanged. A Bedrock API key in `AWS_BEARER_TOKEN_BEDROCK` (through `extraEnv` from a Secret) is used instead of the role when set; the role is the better choice.
 
-**Private networking.** Without a route to the internet, create the interface VPC endpoint for the API you use, with private DNS: `com.amazonaws.<region>.bedrock-mantle` (DNS `bedrock-mantle.<region>.api.aws`) or `com.amazonaws.<region>.bedrock-runtime` (DNS `bedrock-runtime.<region>.amazonaws.com`), besides STS (`com.amazonaws.<region>.sts`, for IRSA) or EKS Auth (`com.amazonaws.<region>.eks-auth`, for Pod Identity). Without private DNS, point `endpoint` at the endpoint's DNS name (for Mantle including `/anthropic`).
+**VPC endpoint (recommended).** Create the interface VPC endpoint for the API you use in the nodes' private subnets, with a security group allowing 443 from the nodes (or the pods' security group) and an endpoint policy that allows only kubesentry's role and the inference action on the models above. Turn private DNS on, so no `endpoint` is needed. The endpoint services: `com.amazonaws.<region>.bedrock-mantle` (DNS `bedrock-mantle.<region>.api.aws`) or `com.amazonaws.<region>.bedrock-runtime` (DNS `bedrock-runtime.<region>.amazonaws.com`), besides STS (`com.amazonaws.<region>.sts`, for IRSA) or EKS Auth (`com.amazonaws.<region>.eks-auth`, for Pod Identity). Without private DNS, point `endpoint` at the endpoint's DNS name (for Mantle including `/anthropic`).
 
 **Network policy.** The investigator connects out on 443, which `networkPolicy.egress.https` already allows (`0.0.0.0/0` by default). If you narrow `toCIDRs`, include the Bedrock VPC endpoint's ENIs, or, for `provider: anthropic`, the route to `api.anthropic.com` (an egress proxy through `HTTPS_PROXY` in `extraEnv` works too).
 
@@ -204,17 +204,18 @@ incidents:
   enabled: true
   investigator:
     enabled: true
-    provider: bedrock
+    provider: bedrock            # the default; through the VPC endpoint above
     acknowledgeDataEgress: true
     bedrockAPI: mantle           # or runtime, with model: us.anthropic.claude-opus-5-5
     # region: us-east-1          # default eks.region
+    # endpoint: ""               # only when the endpoint's private DNS cannot be used
 rbac:
   viewerRoles:
     investigator:
       aggregateTo: []            # bind <release>-investigator to the people who may start runs
 ```
 
-With `provider: anthropic` instead, create the key's Secret first and name it; kubesentry reads it as `ANTHROPIC_API_KEY` and never from a file or flag:
+With `provider: anthropic` instead (the alternative; it needs egress to `api.anthropic.com`), create the key's Secret first and name it; kubesentry reads it as `ANTHROPIC_API_KEY` and never from a file or flag:
 
 ```bash
 kubectl -n kubesentry create secret generic kubesentry-anthropic --from-literal=api-key="$ANTHROPIC_API_KEY"

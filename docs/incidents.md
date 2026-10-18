@@ -4,7 +4,7 @@ An incident is a workload in trouble, and everything around it on one time axis:
 
 Take an app that receives too many requests while its memory climbs. kubesentry opens one incident for its Deployment with a `request-spike` and a `memory-spike`. It attaches the deploy made 20 minutes earlier and a security group change from CloudTrail, then shows the error lines the pods wrote a few minutes after the spike.
 
-Incidents are **dashboard only**: they never notify anyone. The alert findings (`docs/alerts.md`) keep notifying per finding, and each finding's episode shows up in its workload's incident as an `alert` signal. Once it has, the alert links to the incident: the Alertmanager annotation `incident_url` (with `-external-url`, from the next resend on) and `incidentId` in `GET /api/v1/alerts`. Each incident can be downloaded as an **agent-ready bundle**, a redacted, size-capped JSON or NDJSON file meant for a future investigator agent (or a person with `jq`).
+Incidents are **dashboard only**: they never notify anyone. The alert findings (`docs/alerts.md`) keep notifying per finding, and each finding's episode shows up in its workload's incident as an `alert` signal. Once it has, the alert links to the incident: the Alertmanager annotation `incident_url` (with `-external-url`, from the next resend on) and `incidentId` in `GET /api/v1/alerts`. Each incident can be downloaded as an **agent-ready bundle**, a redacted, size-capped JSON or NDJSON file for an agent (or a person with `jq`). The optional AI investigator reads an incident and writes a report with cited evidence ([docs/investigator.md](investigator.md)).
 
 Turn incidents on with `-incidents`, or `incidents.enabled` in the Helm chart. `go run ./cmd/demo` shows three seeded incidents without a cluster.
 
@@ -168,7 +168,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
   "https://kubesentry.example.com/api/v1/incidents/$ID/bundle?format=ndjson" > incident.ndjson
 ```
 
-`GET /api/v1/incidents/{id}/bundle` returns everything kubesentry knows about one incident, for an agent to read: one JSON document, or with `?format=ndjson` one record per line. The schema is `kubesentry.io/incident-bundle/v1`. Responses carry `Content-Disposition: attachment` and `Cache-Control: no-store`. This build has no LLM in it: the investigator that reads bundles comes later.
+`GET /api/v1/incidents/{id}/bundle` returns everything kubesentry knows about one incident, for an agent to read: one JSON document, or with `?format=ndjson` one record per line. The schema is `kubesentry.io/incident-bundle/v1`. Responses carry `Content-Disposition: attachment` and `Cache-Control: no-store`. kubesentry's own AI investigator (off by default) builds its digest from the same bundle: see [docs/investigator.md](investigator.md).
 
 **The header** (the JSON document's top level, and the first NDJSON line):
 
@@ -218,7 +218,7 @@ Keys appear only when they have a value. Signals do not carry the PromQL they ca
 
 **Caps.** Logs 2,000 lines and 1 MiB, events 2,000, audit events 1,000, CloudTrail records 500, and 4 MiB in all. Past 4 MiB, sections are trimmed from their end: logs first, then events, audit, CloudTrail and metrics. Each cut section is named in `truncated`.
 
-**Redaction.** Logs, event messages, CloudTrail records, audit request URIs and user agents, and titles are redacted before they leave the server. The built-in rules cover AWS access key IDs, `password`, `secret`, `token`, `api_key` and `authorization` values (`key=value` and `"key": "value"`), Bearer tokens, JWTs, PEM private keys and `user:password@` in URLs. Add your own with `incidents.redactPatterns` (RE2 regular expressions). Redaction is best effort, so treat a bundle as sensitive. Sending bundles outside the cluster, as the future agent will, needs its own review.
+**Redaction.** Logs, event messages, CloudTrail records, audit request URIs and user agents, and titles are redacted before they leave the server. The built-in rules cover AWS access key IDs, `password`, `secret`, `token`, `api_key` and `authorization` values (`key=value` and `"key": "value"`), Bearer tokens, JWTs, PEM private keys and `user:password@` in URLs. Add your own with `incidents.redactPatterns` (RE2 regular expressions). Redaction is best effort, so treat a bundle as sensitive. The AI investigator sends a digest of it, and the records its starter may see, to the model provider only when you turn it on and acknowledge that: what leaves, the egress filter and the recommended Bedrock setup through a VPC endpoint are in [docs/investigator.md](investigator.md).
 
 **Sections you may not see.** The bundle holds only what the caller may see. A section you lack the permission for is left out and named in `omitted`, and `complete` is `false`; its signals are left out too. With `?require=all` the request is refused with 403 instead, naming the sections. An agent that must see everything should ask that way.
 

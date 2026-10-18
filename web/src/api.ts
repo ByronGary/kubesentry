@@ -28,6 +28,8 @@ export class ApiError extends Error {
     public reauth?: Reauth,
     /** From Retry-After on 429 and 503. */
     public retryAfterMs?: number,
+    /** The JSON error body, when there was one (e.g. a 409's runningId). */
+    public body?: Record<string, unknown>,
   ) {
     super(message)
   }
@@ -108,14 +110,16 @@ async function request<T>(method: 'GET' | 'POST', path: string, body: unknown, s
   }
   if (!res.ok) {
     let msg = res.statusText
+    let body: Record<string, unknown> | undefined
     try {
       const b = await res.json()
-      if (b?.error) msg = b.error
+      if (b && typeof b === 'object' && !Array.isArray(b)) body = b as Record<string, unknown>
+      if (typeof b?.error === 'string' && b.error) msg = b.error
     } catch {
       /* not JSON */
     }
     if (res.status === 401) throw unauthorized(msg)
-    throw new ApiError(res.status, msg, undefined, retryAfterMs(res.headers.get('Retry-After'), Date.now()))
+    throw new ApiError(res.status, msg, undefined, retryAfterMs(res.headers.get('Retry-After'), Date.now()), body)
   }
   return (await res.json()) as T
 }

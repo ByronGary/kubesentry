@@ -741,8 +741,10 @@ incidents:
   # docs/contracts.md "AI investigator"; Bedrock IAM in docs/deploy-eks.md.
   investigator:
     enabled: false
-    # -- -investigator: anthropic (the Anthropic API) or bedrock (Amazon Bedrock).
-    provider: anthropic
+    # -- -investigator: bedrock (Claude on Amazon Bedrock in your AWS account,
+    # reached through a VPC endpoint; the recommended setup, docs/investigator.md)
+    # or anthropic (the Anthropic API; needs existingSecret).
+    provider: bedrock
     # -- -investigator-egress-ack: true accepts that a redacted digest of each
     # investigated incident, and the logs, events, audit and CloudTrail
     # records the starting user may see, go to the provider. Required.

@@ -907,25 +907,35 @@ export interface InvestigationAccess { logs: boolean; audit: boolean; cloudtrail
 
 export interface InvestigationStep {
   at: string
-  /** "turn" (a model reply), "tool" (a tool call), or "note" (budget, retry, fallback). */
+  /**
+   * "turn" (a model reply: "turn 2: 1 tool call (11377 tokens)"), "tool" (a tool call), or "note"
+   * (budget, retry, cancel, cache). When a refusal fallback answered a turn, a note reads
+   * "turn <n>: <model> declined; the fallback model <model> answered".
+   */
   kind: 'turn' | 'tool' | 'note'
   /** Tool name for kind "tool": list_signals, get_logs, get_metric_series, get_k8s_events, get_audit_events, get_cloudtrail_events, get_workload_state, submit_report. */
   tool?: string
-  /** One line for people, e.g. "get_logs checkout-7d9 error 12:01–12:20: 48 lines". Never raw tool input. */
+  /** One line for people, e.g. "get_logs checkout-7d9 error 12:01–12:20: 48 lines" (times in UTC). Never raw tool input. */
   text: string
+  /** Tool steps, and a turn whose model request failed ("error"). */
   result?: 'ok' | 'error' | 'denied' | 'invalid'
 }
 
-/** A reference to evidence: signal:<id>, event:<uid>, log:<n>, logtpl:<n>, audit:<id>, cloudtrail:<id>, metric:<label>. */
+/**
+ * A reference to evidence: signal:<id>, event:<uid>, log:<n> (numbered per run), logtpl:<n> (the digest's log
+ * templates), audit:<auditID>, cloudtrail:<eventID>, metric:<metric>:<label> (metric is memory, requests or errors;
+ * the label may hold colons).
+ */
 export type EvidenceRef = string
 
 export interface InvestigationEvidence {
   ref: EvidenceRef
   kind: 'signal' | 'event' | 'log' | 'logtpl' | 'audit' | 'cloudtrail' | 'metric'
+  /** When it happened (a metric's peak, an event group's latest event, a template's first line). */
   time?: string
-  /** Pod, object or series label. */
+  /** The object or series: "Pod/<name>", "<pod>/<container>" for a log line, "<pod>, <pod>" for a template, a series label. */
   object?: string
-  /** Redacted, at most 300 characters. */
+  /** Redacted, at most 300 characters: a title, a log line or template, "max 2.517e+08 bytes at <time>". */
   snippet?: string
 }
 
@@ -936,7 +946,10 @@ export interface InvestigationReport {
   contributing_factors: { statement: string; evidence: EvidenceRef[] }[]
   timeline: { time: string; event: string; evidence: EvidenceRef[] }[]
   impact: string
-  /** Read-only checks; kubesentry never runs them. A command that was not read-only is removed and the description says so. */
+  /**
+   * Read-only checks; kubesentry never runs them. A command that was not read-only is removed: `command` is
+   * then "" and the description ends with "(command removed: not read-only)".
+   */
   suggested_checks: { description: string; command: string }[]
   remediation_ideas: { description: string; risk: string }[]
   open_questions: string[]
@@ -960,21 +973,33 @@ export interface InvestigationSummary {
   /** The report's status and root-cause confidence, once completed. */
   outcome?: InvestigationReport['status']
   confidence?: InvestigationReport['root_cause']['confidence']
-  /** Served from an earlier run with the same input (no new model call). */
+  /**
+   * Served from an earlier run with the same input (no new model call): that run's ID, which starts with its
+   * creation time (20261016T120102Z-<hex>). The copy carries its report, evidence and steps, zero usage.
+   */
   cachedFrom?: string
 }
 
 export interface Investigation extends InvestigationSummary {
   access: InvestigationAccess
-  /** Sections the starter could not see, with the reason (e.g. {"logs": "forbidden"}). */
+  /**
+   * Sections left out, with the reason: what the starter could not see ("forbidden"; keys logs, audit,
+   * cloudtrail, nodes) and sections the bundle could not read.
+   */
   omitted?: Record<string, string>
   steps: InvestigationStep[]
   report?: InvestigationReport
+  /** The ledger entries of the verified refs the report cites, in citation order. */
   evidence?: InvestigationEvidence[]
   /** status "refused": the model's refusal category and explanation. */
   refusal?: { category: string; explanation: string }
-  /** status "failed": a short reason without provider response bodies ("timeout", "budget: tool calls", "interrupted", "HTTP 529 overloaded"). */
+  /**
+   * status "failed": a short reason without provider response bodies: "timeout", "interrupted",
+   * "budget: turns|tool calls|tokens", "no valid report", "max_tokens: …", "context window exceeded",
+   * "model request failed", "HTTP <status> <type>" ("HTTP 529 overloaded", "HTTP 403 permission").
+   */
   error?: string
+  /** Tokens over the run; all zero for a cached copy. */
   usage: InvestigationUsage
   turns: number
   toolCalls: number
@@ -984,6 +1009,12 @@ export interface Investigation extends InvestigationSummary {
 export interface InvestigationStartResponse {
   investigation: Investigation
   cached?: boolean
+}
+
+/** POST /api/v1/incidents/{id}/investigations answers 409 with this while a run of the incident is running. */
+export interface InvestigationConflict {
+  error: string
+  runningId: string
 }
 
 /** GET /api/v1/incidents/{id}/investigations: newest first. */

@@ -3,6 +3,7 @@ import { can, hiddenNote } from '../access'
 import { ApiError, apiBlob } from '../api'
 import { byteTicks, extent, rateTicks, sharedDomain, type Range } from '../chartMath'
 import { EventLanes } from '../components/EventLane'
+import { InvestigateButton, InvestigationPanel, useInvestigations, type EvidenceActions } from '../components/Investigation'
 import { LogPanel } from '../components/LogPanel'
 import { SignalMark } from '../components/SignalMark'
 import { TimeChart } from '../components/TimeChart'
@@ -88,6 +89,28 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
   const brush = readRange(route.query, domain)
   const setBrush = (r: Range | null) => setQuery(`/incidents/${encodeURIComponent(id)}`, rangeQuery(r))
   const marks = useMemo(() => chartMarks(items), [items])
+  const inv = useInvestigations(id, info)
+  const laneKeys = useMemo(() => new Set(items.map((i) => i.key)), [items])
+  // Evidence the investigation points at: a lane item, the logs or the charts.
+  const [laneFocus, setLaneFocus] = useState<{ key: string; n: number }>()
+  const [logFocus, setLogFocus] = useState<{ pod?: string; container?: string; q?: string; n: number }>()
+  const scrollTo = (elId: string) => requestAnimationFrame(() => document.getElementById(elId)?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+  const actions: EvidenceActions = {
+    lane: (key, t) => {
+      setLaneFocus((f) => ({ key, n: (f?.n ?? 0) + 1 }))
+      if (t !== undefined) setHoverT(t)
+    },
+    logs: (focus, range) => {
+      setLogFocus((f) => ({ ...focus, n: (f?.n ?? 0) + 1 }))
+      setBrush(range)
+      scrollTo('h-logs')
+    },
+    charts: (range) => {
+      setBrush(range)
+      setHoverT((range[0] + range[1]) / 2)
+      scrollTo('h-metrics')
+    },
+  }
   const access = sectionAccess(d.sources, { audit: can(info, 'audit'), cloudtrail: can(info, 'cloudtrail'), podLogs: can(info, 'podLogs') })
   const sev = severityGlyph(inc.severity)
   const peak = severityGlyph(inc.peakSeverity)
@@ -120,7 +143,10 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
   return (
     <>
       <PageHead title={inc.title} lede={<span className="id">{subjectText(inc.subject)}</span>}>
-        <Download id={id} />
+        <div className="inc-actions">
+          <InvestigateButton s={inv} onStarted={() => scrollTo('investigation')} />
+          <Download id={id} />
+        </div>
       </PageHead>
       <p className={`verdict verdict-${sev}`}>
         <StatusGlyph status={sev} label={false} />
@@ -295,6 +321,8 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
         </details>
       )}
 
+      <InvestigationPanel s={inv} laneKeys={laneKeys} domain={domain} actions={actions} />
+
       <div className="inc-window" role="status">
         <p>
           {win ? (
@@ -371,12 +399,12 @@ function Body({ d, id, route, info }: { d: Detail; id: string; route: Route; inf
 
       <section aria-labelledby="h-lanes">
         <h2 id="h-lanes">What happened</h2>
-        <EventLanes items={items} domain={domain} hoverT={hoverT} onHover={setHoverT} brush={brush} onBrush={setBrush} hidden={hidden} absent={absent} />
+        <EventLanes items={items} domain={domain} hoverT={hoverT} onHover={setHoverT} brush={brush} onBrush={setBrush} hidden={hidden} absent={absent} focus={laneFocus} />
       </section>
 
       <section aria-labelledby="h-logs">
         <h2 id="h-logs">Logs</h2>
-        <LogPanel id={id} domain={domain} range={brush} pods={inc.pods ?? []} access={access.logs} sources={logSources(d.sources)} hoverT={hoverT} onHover={setHoverT} onBrush={setBrush} />
+        <LogPanel id={id} domain={domain} range={brush} pods={inc.pods ?? []} access={access.logs} sources={logSources(d.sources)} hoverT={hoverT} onHover={setHoverT} onBrush={setBrush} focus={logFocus} />
       </section>
     </>
   )

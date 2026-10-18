@@ -12,11 +12,23 @@ import (
 	"github.com/ByronGary/kubesentry/internal/snapshot"
 )
 
+// Options tune the demo server.
+type Options struct {
+	// InvestigatorDelay is how long each turn of the scripted investigator
+	// takes (DefaultInvestigatorDelay when zero; negative for none).
+	InvestigatorDelay time.Duration
+}
+
 // NewServer returns an API server wired to synthetic data. ui may be nil. It
 // serves the same handlers as the real server: a snapshot.Manager builds the
 // views from the demo cluster, and every caller is unrestricted. The views
 // and process data are refreshed in the background until ctx ends.
 func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
+	return NewServerWith(ctx, ui, Options{})
+}
+
+// NewServerWith is NewServer with options.
+func NewServerWith(ctx context.Context, ui http.Handler, o Options) (*api.Server, error) {
 	now := time.Now()
 	cluster := NewCluster(now)
 	ing := &audit.Ingester{Store: audit.NewMemoryStore(10000)}
@@ -55,22 +67,40 @@ func NewServer(ctx context.Context, ui http.Handler) (*api.Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	delay := o.InvestigatorDelay
+	switch {
+	case delay == 0:
+		delay = DefaultInvestigatorDelay
+	case delay < 0:
+		delay = 0
+	}
+	investigator, err := NewInvestigator(inc, views.Current, delay)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = investigator.Shutdown(sctx)
+	}()
 
 	return &api.Server{
-		History:       hist,
-		Cluster:       cluster,
-		Views:         views,
-		Policy:        policy,
-		ResponseCache: &api.ResponseCache{MaxBytes: 16 << 20},
-		Processes:     procs,
-		Metrics:       metrics,
-		Audit:         ing,
-		Incidents:     inc,
-		IncidentStore: incStore,
-		Alerts:        demoAlerts{al},
-		UI:            ui,
-		Demo:          true,
-		PVCOptions:    detectors.PVCOptions{MinAge: 24 * time.Hour},
-		LeakOptions:   policy.Leak,
+		History:        hist,
+		Cluster:        cluster,
+		Views:          views,
+		Policy:         policy,
+		ResponseCache:  &api.ResponseCache{MaxBytes: 16 << 20},
+		Processes:      procs,
+		Metrics:        metrics,
+		Audit:          ing,
+		Incidents:      inc,
+		IncidentStore:  incStore,
+		Alerts:         demoAlerts{al},
+		Investigations: investigator,
+		UI:             ui,
+		Demo:           true,
+		PVCOptions:     detectors.PVCOptions{MinAge: 24 * time.Hour},
+		LeakOptions:    policy.Leak,
 	}, nil
 }

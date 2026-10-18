@@ -23,6 +23,7 @@ Each user sees only what their Kubernetes RBAC allows.
 | **Security, certificates** | Pod security, RBAC, exposure and Pod Security labels; cert-manager expiry and failing issuers. |
 | **Storage** | Unused PVCs with an estimated monthly cost; EBS-aware, with EFS/FSx shown as "billed by usage". |
 | **Processes** | Per-pod processes from an optional node agent. |
+| **AI investigator** | Investigates an incident on request and writes a report: likely root cause with confidence, timeline and read-only checks, every claim citing evidence you can jump to. Runs Claude on Amazon Bedrock in your AWS account (VPC endpoint) or the Anthropic API; off by default. |
 | **Alerts** | Findings sent to Alertmanager (or the AMP alert manager), routed by owning team, with an Alerts page to acknowledge and silence them. Opt-in. |
 
 **Built for enterprise clusters:**
@@ -40,6 +41,8 @@ Each user sees only what their Kubernetes RBAC allows.
 | ![Pod memory](docs/images/pod-memory-leak.png) | ![Map](docs/images/map.png) |
 | **Security** | **Dark mode** |
 | ![Security](docs/images/security.png) | ![Overview, dark](docs/images/overview-dark.png) |
+| **AI investigation (demo)** | |
+| ![AI investigation](docs/images/investigation.png) | |
 
 ## Quick start
 
@@ -67,6 +70,7 @@ helm upgrade --install kubesentry oci://ghcr.io/byrongary/charts/kubesentry -n k
 | Deploying on EKS (IAM, SSO, Postgres, sizing) | [docs/deploy-eks.md](docs/deploy-eks.md) |
 | Running from a laptop (remote mode) | [docs/run-remote.md](docs/run-remote.md) |
 | Incidents | [docs/incidents.md](docs/incidents.md) |
+| AI investigator (Bedrock through a VPC endpoint, or the Anthropic API) | [docs/investigator.md](docs/investigator.md) |
 | Alerts and runbooks | [docs/alerts.md](docs/alerts.md) |
 | Monitoring profile for EKS (Prometheus, Alertmanager, Grafana) | [docs/monitoring-eks.md](docs/monitoring-eks.md) |
 | Flags, routes and Helm values | [docs/contracts.md](docs/contracts.md) |

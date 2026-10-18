@@ -1,4 +1,4 @@
-import { useState, type KeyboardEvent } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import type { Range } from '../chartMath'
 import { formatClock, formatDateTime } from '../format'
 import { inRange, laneItems, LANES, type Lane, type TimelineItem } from '../incidents'
@@ -20,6 +20,8 @@ export interface LaneProps {
   hidden?: Partial<Record<Lane, string>>
   /** Lanes whose source is not set up, with a note. */
   absent?: Partial<Record<Lane, string>>
+  /** An item to list, highlight, scroll to and focus (an investigation's evidence); n changes on every request. */
+  focus?: { key: string; n: number }
 }
 
 /**
@@ -56,10 +58,26 @@ export function EventLanes(p: LaneProps) {
   )
 }
 
-function LaneRow({ lane, label, width, items: all, domain, hoverT, onHover, brush, onBrush }: LaneProps & { lane: Lane; label: string; width: number }) {
+function LaneRow({ lane, label, width, items: all, domain, hoverT, onHover, brush, onBrush, focus }: LaneProps & { lane: Lane; label: string; width: number }) {
   const [showAll, setShowAll] = useState(false)
   const [showOutside, setShowOutside] = useState(false)
   const items = laneItems(all, lane)
+  const listRef = useRef<HTMLOListElement>(null)
+  const target = focus ? items.find((i) => i.key === focus.key) : undefined
+  const [jump, setJump] = useState(0)
+  // List the item (all of the lane, and outside the selection), then scroll to it and focus it.
+  useEffect(() => {
+    if (!target) return
+    setShowAll(true)
+    if (brush && !inRange(target, brush)) setShowOutside(true)
+    setJump((n) => n + 1)
+  }, [focus?.n])
+  useEffect(() => {
+    if (!jump || !target) return
+    const b = [...(listRef.current?.querySelectorAll<HTMLButtonElement>('button.lane-item') ?? [])].find((x) => x.dataset.key === target.key)
+    b?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    b?.focus({ preventScroll: true })
+  }, [jump])
   const inside = brush ? items.filter((i) => inRange(i, brush)) : items
   const listed = brush && !showOutside ? inside : items
   const shown = showAll ? listed : listed.slice(0, FIRST)
@@ -117,12 +135,13 @@ function LaneRow({ lane, label, width, items: all, domain, hoverT, onHover, brus
         )}
       </TimeStrip>
       {shown.length > 0 ? (
-        <ol className="lane-items">
+        <ol className="lane-items" ref={listRef}>
           {shown.map((i) => (
             <li key={i.key} className={i.href ? 'lane-linked' : undefined}>
               <button
                 type="button"
-                className={`lane-item${hoverT === i.t ? ' on' : ''}`}
+                className={`lane-item${hoverT === i.t ? ' on' : ''}${focus?.key === i.key ? ' hl' : ''}`}
+                data-key={i.key}
                 onFocus={() => onHover(i.t)}
                 onMouseEnter={() => onHover(i.t)}
                 onClick={() => onHover(i.t)}
