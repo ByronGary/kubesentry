@@ -17,6 +17,8 @@ type Options struct {
 	// InvestigatorDelay is how long each turn of the scripted investigator
 	// takes (DefaultInvestigatorDelay when zero; negative for none).
 	InvestigatorDelay time.Duration
+	// SettingsMode is the Settings page's mode: ui (default) or locked.
+	SettingsMode string
 }
 
 // NewServer returns an API server wired to synthetic data. ui may be nil. It
@@ -84,6 +86,10 @@ func NewServerWith(ctx context.Context, ui http.Handler, o Options) (*api.Server
 		defer cancel()
 		_ = investigator.Shutdown(sctx)
 	}()
+	st, err := NewSettings(ctx, investigator, delay, o.SettingsMode)
+	if err != nil {
+		return nil, err
+	}
 
 	return &api.Server{
 		History:        hist,
@@ -98,6 +104,7 @@ func NewServerWith(ctx context.Context, ui http.Handler, o Options) (*api.Server
 		IncidentStore:  incStore,
 		Alerts:         demoAlerts{al},
 		Investigations: investigator,
+		Settings:       st,
 		UI:             ui,
 		Demo:           true,
 		PVCOptions:     detectors.PVCOptions{MinAge: 24 * time.Hour},

@@ -21,6 +21,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 	delay := flag.Duration("investigator-delay", demo.DefaultInvestigatorDelay,
 		"how long each turn of the scripted demo investigator takes (it never calls a model)")
+	settingsMode := flag.String("investigator-settings", "ui", "the Settings page's mode: ui, or locked (read-only, as with Helm's settings: locked)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -30,7 +31,7 @@ func main() {
 	if d <= 0 {
 		d = -1 // none
 	}
-	srv, err := demo.NewServerWith(ctx, web.Handler(), demo.Options{InvestigatorDelay: d})
+	srv, err := demo.NewServerWith(ctx, web.Handler(), demo.Options{InvestigatorDelay: d, SettingsMode: *settingsMode})
 	if err != nil {
 		slog.Error("build demo server", "err", err)
 		os.Exit(1)
