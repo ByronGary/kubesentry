@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react'
+import { useEffect, useId, useMemo, useState } from 'react'
 import { hiddenNote } from '../access'
 import { ApiError } from '../api'
 import type { Range } from '../chartMath'
@@ -33,6 +33,8 @@ export interface LogPanelProps {
   hoverT: number | null
   onHover: (t: number | null) => void
   onBrush?: (r: Range | null) => void
+  /** Narrow the filters to these (an investigation's evidence); n changes on every request. Unset fields are cleared. */
+  focus?: { pod?: string; container?: string; q?: string; n: number }
 }
 
 /**
@@ -50,6 +52,15 @@ export function LogPanel(p: LogPanelProps) {
   const [open, setOpen] = useState<Row | null>(null)
   const [wrap, w] = useWidth()
   const hatch = `hatch-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
+  const fn = p.focus?.n
+  useEffect(() => {
+    if (!p.focus) return
+    setLevel('')
+    setPod(p.focus.pod ?? '')
+    setContainer(p.focus.container ?? '')
+    setText(p.focus.q ?? '')
+    setOpen(null)
+  }, [fn])
 
   const path = p.access === 'ok' ? logsPath(p.id, { from: p.range?.[0], to: p.range?.[1], pod, container, level, q, source }) : null
   const state = useApi<IncidentLogsResponse>(path)
