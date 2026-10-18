@@ -1,0 +1,215 @@
+{
+  "recommended": "anthropic",
+  "tabs": [
+    {
+      "id": "irsa",
+      "title": "EKS: IRSA",
+      "summary": "No keys: kubesentry's service account assumes an IAM role through the cluster's OIDC provider, and reaches Bedrock through a VPC endpoint.",
+      "steps": [
+        {
+          "title": "Enable model access",
+          "text": "In the Amazon Bedrock console of <REGION>, open Model access and request Anthropic's Claude Opus 5.5 (anthropic.claude-opus-5-5). The refusal fallback uses anthropic.claude-opus-5: request it too, or set the fallback to off. The first Anthropic model in an account also asks for the use-case form."
+        },
+        {
+          "title": "Find the cluster's network",
+          "text": "The VPC, the private subnets of the nodes and the cluster security group.",
+          "code": "aws eks describe-cluster --name <CLUSTER> --region <REGION> \\\n  --query 'cluster.resourcesVpcConfig.{vpc:vpcId,subnets:subnetIds,clusterSG:clusterSecurityGroupId}'",
+          "lang": "shell"
+        },
+        {
+          "title": "Endpoint security group",
+          "text": "Allow HTTPS (TCP 443) into the endpoint from the nodes (or from the pods' security group with security groups for pods).",
+          "code": "aws ec2 create-security-group --region <REGION> --vpc-id <VPC_ID> \\\n  --group-name kubesentry-bedrock-endpoint --description 'Bedrock endpoint for kubesentry'\naws ec2 authorize-security-group-ingress --region <REGION> --group-id <ENDPOINT_SG_ID> \\\n  --protocol tcp --port 443 --source-group <NODE_SG_ID>",
+          "lang": "shell"
+        },
+        {
+          "title": "Endpoint policy",
+          "text": "Only kubesentry's role, only the inference action and the models. Save it as endpoint-policy.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"KubesentryInvestigatorBedrockMantle\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"AWS\": \"arn:aws:iam::<ACCOUNT_ID>:role/kubesentry-investigator\"\n      },\n      \"Action\": [\n        \"bedrock-mantle:CreateInference\"\n      ],\n      \"Resource\": \"arn:aws:bedrock-mantle:<REGION>:<ACCOUNT_ID>:project/*\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"bedrock-mantle:Model\": [\n            \"anthropic.claude-opus-5-5\",\n            \"anthropic.claude-opus-5\"\n          ]\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Create the interface VPC endpoint",
+          "text": "Service com.amazonaws.<REGION>.bedrock-mantle in the nodes' private subnets, with private DNS on: bedrock-mantle.<REGION>.api.aws then resolves to private addresses inside the VPC, so no endpoint override is needed and no traffic leaves the VPC.",
+          "code": "aws ec2 create-vpc-endpoint --region <REGION> --vpc-id <VPC_ID> \\\n  --vpc-endpoint-type Interface --service-name com.amazonaws.<REGION>.bedrock-mantle \\\n  --subnet-ids <PRIVATE_SUBNET_IDS> --security-group-ids <ENDPOINT_SG_ID> \\\n  --private-dns-enabled --policy-document file://endpoint-policy.json",
+          "lang": "shell"
+        },
+        {
+          "title": "Role policy",
+          "text": "kubesentry's role needs bedrock-mantle:CreateInference on the account's Mantle projects (Bedrock API: mantle). Save it as investigator-policy.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"KubesentryInvestigatorBedrockMantle\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"bedrock-mantle:CreateInference\"\n      ],\n      \"Resource\": \"arn:aws:bedrock-mantle:<REGION>:<ACCOUNT_ID>:project/*\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"bedrock-mantle:Model\": [\n            \"anthropic.claude-opus-5-5\",\n            \"anthropic.claude-opus-5\"\n          ]\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "The cluster's OIDC issuer",
+          "text": "IRSA trusts the cluster's OIDC provider. kubesentry does not know it: look it up, and replace <OIDC_ISSUER> below with it (without https://). Create the IAM OIDC provider once per cluster if it does not exist (eksctl utils associate-iam-oidc-provider).",
+          "code": "aws eks describe-cluster --name <CLUSTER> --region <REGION> \\\n  --query cluster.identity.oidc.issuer --output text",
+          "lang": "shell"
+        },
+        {
+          "title": "Trust policy (IRSA)",
+          "text": "Only kubesentry's service account observability/ks may assume the role. Save it as trust-irsa.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"Federated\": \"arn:aws:iam::<ACCOUNT_ID>:oidc-provider/<OIDC_ISSUER>\"\n      },\n      \"Action\": \"sts:AssumeRoleWithWebIdentity\",\n      \"Condition\": {\n        \"StringEquals\": {\n          \"<OIDC_ISSUER>:aud\": \"sts.amazonaws.com\",\n          \"<OIDC_ISSUER>:sub\": \"system:serviceaccount:observability:ks\"\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Create the role",
+          "text": "Create the role with the trust policy and attach the inference policy.",
+          "code": "aws iam create-role --role-name kubesentry-investigator \\\n  --assume-role-policy-document file://trust-irsa.json\naws iam put-role-policy --role-name kubesentry-investigator --policy-name kubesentry-investigator \\\n  --policy-document file://investigator-policy.json",
+          "lang": "shell"
+        },
+        {
+          "title": "Helm values",
+          "text": "Annotate kubesentry's service account with the role.",
+          "code": "serviceAccount:\n  annotations:\n    eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/kubesentry-investigator\nincidents:\n  enabled: true\n  investigator:\n    provider: bedrock\n    bedrockAPI: mantle\n    # enabled: true and acknowledgeDataEgress: true here, or turn it on in Settings\n    # settings: locked   # GitOps: Helm is the only source, the Settings page is read-only\n",
+          "lang": "yaml"
+        },
+        {
+          "title": "Test the connection",
+          "text": "Restart kubesentry so its pods pick up the role (kubectl -n observability rollout restart deployment), then press Test connection above: it shows the role kubesentry runs as and sends a one-token request to the model. Turn the investigator on when it passes."
+        }
+      ]
+    },
+    {
+      "id": "pod-identity",
+      "title": "EKS: Pod Identity",
+      "summary": "No keys: an EKS Pod Identity association gives kubesentry's service account an IAM role; Bedrock through a VPC endpoint.",
+      "steps": [
+        {
+          "title": "Enable model access",
+          "text": "In the Amazon Bedrock console of <REGION>, open Model access and request Anthropic's Claude Opus 5.5 (anthropic.claude-opus-5-5). The refusal fallback uses anthropic.claude-opus-5: request it too, or set the fallback to off. The first Anthropic model in an account also asks for the use-case form."
+        },
+        {
+          "title": "Find the cluster's network",
+          "text": "The VPC, the private subnets of the nodes and the cluster security group.",
+          "code": "aws eks describe-cluster --name <CLUSTER> --region <REGION> \\\n  --query 'cluster.resourcesVpcConfig.{vpc:vpcId,subnets:subnetIds,clusterSG:clusterSecurityGroupId}'",
+          "lang": "shell"
+        },
+        {
+          "title": "Endpoint security group",
+          "text": "Allow HTTPS (TCP 443) into the endpoint from the nodes (or from the pods' security group with security groups for pods).",
+          "code": "aws ec2 create-security-group --region <REGION> --vpc-id <VPC_ID> \\\n  --group-name kubesentry-bedrock-endpoint --description 'Bedrock endpoint for kubesentry'\naws ec2 authorize-security-group-ingress --region <REGION> --group-id <ENDPOINT_SG_ID> \\\n  --protocol tcp --port 443 --source-group <NODE_SG_ID>",
+          "lang": "shell"
+        },
+        {
+          "title": "Endpoint policy",
+          "text": "Only kubesentry's role, only the inference action and the models. Save it as endpoint-policy.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"KubesentryInvestigatorBedrockMantle\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"AWS\": \"arn:aws:iam::<ACCOUNT_ID>:role/kubesentry-investigator\"\n      },\n      \"Action\": [\n        \"bedrock-mantle:CreateInference\"\n      ],\n      \"Resource\": \"arn:aws:bedrock-mantle:<REGION>:<ACCOUNT_ID>:project/*\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"bedrock-mantle:Model\": [\n            \"anthropic.claude-opus-5-5\",\n            \"anthropic.claude-opus-5\"\n          ]\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Create the interface VPC endpoint",
+          "text": "Service com.amazonaws.<REGION>.bedrock-mantle in the nodes' private subnets, with private DNS on: bedrock-mantle.<REGION>.api.aws then resolves to private addresses inside the VPC, so no endpoint override is needed and no traffic leaves the VPC.",
+          "code": "aws ec2 create-vpc-endpoint --region <REGION> --vpc-id <VPC_ID> \\\n  --vpc-endpoint-type Interface --service-name com.amazonaws.<REGION>.bedrock-mantle \\\n  --subnet-ids <PRIVATE_SUBNET_IDS> --security-group-ids <ENDPOINT_SG_ID> \\\n  --private-dns-enabled --policy-document file://endpoint-policy.json",
+          "lang": "shell"
+        },
+        {
+          "title": "Role policy",
+          "text": "kubesentry's role needs bedrock-mantle:CreateInference on the account's Mantle projects (Bedrock API: mantle). Save it as investigator-policy.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"KubesentryInvestigatorBedrockMantle\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"bedrock-mantle:CreateInference\"\n      ],\n      \"Resource\": \"arn:aws:bedrock-mantle:<REGION>:<ACCOUNT_ID>:project/*\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"bedrock-mantle:Model\": [\n            \"anthropic.claude-opus-5-5\",\n            \"anthropic.claude-opus-5\"\n          ]\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Trust policy (Pod Identity)",
+          "text": "The EKS Pod Identity service assumes the role for the pod. Save it as trust-pod-identity.json.",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"AllowEksAuthToAssumeRoleForPodIdentity\",\n      \"Effect\": \"Allow\",\n      \"Principal\": {\n        \"Service\": \"pods.eks.amazonaws.com\"\n      },\n      \"Action\": [\n        \"sts:AssumeRole\",\n        \"sts:TagSession\"\n      ]\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Create the role",
+          "text": "Create the role with the trust policy and attach the inference policy.",
+          "code": "aws iam create-role --role-name kubesentry-investigator \\\n  --assume-role-policy-document file://trust-pod-identity.json\naws iam put-role-policy --role-name kubesentry-investigator --policy-name kubesentry-investigator \\\n  --policy-document file://investigator-policy.json",
+          "lang": "shell"
+        },
+        {
+          "title": "Associate the role with kubesentry's service account",
+          "text": "Needs the Amazon EKS Pod Identity Agent add-on (and, in private clusters, the com.amazonaws.<REGION>.eks-auth endpoint). No annotation is needed.",
+          "code": "aws eks create-pod-identity-association --region <REGION> --cluster-name <CLUSTER> \\\n  --namespace observability --service-account ks \\\n  --role-arn arn:aws:iam::<ACCOUNT_ID>:role/kubesentry-investigator",
+          "lang": "shell"
+        },
+        {
+          "title": "Helm values",
+          "text": "Nothing to add for the role; point the investigator at Bedrock.",
+          "code": "incidents:\n  enabled: true\n  investigator:\n    provider: bedrock\n    bedrockAPI: mantle\n    # enabled: true and acknowledgeDataEgress: true here, or turn it on in Settings\n    # settings: locked   # GitOps: Helm is the only source, the Settings page is read-only\n",
+          "lang": "yaml"
+        },
+        {
+          "title": "Test the connection",
+          "text": "Restart kubesentry so its pods pick up the role (kubectl -n observability rollout restart deployment), then press Test connection above: it shows the role kubesentry runs as and sends a one-token request to the model. Turn the investigator on when it passes."
+        }
+      ]
+    },
+    {
+      "id": "outside-eks",
+      "title": "Outside EKS",
+      "summary": "From a laptop (remote mode) with your AWS profile or SSO sign-in, or in another cluster with a Kubernetes Secret the chart mounts.",
+      "steps": [
+        {
+          "title": "Enable model access",
+          "text": "In the Amazon Bedrock console of <REGION>, open Model access and request Anthropic's Claude Opus 5.5 (anthropic.claude-opus-5-5). The refusal fallback uses anthropic.claude-opus-5: request it too, or set the fallback to off. The first Anthropic model in an account also asks for the use-case form."
+        },
+        {
+          "title": "Grant your identity the inference action",
+          "text": "From a laptop kubesentry calls Bedrock as you: add this statement to your IAM Identity Center permission set (or the role your profile assumes).",
+          "code": "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {\n      \"Sid\": \"KubesentryInvestigatorBedrockMantle\",\n      \"Effect\": \"Allow\",\n      \"Action\": [\n        \"bedrock-mantle:CreateInference\"\n      ],\n      \"Resource\": \"arn:aws:bedrock-mantle:<REGION>:<ACCOUNT_ID>:project/*\",\n      \"Condition\": {\n        \"StringLike\": {\n          \"bedrock-mantle:Model\": [\n            \"anthropic.claude-opus-5-5\",\n            \"anthropic.claude-opus-5\"\n          ]\n        }\n      }\n    }\n  ]\n}",
+          "lang": "json"
+        },
+        {
+          "title": "Sign in with your AWS profile",
+          "text": "Remote mode reads the AWS profile like the AWS CLI does; with IAM Identity Center, sign in first. The session expires: sign in again when Test connection says the credentials expired.",
+          "code": "aws sso login --profile <PROFILE>\nexport AWS_PROFILE=<PROFILE>",
+          "lang": "shell"
+        },
+        {
+          "title": "Run kubesentry",
+          "text": "Remote mode, with incidents on; then turn the investigator on in Settings, or with flags.",
+          "code": "kubesentry -kube-context <KUBE_CONTEXT> -incidents -aws-region <REGION> \\\n  -investigator-bedrock-api mantle",
+          "lang": "shell"
+        },
+        {
+          "title": "Other clusters: a Kubernetes Secret",
+          "text": "In a cluster outside AWS there is no pod role. Prefer short-lived credentials (IAM Roles Anywhere); otherwise put a dedicated, least-privilege user's keys in a Secret you manage and rotate. kubesentry never stores them: the chart mounts them as environment variables.",
+          "code": "kubectl -n observability create secret generic kubesentry-aws \\\n  --from-literal=AWS_ACCESS_KEY_ID=\"$AWS_ACCESS_KEY_ID\" \\\n  --from-literal=AWS_SECRET_ACCESS_KEY=\"$AWS_SECRET_ACCESS_KEY\"",
+          "lang": "shell"
+        },
+        {
+          "title": "Helm values for the Secret",
+          "text": "The server reads the keys from its environment.",
+          "code": "extraEnv:\n  - name: AWS_ACCESS_KEY_ID\n    valueFrom:\n      secretKeyRef: {name: kubesentry-aws, key: AWS_ACCESS_KEY_ID}\n  - name: AWS_SECRET_ACCESS_KEY\n    valueFrom:\n      secretKeyRef: {name: kubesentry-aws, key: AWS_SECRET_ACCESS_KEY}\nincidents:\n  enabled: true\n  investigator:\n    provider: bedrock\n    bedrockAPI: mantle\n    # enabled: true and acknowledgeDataEgress: true here, or turn it on in Settings\n    # settings: locked   # GitOps: Helm is the only source, the Settings page is read-only\n",
+          "lang": "yaml"
+        },
+        {
+          "title": "Test the connection",
+          "text": "Press Test connection above: it shows the identity kubesentry runs as and sends a one-token request to the model."
+        }
+      ]
+    },
+    {
+      "id": "anthropic",
+      "title": "Anthropic API",
+      "summary": "The alternative: Claude on the Anthropic API with an API key from a Kubernetes Secret.",
+      "steps": [
+        {
+          "title": "Create the Secret",
+          "text": "The key comes only from the ANTHROPIC_API_KEY environment variable, set from a Kubernetes Secret: kubesentry never stores it and the Settings page never takes it. ANTHROPIC_API_KEY is set in this server's environment.",
+          "code": "kubectl -n observability create secret generic kubesentry-anthropic \\\n  --from-literal=api-key=\"$ANTHROPIC_API_KEY\"",
+          "lang": "shell"
+        },
+        {
+          "title": "Helm values",
+          "text": "The chart sets ANTHROPIC_API_KEY from the Secret. Restart kubesentry after the first install of the Secret.",
+          "code": "incidents:\n  enabled: true\n  investigator:\n    provider: anthropic\n    existingSecret: kubesentry-anthropic\n    # apiKeyKey: api-key\n",
+          "lang": "yaml"
+        },
+        {
+          "title": "Network",
+          "text": "The pods need egress on 443 to api.anthropic.com (an egress proxy through HTTPS_PROXY in extraEnv works). Requests leave your network: the recommended setup is Bedrock through a VPC endpoint."
+        },
+        {
+          "title": "Test the connection",
+          "text": "Choose the Anthropic API as the provider above, save, and press Test connection: a missing or wrong key answers 401."
+        }
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ByronGary/kubesentry/internal/incidents"
@@ -70,11 +71,15 @@ type Hooks struct {
 	OnToolCall func(tool, result string)
 }
 
-// Config is what NewService needs. LLM, Source and Store are required.
+// Config is what NewService needs. LLM (unless Disabled), Source and Store
+// are required.
 type Config struct {
-	LLM    LLM
-	Source Source
-	Store  Store
+	LLM LLM
+	// Disabled starts the service off: it serves the runs stored before
+	// and refuses new ones until Reconfigure turns it on.
+	Disabled bool
+	Source   Source
+	Store    Store
 	// Egress filters what leaves (nil: the built-in redaction rules). Build
 	// it over the incidents runner's redactor so -incident-redact-patterns
 	// apply.
@@ -99,9 +104,14 @@ type Config struct {
 // quotas, the per-replica concurrency and one running run per incident,
 // serves completed runs again for the same input, persists progress after
 // every turn, and answers reads with the caller's access in mind.
+//
+// Its model client, options and limits can be swapped at run time
+// (Reconfigure): a run keeps the runtime it started with to the end, new
+// starts take the new one, and a disabled service refuses new starts
+// (ErrDisabled) while it still serves, and cancels, the runs it has.
 type Service struct {
 	c    Config
-	o    Options
+	rt   atomic.Pointer[runtime]
 	eg   *Egress
 	log  *slog.Logger
 	now  func() time.Time
@@ -113,7 +123,59 @@ type Service struct {
 	closed bool
 }
 
+// runtime is what a run uses from start to end: the model client, the
+// options and the limits.
+type runtime struct {
+	enabled      bool
+	llm          LLM
+	o            Options
+	perHour      int
+	perHourTotal int
+	concurrency  int
+}
+
+func (r *runtime) provider() string {
+	if r.llm == nil {
+		return ""
+	}
+	return r.llm.Provider()
+}
+
+// Runtime is what Reconfigure swaps in: the model client, the options and
+// the limits (zero limits take the defaults).
+type Runtime struct {
+	LLM          LLM
+	Options      Options
+	PerHour      int
+	PerHourTotal int
+	Concurrency  int
+}
+
+// ErrDisabled is a start while the investigator is off.
+var ErrDisabled = errors.New("investigate: the AI investigator is off")
+
+func newRuntime(r Runtime) (*runtime, error) {
+	if r.LLM == nil {
+		return nil, errors.New("investigate: a model is required")
+	}
+	if err := r.Options.Validate(); err != nil {
+		return nil, err
+	}
+	rt := &runtime{enabled: true, llm: r.LLM, o: r.Options.WithDefaults(), perHour: r.PerHour, perHourTotal: r.PerHourTotal, concurrency: r.Concurrency}
+	if rt.perHour <= 0 {
+		rt.perHour = DefaultPerHour
+	}
+	if rt.perHourTotal <= 0 {
+		rt.perHourTotal = DefaultPerHourTotal
+	}
+	if rt.concurrency <= 0 {
+		rt.concurrency = DefaultConcurrency
+	}
+	return rt, nil
+}
+
 type job struct {
+	rt       *runtime
 	cancel   context.CancelCauseFunc
 	done     chan struct{}
 	started  time.Time
@@ -125,25 +187,26 @@ type job struct {
 
 // NewService checks the config and returns a service.
 func NewService(c Config) (*Service, error) {
-	if c.LLM == nil || c.Source == nil || c.Store == nil {
+	if (c.LLM == nil && !c.Disabled) || c.Source == nil || c.Store == nil {
 		return nil, errors.New("investigate: a model, a source and a store are required")
 	}
-	if err := c.Options.Validate(); err != nil {
-		return nil, err
-	}
-	if c.PerHour <= 0 {
-		c.PerHour = DefaultPerHour
-	}
-	if c.PerHourTotal <= 0 {
-		c.PerHourTotal = DefaultPerHourTotal
-	}
-	if c.Concurrency <= 0 {
-		c.Concurrency = DefaultConcurrency
+	var rt *runtime
+	if c.Disabled {
+		if err := c.Options.Validate(); err != nil {
+			return nil, err
+		}
+		rt = &runtime{llm: c.LLM, o: c.Options.WithDefaults(), perHour: c.PerHour, perHourTotal: c.PerHourTotal, concurrency: c.Concurrency}
+	} else {
+		var err error
+		if rt, err = newRuntime(Runtime{LLM: c.LLM, Options: c.Options, PerHour: c.PerHour, PerHourTotal: c.PerHourTotal, Concurrency: c.Concurrency}); err != nil {
+			return nil, err
+		}
 	}
 	if c.Heartbeat <= 0 {
 		c.Heartbeat = DefaultHeartbeat
 	}
-	s := &Service{c: c, o: c.Options.WithDefaults(), eg: c.Egress, log: c.Logger, now: c.Now, jobs: map[string]*job{}}
+	s := &Service{c: c, eg: c.Egress, log: c.Logger, now: c.Now, jobs: map[string]*job{}}
+	s.rt.Store(rt)
 	if s.eg == nil {
 		s.eg = defaultEgress
 	}
@@ -157,14 +220,35 @@ func NewService(c Config) (*Service, error) {
 	return s, nil
 }
 
-// Provider names the model backend.
-func (s *Service) Provider() string { return s.c.LLM.Provider() }
+// Provider names the model backend in force ("" when none was ever set).
+func (s *Service) Provider() string { return s.rt.Load().provider() }
 
 // Options returns the options in force, defaults applied.
-func (s *Service) Options() Options { return s.o }
+func (s *Service) Options() Options { return s.rt.Load().o }
 
 // PerHour is the per-identity hourly quota (for /info).
-func (s *Service) PerHour() int { return s.c.PerHour }
+func (s *Service) PerHour() int { return s.rt.Load().perHour }
+
+// Enabled reports whether new runs may start.
+func (s *Service) Enabled() bool { return s.rt.Load().enabled }
+
+// Reconfigure swaps in a new model client, options and limits, or with nil
+// turns the service off. Running runs finish on what they started with;
+// new starts use the new runtime (or are refused with ErrDisabled).
+func (s *Service) Reconfigure(r *Runtime) error {
+	if r == nil {
+		off := *s.rt.Load()
+		off.enabled = false
+		s.rt.Store(&off)
+		return nil
+	}
+	rt, err := newRuntime(*r)
+	if err != nil {
+		return err
+	}
+	s.rt.Store(rt)
+	return nil
+}
 
 // StartRequest asks for an investigation. The caller (the API) has checked
 // that the incident is visible and that RequestedBy may investigate it.
@@ -178,9 +262,9 @@ type StartRequest struct {
 	Fresh bool
 }
 
-func (s *Service) result(r string) {
+func (s *Service) result(provider, r string) {
 	if h := s.c.Hooks.OnResult; h != nil {
-		h(s.Provider(), r)
+		h(provider, r)
 	}
 }
 
@@ -196,11 +280,17 @@ func (s *Service) running() {
 // Start begins an investigation and returns it at once (status running),
 // or, unless Fresh, a completed run with the same input from the last 24
 // hours (cached true: no model call, no quota used). Errors: ErrIncidentNotFound,
-// *ConflictError, *QuotaError, *BusyError.
+// *ConflictError, *QuotaError, *BusyError, ErrDisabled.
 func (s *Service) Start(ctx context.Context, req StartRequest) (*Investigation, bool, error) {
 	if req.IncidentID == "" || req.RequestedBy == "" {
 		return nil, false, errors.New("investigate: an incident and an identity are required")
 	}
+	// The runtime this start, and its run, use to the end.
+	rt := s.rt.Load()
+	if !rt.enabled {
+		return nil, false, ErrDisabled
+	}
+	o := rt.o
 	s.mu.Lock()
 	closed := s.closed
 	s.mu.Unlock()
@@ -228,8 +318,8 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (*Investigation, 
 		return nil, false, fmt.Errorf("investigate: the incident's evidence: %w", err)
 	}
 	gateBundle(b, access)
-	digest, stable, led := s.eg.digest(b, s.o.DigestBytes)
-	hash := inputHash(stable, s.o.Model, s.o.Effort, access)
+	digest, stable, led := s.eg.digest(b, o.DigestBytes)
+	hash := inputHash(stable, o.Model, o.Effort, access)
 
 	if !req.Fresh {
 		orig, err := s.c.Store.Cached(ctx, hash, now.Add(-CacheFor))
@@ -239,31 +329,31 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (*Investigation, 
 			if err := s.c.Store.Create(ctx, inv); err != nil {
 				return nil, false, err
 			}
-			s.result(ResultCached)
-			s.log.Info("investigation started", "identity", req.RequestedBy, "incident", req.IncidentID, "provider", s.Provider(),
-				"model", s.o.Model, "id", inv.ID, "cachedFrom", inv.CachedFrom)
+			s.result(rt.provider(), ResultCached)
+			s.log.Info("investigation started", "identity", req.RequestedBy, "incident", req.IncidentID, "provider", rt.provider(),
+				"model", o.Model, "id", inv.ID, "cachedFrom", inv.CachedFrom)
 			return inv, true, nil
 		case !errors.Is(err, ErrNotFound):
 			return nil, false, err
 		}
 	}
 
-	if err := s.checkQuota(ctx, req.RequestedBy, now); err != nil {
-		s.result(ResultQuota)
+	if err := s.checkQuota(ctx, rt, req.RequestedBy, now); err != nil {
+		s.result(rt.provider(), ResultQuota)
 		return nil, false, err
 	}
 
 	inv := &Investigation{ID: newID(now), IncidentID: req.IncidentID, Namespace: b.Incident.Subject.Namespace, Status: Running,
-		RequestedBy: req.RequestedBy, CreatedAt: now, UpdatedAt: now, Provider: s.Provider(), Model: s.o.Model, Effort: s.o.Effort,
+		RequestedBy: req.RequestedBy, CreatedAt: now, UpdatedAt: now, Provider: rt.provider(), Model: o.Model, Effort: o.Effort,
 		PromptVersion: PromptVersion, InputSHA256: hash, Access: access, Omitted: s.omitted(b), Steps: []Step{}}
-	j := &job{done: make(chan struct{}), started: now, inv: inv, p: &progress{steps: []Step{}}}
+	j := &job{rt: rt, done: make(chan struct{}), started: now, inv: inv, p: &progress{steps: []Step{}}}
 	ctxJob, cancel := context.WithCancelCause(s.base)
 	j.cancel = cancel
 	s.mu.Lock()
-	if s.closed || len(s.jobs) >= s.c.Concurrency {
+	if s.closed || len(s.jobs) >= rt.concurrency {
 		s.mu.Unlock()
 		cancel(nil)
-		s.result(ResultBusy)
+		s.result(rt.provider(), ResultBusy)
 		return nil, false, &BusyError{RetryAfter: busyRetry}
 	}
 	s.jobs[inv.ID] = j
@@ -276,10 +366,10 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (*Investigation, 
 		return nil, false, err
 	}
 	s.running()
-	s.log.Info("investigation started", "identity", req.RequestedBy, "incident", req.IncidentID, "provider", s.Provider(),
-		"model", s.o.Model, "id", inv.ID)
+	s.log.Info("investigation started", "identity", req.RequestedBy, "incident", req.IncidentID, "provider", rt.provider(),
+		"model", o.Model, "id", inv.ID)
 	tb := &toolbox{src: s.c.Source, egress: s.eg, access: access, inc: b.Incident, from: b.Window.From, to: b.Window.To,
-		open: b.Incident.State == incidents.Open, now: s.now, ledger: led, timeout: s.o.ToolTimeout, bundleCT: b.CloudTrail}
+		open: b.Incident.State == incidents.Open, now: s.now, ledger: led, timeout: o.ToolTimeout, bundleCT: b.CloudTrail}
 	go s.run(ctxJob, j, tb, digest)
 	return inv.Clone(), false, nil
 }
@@ -301,7 +391,7 @@ func (s *Service) checkRunning(ctx context.Context, incidentID string, now time.
 	return &ConflictError{RunningID: cur.ID}
 }
 
-func (s *Service) checkQuota(ctx context.Context, identity string, now time.Time) error {
+func (s *Service) checkQuota(ctx context.Context, rt *runtime, identity string, now time.Time) error {
 	since := now.Add(-time.Hour)
 	retry := func(oldest time.Time) time.Duration {
 		d := oldest.Add(time.Hour).Sub(now).Round(time.Second)
@@ -314,15 +404,15 @@ func (s *Service) checkQuota(ctx context.Context, identity string, now time.Time
 	if err != nil {
 		return err
 	}
-	if n >= s.c.PerHour {
-		return &QuotaError{Scope: "user", Limit: s.c.PerHour, RetryAfter: retry(oldest)}
+	if n >= rt.perHour {
+		return &QuotaError{Scope: "user", Limit: rt.perHour, RetryAfter: retry(oldest)}
 	}
 	n, oldest, err = s.c.Store.CountSince(ctx, "", since)
 	if err != nil {
 		return err
 	}
-	if n >= s.c.PerHourTotal {
-		return &QuotaError{Scope: "total", Limit: s.c.PerHourTotal, RetryAfter: retry(oldest)}
+	if n >= rt.perHourTotal {
+		return &QuotaError{Scope: "total", Limit: rt.perHourTotal, RetryAfter: retry(oldest)}
 	}
 	return nil
 }
@@ -342,10 +432,11 @@ func (s *Service) omitted(b *incidents.Bundle) map[string]string {
 
 // run is one job: the loop, a heartbeat, and the final write.
 func (s *Service) run(ctx context.Context, j *job, tb *toolbox, digest []byte) {
-	ctx, cancelT := context.WithTimeoutCause(ctx, s.o.Timeout, errTimeout)
+	rt := j.rt
+	ctx, cancelT := context.WithTimeoutCause(ctx, rt.o.Timeout, errTimeout)
 	defer cancelT()
-	provider, model := s.Provider(), s.o.Model
-	a := &agent{llm: s.c.LLM, tb: tb, o: s.o, now: s.now, p: j.p, digest: digest, conv: j.inv.ID, hooks: agentHooks{
+	provider, model := rt.provider(), rt.o.Model
+	a := &agent{llm: rt.llm, tb: tb, o: rt.o, now: s.now, p: j.p, digest: digest, conv: j.inv.ID, hooks: agentHooks{
 		onTokens: func(u Usage) {
 			if h := s.c.Hooks.OnTokens; h != nil {
 				h(provider, model, u)
@@ -409,7 +500,7 @@ func (s *Service) finish(j *job, out outcome) {
 	j.mu.Unlock()
 	switch {
 	case err == nil:
-		s.result(resultOf(out))
+		s.result(j.rt.provider(), resultOf(out))
 		if h := s.c.Hooks.OnDuration; h != nil {
 			h(now.Sub(j.started))
 		}
@@ -558,7 +649,7 @@ func (s *Service) Cancel(ctx context.Context, incidentID, id, identity string) (
 	if err := s.c.Store.Update(ctx, c); err != nil {
 		return nil, err
 	}
-	s.result(ResultCancelled)
+	s.result(inv.Provider, ResultCancelled)
 	return s.c.Store.Get(ctx, id)
 }
 
