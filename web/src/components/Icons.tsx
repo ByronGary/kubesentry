@@ -62,6 +62,12 @@ const PATHS: Record<IconName, ReactNode> = {
     </>
   ),
   activity: <path d="M2.5 10H6l2-5 4 10 2-5h3.5" />,
+  settings: (
+    <>
+      <circle cx="10" cy="10" r="2.6" />
+      <path d="M10 2.5v2.2M10 15.3v2.2M2.5 10h2.2M15.3 10h2.2M4.7 4.7l1.6 1.6M13.7 13.7l1.6 1.6M4.7 15.3l1.6-1.6M13.7 6.3l1.6-1.6" />
+    </>
+  ),
   menu: <path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13" />,
   close: <path d="M5 5l10 10M15 5 5 15" />,
   collapse: <path d="M10.5 5 5.5 10l5 5M15.5 5l-5 5 5 5" />,

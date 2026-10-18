@@ -19,6 +19,7 @@ import { Overview, OVERVIEW_POLL_MS } from './pages/Overview'
 import { PodDetail } from './pages/PodDetail'
 import { Pods } from './pages/Pods'
 import { Security } from './pages/Security'
+import { Settings } from './pages/Settings'
 import { Storage } from './pages/Storage'
 import { Workloads } from './pages/Workloads'
 import { useRoute } from './router'
@@ -26,7 +27,7 @@ import { prometheusOutage } from './sources'
 import type { Capability, Info, OverviewResponse } from './types'
 import { useApi, usePolled, type ApiState } from './useApi'
 
-type Flag = 'inventory' | 'certs' | 'incidents' | 'alerts'
+type Flag = 'inventory' | 'certs' | 'incidents' | 'alerts' | 'settings'
 
 /** Pages built around wide tables (and the Overview's tiles) get more room; the map and node pages get the most. */
 const TABLE_PAGES = new Set<PageKey>(['overview', 'alerts', 'pods', 'workloads', 'storage', 'activity', 'agents', 'incidents', 'incident'])
@@ -60,6 +61,8 @@ function Gate({ state, title, needs, cap, children }: { state: ApiState<Info>; t
               ? 'This kubesentry server does not track incidents: it is older than incidents, or runs without -incidents.'
               : needs === 'alerts'
                 ? 'This kubesentry server does not evaluate alerts: it is older than alerting, or runs without -alerts.'
+                : needs === 'settings'
+                  ? 'This kubesentry server has no Settings page: it is older than the page.'
                 : 'This kubesentry server does not list workloads, services and nodes, so this page has nothing to show.'}
         </Empty>
       </>
@@ -156,6 +159,9 @@ export function App() {
           {(i) => <IncidentDetail key={parts[1]} id={parts[1]} route={route} info={i} />}
         </Gate>
       )
+      break
+    case 'settings':
+      page = <Gate state={infoState} title="Settings" needs="settings" cap="settings">{(i) => <Settings info={i} />}</Gate>
       break
     case 'agents':
       page = <Gate state={infoState} title="Agents" cap="agents">{() => <Agents onMissing={() => hideRoute('/agents')} />}</Gate>

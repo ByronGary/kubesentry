@@ -250,9 +250,9 @@ export function Sidebar({
       <div className="side-scroll">
         <nav aria-label="Main" onKeyDown={onNavKey}>
           {sections.map((s) => {
-            if (s.key === 'top') {
+            if (s.key === 'top' || s.key === 'bottom') {
               return (
-                <ul className="nav-list" key={s.key}>
+                <ul className={s.key === 'bottom' ? 'nav-list nav-bottom' : 'nav-list'} key={s.key}>
                   {s.items.map(item)}
                 </ul>
               )

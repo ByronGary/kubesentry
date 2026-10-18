@@ -62,6 +62,20 @@ describe('groupNav', () => {
       ['security', ['security', 'certificates']],
     ])
   })
+  it('puts Settings at the bottom, for settings admins of a server that has the page', () => {
+    const withPage: Info = { ...scoped, settings: { investigator: true, mode: 'ui' } }
+    // An older server: no page.
+    expect(keys(scoped).map(([k]) => k)).not.toContain('bottom')
+    // The page, but not the capability.
+    expect(keys(withPage).map(([k]) => k)).not.toContain('bottom')
+    expect(keys({ ...withPage, capabilities: { ...scoped.capabilities, settings: true } }).at(-1)).toEqual(['bottom', ['settings']])
+    // An unscoped server (the API token, the demo): everything allowed.
+    expect(keys({ ...base, settings: { investigator: true, mode: 'locked' } }).at(-1)).toEqual(['bottom', ['settings']])
+    expect(resolveRoute('/settings', new URLSearchParams(), { overview: true }).page).toBe('settings')
+    // The bottom section never folds.
+    const s0: NavState = { folded: [], drawerOpen: false }
+    expect(navReducer(s0, { type: 'toggleSection', section: 'bottom' })).toBe(s0)
+  })
   it('drops a section with nothing visible in it', () => {
     const bare: Info = { ...base, inventory: false, certs: false, capabilities: { audit: false } }
     expect(keys(bare).map(([k]) => k)).toEqual(['top', 'cluster', 'health'])

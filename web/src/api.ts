@@ -88,7 +88,7 @@ export function qs(params: Record<string, string | number | undefined>): string 
   return s ? `?${s}` : ''
 }
 
-async function request<T>(method: 'GET' | 'POST', path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+async function request<T>(method: 'GET' | 'POST' | 'PUT', path: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const token = getToken()
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (token) headers.Authorization = `Bearer ${token}`
@@ -169,4 +169,9 @@ export async function apiBlob(path: string, signal?: AbortSignal): Promise<{ blo
 /** POST with an optional JSON body. */
 export function apiPost<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   return request<T>('POST', path, body, signal)
+}
+
+/** PUT a JSON body. */
+export function apiPut<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  return request<T>('PUT', path, body, signal)
 }

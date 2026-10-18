@@ -20,8 +20,10 @@ export type NavKey =
   | 'security'
   | 'certificates'
   | 'activity'
+  | 'settings'
 
-export type SectionKey = 'top' | 'cluster' | 'health' | 'security'
+/** `top` and `bottom` have no heading and never fold. */
+export type SectionKey = 'top' | 'cluster' | 'health' | 'security' | 'bottom'
 
 export interface NavEntry extends NavItem {
   key: NavKey
@@ -33,6 +35,7 @@ export const SECTIONS: { key: SectionKey; label: string }[] = [
   { key: 'cluster', label: 'Cluster' },
   { key: 'health', label: 'Health' },
   { key: 'security', label: 'Security' },
+  { key: 'bottom', label: '' },
 ]
 
 export const NAV: NavEntry[] = [
@@ -51,6 +54,7 @@ export const NAV: NavEntry[] = [
   { key: 'security', section: 'security', href: '/security', label: 'Security', needs: 'inventory' },
   { key: 'certificates', section: 'security', href: '/certificates', label: 'Certificates', needs: 'certs' },
   { key: 'activity', section: 'security', href: '/activity', label: 'Activity', cap: 'audit' },
+  { key: 'settings', section: 'bottom', href: '/settings', label: 'Settings', needs: 'settings', cap: 'settings' },
 ]
 
 // ---- Badges ----
@@ -169,7 +173,22 @@ export interface Resolved {
   redirect?: string
 }
 
-const PAGES = new Set<string>(['alerts', 'map', 'workloads', 'pods', 'nodes', 'agents', 'incidents', 'findings', 'memory', 'storage', 'security', 'certificates', 'activity'])
+const PAGES = new Set<string>([
+  'alerts',
+  'map',
+  'workloads',
+  'pods',
+  'nodes',
+  'agents',
+  'incidents',
+  'findings',
+  'memory',
+  'storage',
+  'security',
+  'certificates',
+  'activity',
+  'settings',
+])
 
 /** Old paths that still work. */
 const ALIAS: Record<string, string> = { volumes: 'storage' }
@@ -265,7 +284,7 @@ export function navReducer(s: NavState, a: NavAction): NavState {
       if (a.layout === 'drawer') return s
       return { ...s, pref: a.layout === 'expanded' ? 'rail' : 'expanded' }
     case 'toggleSection':
-      if (a.section === 'top') return s
+      if (a.section === 'top' || a.section === 'bottom') return s
       return { ...s, folded: s.folded.includes(a.section) ? s.folded.filter((x) => x !== a.section) : [...s.folded, a.section] }
     case 'openDrawer':
       return s.drawerOpen ? s : { ...s, drawerOpen: true }

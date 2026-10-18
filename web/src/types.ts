@@ -43,6 +43,12 @@ export interface Info {
     /** The longest silence an action may ask for (-alerts-max-silence), in seconds; absent on older servers (then 7 days). */
     maxSilenceSeconds?: number
   }
+  /** The Settings page (/api/v1/settings/investigator); absent on older servers. */
+  settings?: {
+    investigator: boolean
+    /** ui: admins change the settings live; locked: Helm is the only source. */
+    mode: 'ui' | 'locked'
+  }
   /** AI investigator (-investigator); absent when off or on older servers. */
   investigator?: {
     enabled: boolean
@@ -72,6 +78,8 @@ export type Capability = 'nodes' | 'pvs' | 'storageClasses' | 'clusterRBAC' | 'c
   | 'alertsUpdate'
   /** `create investigations.kubesentry.io` somewhere: may start AI investigations of incidents there. */
   | 'investigate'
+  /** `update settings.kubesentry.io` cluster-wide: may read and change the Settings page. */
+  | 'settings'
 
 /** Optional paging on list responses: pass `continue` back to get the next page. */
 export interface Paged {
@@ -1022,4 +1030,150 @@ export interface InvestigationsResponse {
   items: InvestigationSummary[]
   /** Runs on this incident that used sections the caller cannot see. */
   hidden: number
+}
+
+// ---- Settings (/api/v1/settings/investigator) ----
+// Mirrors internal/settings (Investigator, State, Environment, Credentials,
+// Guide, TestResult) and internal/api/settings.go. docs/contracts.md
+// "Settings (M7b)".
+
+export type InvestigatorProvider = 'anthropic' | 'bedrock'
+export type BedrockAPI = 'mantle' | 'runtime'
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export interface InvestigatorValues {
+  enabled: boolean
+  provider: InvestigatorProvider
+  /** Empty: the provider's default model. */
+  model: string
+  effort: Effort
+  /** Empty: -aws-region, then AWS_REGION. */
+  region: string
+  bedrockAPI: BedrockAPI | ''
+  endpoint: string
+  /** auto, off or a model ID. */
+  fallback: string
+  limits: {
+    perHour: number
+    perHourTotal: number
+    concurrency: number
+    maxTurns: number
+    maxToolCalls: number
+    maxTokens: number
+    /** A duration: "10m", "1h30m". */
+    timeout: string
+  }
+}
+
+export interface SettingSource {
+  source: 'helm' | 'ui'
+  by?: string
+  at?: string
+}
+
+export interface SettingChange {
+  field: string
+  old: string
+  new: string
+}
+
+export interface SettingsAuditEntry {
+  id: number
+  at: string
+  actor: string
+  action: 'save' | 'reset'
+  version: number
+  changes: SettingChange[]
+  egressAcknowledged: boolean
+  egressAckByPlatform?: boolean
+}
+
+export interface SettingsEnvironment {
+  kind: 'eks' | 'kubernetes' | 'remote'
+  label: string
+  cluster?: string
+  region?: string
+  platform?: string
+  namespace?: string
+  serviceAccount?: string
+  kubeContext?: string
+  oidcIssuer?: string
+}
+
+export interface SettingsCredentials {
+  kind: 'bedrock-api-key' | 'profile' | 'env-keys' | 'irsa' | 'pod-identity' | 'container' | 'instance-role' | 'none'
+  label: string
+  roleArn?: string
+  profile?: string
+  sso?: boolean
+  note?: string
+  anthropicKey: boolean
+  accountId?: string
+}
+
+export interface SetupStep {
+  title: string
+  text: string
+  code?: string
+  lang?: 'json' | 'yaml' | 'shell'
+}
+
+export interface SetupTab {
+  id: 'irsa' | 'pod-identity' | 'outside-eks' | 'anthropic'
+  title: string
+  summary: string
+  steps: SetupStep[]
+}
+
+export interface InvestigatorSettings {
+  values: InvestigatorValues
+  helm: InvestigatorValues
+  /** Keyed by field: "enabled", "model", "limits.timeout", … */
+  sources: Record<string, SettingSource>
+  mode: 'ui' | 'locked'
+  locked: boolean
+  version: number
+  updatedAt?: string
+  updatedBy?: string
+  /** What this replica runs with. */
+  applied: { enabled: boolean; at?: string; error?: string }
+  audit: SettingsAuditEntry[]
+  egressAckByPlatform: boolean
+  /** -incidents is on (the investigator needs it). */
+  incidents: boolean
+  anthropicKey: boolean
+  defaultRegion?: string
+  environment: SettingsEnvironment
+  credentials: SettingsCredentials
+  setup: { recommended: SetupTab['id']; tabs: SetupTab[] }
+  options: { providers: InvestigatorProvider[]; bedrockAPIs: BedrockAPI[]; efforts: Effort[]; fields: string[] }
+}
+
+/** PUT /api/v1/settings/investigator */
+export interface InvestigatorSettingsSave {
+  version: number
+  values?: InvestigatorValues
+  reset?: boolean
+  egressAcknowledged?: boolean
+}
+
+/** POST /api/v1/settings/investigator/test */
+export interface ConnectionTestResult {
+  ok: boolean
+  provider: string
+  region?: string
+  endpoint: string
+  model: string
+  identityArn?: string
+  account?: string
+  credentialSource?: string
+  latencyMs: number
+  at: string
+  error?: {
+    kind: 'no_credentials' | 'access_denied' | 'model_access' | 'model_unavailable' | 'network' | 'auth' | 'throttled' | 'config' | 'other'
+    message: string
+    hint?: string
+    action?: string
+    status?: number
+  }
 }

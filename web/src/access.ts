@@ -18,7 +18,7 @@ export function isScoped(info: Pick<Info, 'capabilities'> | undefined): boolean 
   return info?.capabilities !== undefined
 }
 
-export type Flag = 'inventory' | 'certs' | 'processes' | 'audit' | 'incidents' | 'alerts'
+export type Flag = 'inventory' | 'certs' | 'processes' | 'audit' | 'incidents' | 'alerts' | 'settings'
 
 /**
  * Whether the server offers a feature. Incidents and alerts count only when
@@ -29,6 +29,7 @@ export function hasFeature(info: Info | undefined, flag: Flag): boolean {
   if (!info) return false
   if (flag === 'incidents') return info.incidents?.enabled === true
   if (flag === 'alerts') return info.alerts?.enabled === true
+  if (flag === 'settings') return info.settings?.investigator === true
   return info[flag] === true
 }
 
@@ -64,6 +65,7 @@ const NOUN: Record<Capability, string> = {
   cloudtrail: 'AWS CloudTrail events',
   alertsUpdate: 'alert actions (ack and silence)',
   investigate: 'AI investigations',
+  settings: 'the Settings page',
 }
 
 /** Inline note where the server degrades a source to names only. */
@@ -85,6 +87,7 @@ const HIDDEN: Record<Capability, string> = {
   cloudtrail: 'CloudTrail changes are hidden: they need the kubesentry CloudTrail viewer role.',
   alertsUpdate: 'Ack and silence are unavailable: they need the kubesentry alerts responder role.',
   investigate: 'Investigate is unavailable: it needs the kubesentry investigator role.',
+  settings: 'Settings are hidden: they need the kubesentry settings admin role (update settings.kubesentry.io, cluster-wide).',
 }
 
 /** Note for a section hidden because the user lacks a capability. */
