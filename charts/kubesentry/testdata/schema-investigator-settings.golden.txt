@@ -1,0 +1,4 @@
+Error: values don't meet the specifications of the schema(s) in the following chart(s):
+kubesentry:
+- at '/incidents/investigator/settings': value must be one of 'ui', 'locked'
+

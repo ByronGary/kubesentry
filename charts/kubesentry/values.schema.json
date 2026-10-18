@@ -202,7 +202,8 @@
             "cloudtrailViewer": { "$ref": "#/definitions/viewerRole" },
             "logsViewer": { "$ref": "#/definitions/viewerRole" },
             "alertsResponder": { "$ref": "#/definitions/viewerRole" },
-            "investigator": { "$ref": "#/definitions/viewerRole" }
+            "investigator": { "$ref": "#/definitions/viewerRole" },
+            "settingsAdmin": { "$ref": "#/definitions/viewerRole" }
           }
         }
       }
@@ -708,6 +709,7 @@
           "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
+            "settings": { "enum": ["ui", "locked"] },
             "provider": { "enum": ["anthropic", "bedrock"] },
             "acknowledgeDataEgress": { "type": "boolean" },
             "model": { "type": "string" },

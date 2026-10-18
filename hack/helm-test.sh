@@ -130,6 +130,14 @@ golden investigator -f "$TESTDATA/investigator.values.yaml"
 # The default: Claude on Amazon Bedrock with the pod's role (no Secret).
 golden investigator-bedrock -f "$TESTDATA/incidents.values.yaml" --set incidents.investigator.enabled=true \
   --set incidents.investigator.acknowledgeDataEgress=true
+# Off, but its Helm values still reach the server (Settings starts from
+# them), the Anthropic key is mounted so Settings can switch to it, the
+# platform acknowledged the egress, the settings are locked (GitOps), and the
+# settings admin role is aggregated into admin.
+golden investigator-settings -f "$TESTDATA/incidents.values.yaml" --set incidents.investigator.settings=locked \
+  --set incidents.investigator.provider=anthropic --set incidents.investigator.existingSecret=kubesentry-anthropic \
+  --set incidents.investigator.acknowledgeDataEgress=true --set incidents.investigator.model=claude-opus-5-5 \
+  --set incidents.investigator.effort=max --set 'rbac.viewerRoles.settingsAdmin.aggregateTo={admin}'
 
 echo "== refused configurations"
 # Two replicas would each keep a partial, different audit history.
@@ -176,6 +184,7 @@ refuses guardrail-investigator-incidents --set incidents.investigator.enabled=tr
 refuses guardrail-investigator-secret --set incidents.enabled=true --set incidents.investigator.enabled=true \
   --set incidents.investigator.provider=anthropic --set incidents.investigator.acknowledgeDataEgress=true
 refuses schema-investigator-provider --set incidents.investigator.provider=openai
+refuses schema-investigator-settings --set incidents.investigator.settings=open
 
 if [ "$failed" -ne 0 ]; then
   echo "helm tests FAILED"

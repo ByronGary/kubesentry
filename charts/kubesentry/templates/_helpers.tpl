@@ -508,13 +508,19 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- with $ct.start }}{{ $a = append $a (printf "-cloudtrail-start=%s" .) }}{{ end -}}
 {{- end -}}
 {{- $ivr := $inc.investigator -}}
+{{- /* The investigator's values go to the server whether or not it is on:
+     they are the Helm values its Settings page starts from (settings: ui). */ -}}
 {{- if $ivr.enabled -}}
 {{- $a = append $a (printf "-investigator=%s" $ivr.provider) -}}
-{{- $a = append $a "-investigator-egress-ack=true" -}}
+{{- else if ne $ivr.provider "bedrock" -}}
+{{- $a = append $a (printf "-investigator-default-provider=%s" $ivr.provider) -}}
+{{- end -}}
+{{- if or $ivr.enabled $ivr.acknowledgeDataEgress }}{{ $a = append $a "-investigator-egress-ack=true" }}{{ end -}}
+{{- if eq (default "ui" $ivr.settings) "locked" }}{{ $a = append $a "-investigator-settings=locked" }}{{ end -}}
 {{- with $ivr.model }}{{ $a = append $a (printf "-investigator-model=%s" .) }}{{ end -}}
 {{- with $ivr.effort }}{{ $a = append $a (printf "-investigator-effort=%s" .) }}{{ end -}}
 {{- with $ivr.region }}{{ $a = append $a (printf "-investigator-region=%s" .) }}{{ end -}}
-{{- if eq $ivr.provider "bedrock" }}{{ with $ivr.bedrockAPI }}{{ $a = append $a (printf "-investigator-bedrock-api=%s" .) }}{{ end }}{{ end -}}
+{{- if or (eq $ivr.provider "bedrock") (not $ivr.enabled) }}{{ with $ivr.bedrockAPI }}{{ $a = append $a (printf "-investigator-bedrock-api=%s" .) }}{{ end }}{{ end -}}
 {{- with $ivr.endpoint }}{{ $a = append $a (printf "-investigator-endpoint=%s" .) }}{{ end -}}
 {{- with $ivr.fallback }}{{ $a = append $a (printf "-investigator-fallback=%s" .) }}{{ end -}}
 {{- with $ivr.timeout }}{{ $a = append $a (printf "-investigator-timeout=%s" .) }}{{ end -}}
@@ -522,7 +528,6 @@ Scalar for a flag value. Helm reads YAML numbers as float64, which print as
 {{- range $key, $flag := $lflags -}}
 {{- $val := index $ivr.limits $key -}}
 {{- if not (kindIs "invalid" $val) }}{{ $a = append $a (printf "-%s=%s" $flag (include "kubesentry.scalar" $val)) }}{{ end -}}
-{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- range $v.extraArgs }}{{ $a = append $a . }}{{ end -}}

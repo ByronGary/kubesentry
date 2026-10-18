@@ -163,6 +163,12 @@ rbac:
     # the default aggregates it into no role.
     investigator:
       aggregateTo: []
+    # update settings.kubesentry.io (cluster-wide): the Settings page, where
+    # admins turn the AI investigator on and off and change its provider,
+    # model and limits live (incidents.investigator.settings: ui). Reading
+    # the page needs it too: it shows role ARNs and the settings audit.
+    settingsAdmin:
+      aggregateTo: []
 
 # -- Server listener and tuning flags beyond the ones grouped elsewhere.
 server:
@@ -740,14 +746,22 @@ incidents:
   # investigations.kubesentry.io (rbac.viewerRoles.investigator).
   # docs/contracts.md "AI investigator"; Bedrock IAM in docs/deploy-eks.md.
   investigator:
+    # -- -investigator: on from the start. With settings: ui an admin can also
+    # turn it on (and off) on the Settings page, live, without a restart.
     enabled: false
-    # -- -investigator: bedrock (Claude on Amazon Bedrock in your AWS account,
+    # -- -investigator-settings: ui (these values are the initial ones; values
+    # an admin saves on the Settings page win over them, field by field, on
+    # every replica, audited) or locked (GitOps: these values only; the page is
+    # read-only). Needs rbac.viewerRoles.settingsAdmin to see the page.
+    settings: ui
+    # -- -investigator (or, while off, -investigator-default-provider): bedrock (Claude on Amazon Bedrock in your AWS account,
     # reached through a VPC endpoint; the recommended setup, docs/investigator.md)
     # or anthropic (the Anthropic API; needs existingSecret).
     provider: bedrock
     # -- -investigator-egress-ack: true accepts that a redacted digest of each
     # investigated incident, and the logs, events, audit and CloudTrail
-    # records the starting user may see, go to the provider. Required.
+    # records the starting user may see, go to the provider. Required with
+    # enabled; without it, the admin turning it on in Settings acknowledges.
     acknowledgeDataEgress: false
     # -- -investigator-model: empty uses claude-opus-5-5 (anthropic) or
     # anthropic.claude-opus-5-5 (bedrock; an inference-profile ID or ARN works too).
@@ -766,7 +780,8 @@ incidents:
       maxToolCalls: null  # -investigator-max-tool-calls (24) tool calls per run
       maxTokens: null     # -investigator-max-tokens (1500000) tokens per run, every kind summed
     # -- provider anthropic: the Secret holding the API key (set as
-    # ANTHROPIC_API_KEY in the server's environment), and its key.
+    # ANTHROPIC_API_KEY in the server's environment whenever it is named, so
+    # Settings can switch to the Anthropic API), and its key.
     existingSecret: ""
     apiKeyKey: api-key
 

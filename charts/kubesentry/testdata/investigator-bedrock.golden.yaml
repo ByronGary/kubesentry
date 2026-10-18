@@ -290,6 +290,25 @@ rules:
 
 ---
 # Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/settings: read and change kubesentry's run-time settings on the Settings page (the AI investigator: on and off, provider, model, limits), which shows role ARNs and the settings audit; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-settings-admin
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["settings"]
+    verbs: ["update"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
 # An incident's container logs, per namespace: the permission kubectl logs
 # needs, which kubesentry checks for each user. The built-in view role already
 # grants it; this role is for users who have narrower roles.
@@ -679,6 +698,11 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # The Settings page's setup steps name kubesentry's service account.
+            - name: KUBESENTRY_SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             # GOMEMLIMIT is left unset on purpose: the server sets it to 90% of the
             # cgroup memory limit, leaving headroom for non-heap memory.
             - name: AWS_REGION
