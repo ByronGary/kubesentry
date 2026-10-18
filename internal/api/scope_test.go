@@ -260,7 +260,18 @@ func TestNoAuthorizationLeaks(t *testing.T) {
 	// agents' (no ViewAgents).
 	s.Alerts.(*staticAlerts).set(append(tenantFindings(), gatedFindings()...))
 	runs := seedInvestigations(t, s) // one run per incident
+	// The Settings page holds role ARNs and its audit: nobody here has
+	// EditSettings, so it is 403 for all, reads included.
+	s.Settings = newFakeSettings(t, "ui", nil)
 	h := s.Handler()
+	for _, user := range []string{"alice", "bob", "carol"} {
+		for _, c := range []struct{ method, path, body string }{{http.MethodGet, "/api/v1/settings/investigator", ""},
+			{http.MethodPut, "/api/v1/settings/investigator", `{"version":0,"reset":true}`}, {http.MethodPost, "/api/v1/settings/investigator/test", ""}} {
+			if rec := sendAs(t, h, c.method, user, c.path, c.body, nil); rec.Code != 403 || strings.Contains(rec.Body.String(), "arn:") {
+				t.Errorf("%s %s as %s = %d, want 403", c.method, c.path, user, rec.Code)
+			}
+		}
+	}
 	routes := []string{
 		"/api/v1/pods", "/api/v1/workloads", "/api/v1/storage", "/api/v1/security", "/api/v1/security?view=summary",
 		"/api/v1/map", "/api/v1/map?namespace=team-a", "/api/v1/certificates", "/api/v1/pvcs/unused", "/api/v1/audit/events",

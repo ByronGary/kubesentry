@@ -21,6 +21,7 @@ import (
 	"github.com/ByronGary/kubesentry/internal/audit"
 	"github.com/ByronGary/kubesentry/internal/auth"
 	"github.com/ByronGary/kubesentry/internal/detectors"
+	"github.com/ByronGary/kubesentry/internal/incidents"
 	"github.com/ByronGary/kubesentry/internal/kube"
 	"github.com/ByronGary/kubesentry/internal/metrics"
 	"github.com/ByronGary/kubesentry/internal/model"
@@ -245,28 +246,31 @@ func run(cfg *config) error {
 		}
 	}
 
+	var runner *incidents.Runner
 	if cfg.incidents.enabled {
 		if cfg.auditStore != "postgres" {
 			slog.Warn("incidents with the memory store: run one replica; with more, each would keep incidents of its own (use -audit-store=postgres)")
 		}
-		runner, err := incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
+		runner, err = incidentsSetup{cfg: cfg, current: current, kick: built.subscribe(), clients: clients, cache: cache, prom: metricsSource,
 			pg: pg, audit: auditStore, alerts: alertsRunner, cw: cwl}.start(ctx, srv)
 		if err != nil {
 			return fmt.Errorf("incidents: %w", err)
 		}
-		if cfg.investigator.enabled() {
-			svc, err := investigatorSetup{cfg: cfg, runner: runner, current: current, pg: pg}.start(ctx, srv)
-			if err != nil {
-				return fmt.Errorf("investigator: %w", err)
+	}
+	// The investigator (with incidents) and its Settings page: the flags
+	// give its settings, an admin may change them live (-investigator-settings).
+	svc, err := investigatorSetup{cfg: cfg, runner: runner, current: current, pg: pg, inCluster: clients.InCluster}.start(ctx, srv)
+	if err != nil {
+		return fmt.Errorf("investigator: %w", err)
+	}
+	if svc != nil {
+		// At SIGTERM: no new runs, and this replica's running ones are
+		// stopped and stored as interrupted while the listeners drain.
+		onStop = append(onStop, func(ctx context.Context) {
+			if err := svc.Shutdown(ctx); err != nil {
+				slog.Warn("investigations still writing at shutdown", "err", err)
 			}
-			// At SIGTERM: no new runs, and this replica's running ones are
-			// stopped and stored as interrupted while the listeners drain.
-			onStop = append(onStop, func(ctx context.Context) {
-				if err := svc.Shutdown(ctx); err != nil {
-					slog.Warn("investigations still writing at shutdown", "err", err)
-				}
-			})
-		}
+		})
 	}
 
 	srv.Checks = append(srv.Checks, api.HealthCheck{Name: "snapshot", Check: func(context.Context) error {

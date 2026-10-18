@@ -35,6 +35,9 @@ type InvestigationsService interface {
 	Provider() string
 	Options() investigate.Options
 	PerHour() int
+	// Enabled is false while the investigator is off (Settings): starts
+	// answer 404, past runs stay readable.
+	Enabled() bool
 }
 
 var _ InvestigationsService = (*investigate.Service)(nil)
@@ -47,7 +50,10 @@ const (
 	investigationCancelRoute = "POST /api/v1/incidents/{id}/investigations/{iid}/cancel"
 )
 
-const errInvestigationNotFound = "investigation not found"
+const (
+	errInvestigationNotFound = "investigation not found"
+	errInvestigatorOff       = "the AI investigator is off"
+)
 
 // investigationStartResponse mirrors web/src/types.ts
 // InvestigationStartResponse.
@@ -74,7 +80,7 @@ type infoInvestigator struct {
 
 // infoInvestigator describes the investigator; nil when it is off.
 func (s *Server) infoInvestigator() *infoInvestigator {
-	if s.Investigations == nil || s.Incidents == nil {
+	if s.Investigations == nil || s.Incidents == nil || !s.Investigations.Enabled() {
 		return nil
 	}
 	o := s.Investigations.Options()
@@ -146,6 +152,10 @@ func (s *Server) investigationStart(w http.ResponseWriter, r *http.Request) {
 	if !optionalJSON(w, r, &req) {
 		return
 	}
+	if !s.Investigations.Enabled() {
+		writeError(w, http.StatusNotFound, errInvestigatorOff)
+		return
+	}
 	in, ok := s.visibleIncident(w, r)
 	if !ok {
 		return
@@ -165,6 +175,9 @@ func (s *Server) investigationStart(w http.ResponseWriter, r *http.Request) {
 	var busy *investigate.BusyError
 	switch {
 	case err == nil:
+	case errors.Is(err, investigate.ErrDisabled):
+		writeError(w, http.StatusNotFound, errInvestigatorOff)
+		return
 	case errors.Is(err, investigate.ErrIncidentNotFound), errors.Is(err, investigate.ErrNotFound):
 		writeError(w, http.StatusNotFound, errIncidentNotFound)
 		return

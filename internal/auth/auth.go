@@ -79,6 +79,10 @@ var (
 	// need it cluster-wide. A run sends a redacted digest of the incident,
 	// and what the caller may read inside it, to the model provider.
 	InvestigateIncidents = Capability{Verb: "create", Group: "kubesentry.io", Resource: "investigations", Namespaced: true}
+	// EditSettings lets a caller read and change kubesentry's run-time
+	// settings (the Settings page: the AI investigator), cluster-wide.
+	// Reading needs it too: the page shows role ARNs and the settings audit.
+	EditSettings = Capability{Verb: "update", Group: "kubesentry.io", Resource: "settings"}
 )
 
 // Scope is the set of namespaces a capability is granted in.

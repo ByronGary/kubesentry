@@ -40,6 +40,8 @@ type infoResponse struct {
 	Incidents *infoIncidents `json:"incidents,omitempty"`
 	// Investigator is left out when the AI investigator is off.
 	Investigator *infoInvestigator `json:"investigator,omitempty"`
+	// Settings is left out when the server has no Settings page.
+	Settings *infoSettings `json:"settings,omitempty"`
 }
 
 type infoIdentity struct {
@@ -164,6 +166,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	resp.Prometheus = s.prometheusInfo()
 	resp.Incidents = s.infoIncidents(resp.Capabilities)
 	resp.Investigator = s.infoInvestigator()
+	resp.Settings = s.infoSettings()
 
 	var fromView map[string]string
 	if v != nil {

@@ -41,7 +41,8 @@ func TestInvestigatorFlags(t *testing.T) {
 		ic.maxOutputTokens != 16_000 || ic.digestBytes != 64<<10 || ic.perHour != 10 || ic.perHourTotal != 60 || ic.concurrency != 2 {
 		t.Errorf("defaults = %+v", ic)
 	}
-	if ic.modelID() != "claude-opus-5-5" {
+	// Off, Settings starts from -investigator-default-provider (bedrock).
+	if ic.modelID() != "anthropic.claude-opus-5-5" {
 		t.Errorf("default model %q", ic.modelID())
 	}
 	on := []string{"-incidents", "-investigator=anthropic", "-investigator-egress-ack"}

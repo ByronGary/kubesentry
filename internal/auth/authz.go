@@ -483,6 +483,7 @@ var uiCapabilities = []struct {
 	{"cloudtrail", ViewCloudTrail},
 	{"alertsUpdate", UpdateAlerts},
 	{"investigate", InvestigateIncidents},
+	{"settings", EditSettings},
 }
 
 // Capabilities asks a for every capability the UI gates on and returns the

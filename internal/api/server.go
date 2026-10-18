@@ -162,10 +162,14 @@ type Server struct {
 	// routes under /api/v1/incidents/{id}/investigations and /info's
 	// investigator.
 	Investigations InvestigationsService
+	// Settings, if set, serves the Settings page's routes under
+	// /api/v1/settings/investigator and /info's settings.
+	Settings SettingsService
 
-	cacheOnce sync.Once
-	recheckMu sync.Mutex
-	rechecks  map[string]time.Time // identity key → last recheck
+	settingsTests testLimiter
+	cacheOnce     sync.Once
+	recheckMu     sync.Mutex
+	rechecks      map[string]time.Time // identity key → last recheck
 }
 
 // HealthCheck is one dependency /readyz reports on.
@@ -409,6 +413,9 @@ func (s *Server) apiRoutes() http.Handler {
 		if s.Investigations != nil {
 			s.investigationRoutes(mux, t, long)
 		}
+	}
+	if s.Settings != nil {
+		s.settingsRoutes(mux, t, long)
 	}
 	return withAuthzMemo(mux)
 }
