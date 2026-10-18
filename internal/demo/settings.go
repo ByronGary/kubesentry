@@ -65,7 +65,7 @@ func NewSettings(ctx context.Context, svc *investigate.Service, delay time.Durat
 }
 
 func (d *demoSettings) State(ctx context.Context) (*settings.State, error) { return d.m.State(ctx) }
-func (d *demoSettings) Mode() string                                      { return d.m.Mode() }
+func (d *demoSettings) Mode() string                                       { return d.m.Mode() }
 func (d *demoSettings) Save(ctx context.Context, r settings.SaveRequest) (*settings.State, error) {
 	return d.m.Save(ctx, r)
 }
