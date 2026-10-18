@@ -1,0 +1,1032 @@
+---
+# Source: kubesentry/templates/agent.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: agent
+# The agent never talks to the Kubernetes API.
+automountServiceAccountToken: false
+
+---
+# Source: kubesentry/templates/serviceaccount.yaml
+# IRSA: annotate with eks.amazonaws.com/role-arn. EKS Pod Identity: no
+# annotation; associate a role with this ServiceAccount
+# (aws eks create-pod-identity-association, docs/deploy-eks.md).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+automountServiceAccountToken: false
+
+---
+# Source: kubesentry/templates/secrets.yaml
+# API token (-api-token): break-glass access to /api/
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubesentry-api
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+type: Opaque
+data:
+  token: <generated>
+
+---
+# Source: kubesentry/templates/secrets.yaml
+# Agent token (-agent-token): authenticates node agents' reports
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+type: Opaque
+data:
+  token: <generated>
+
+---
+# Source: kubesentry/templates/configmap.yaml
+# Request profiles of your own, read by -incident-request-profiles-file.
+# kubesentry builds the PromQL from them (with -prometheus-selector); a
+# profile names labels, never a query.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubesentry-incidents
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+data:
+  request-profiles.json: |
+    [
+      {
+        "metric": "envoy_cluster_upstream_rq_total",
+        "name": "envoy",
+        "namespaceLabel": "namespace",
+        "serviceLabel": "service",
+        "statusLabel": "response_code"
+      }
+    ]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Read-only access to everything kubesentry watches. Secrets are deliberately
+# absent: kubesentry never reads them (the cert-manager page uses Certificate
+# status, not the issued Secret).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "persistentvolumes", "services", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+  # The IRSA role annotations (eks.amazonaws.com/role-arn) that tie CloudTrail
+  # changes to workloads; only ServiceAccounts with one are kept.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["list", "watch"]
+  # Optional: without cert-manager the Certificates page reports it as not installed.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates", "certificaterequests", "issuers", "clusterissuers"]
+    verbs: ["get", "list", "watch"]
+  # Optional: AWS Load Balancer Controller target groups, for ALB metrics and
+  # CloudTrail changes on incidents.
+  - apiGroups: ["elbv2.k8s.aws"]
+    resources: ["targetgroupbindings"]
+    verbs: ["list", "watch"]
+  # Incidents: Warning events (and the Normal reasons kept), watched by the
+  # replica running the incidents engine.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch"]
+  # Incidents: container logs, read when a user who may read them (get
+  # pods/log, checked per namespace) opens an incident.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Per-user scoping asks the API server what each signed-in user may see, and
+  # the startup probe checks kubesentry's own access per resource.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews", "selfsubjectaccessreviews"]
+    verbs: ["create"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/auditevents: audit events: bind with a RoleBinding for one namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-audit-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["auditevents"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/processes: processes inside pods, per namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-process-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["processes"]
+    verbs: ["get"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/agents: node agent health; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-agents-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["agents"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/cloudtrail: the AWS changes (CloudTrail) attached to incidents; needs a ClusterRoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-cloudtrail-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["cloudtrail"]
+    verbs: ["list"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/alerts: acknowledge and silence the alerts one can see: bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and cluster-scoped findings; kubesentry never writes to the cluster or to Alertmanager's silences.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-alerts-responder
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["alerts"]
+    verbs: ["update"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# Virtual resource kubesentry.io/investigations: start AI investigations of the incidents one can see (incidents.investigator): bind with a RoleBinding per namespace, or a ClusterRoleBinding for all namespaces and node incidents; each run sends a redacted digest of the incident to the model provider.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-investigator
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: ["kubesentry.io"]
+    resources: ["investigations"]
+    verbs: ["create"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+# An incident's container logs, per namespace: the permission kubectl logs
+# needs, which kubesentry checks for each user. The built-in view role already
+# grants it; this role is for users who have narrower roles.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubesentry-logs-viewer
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+rules:
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+---
+# Source: kubesentry/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubesentry
+subjects:
+  - kind: ServiceAccount
+    name: kubesentry
+    namespace: kubesentry
+
+---
+# Source: kubesentry/templates/services.yaml
+# Web: the UI and /api/. The oauth2-proxy sidecar when enabled, else kubesentry.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: web
+      port: 8080
+      targetPort: web
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Ingest: POST /agent/report and /audit/webhook, token-authenticated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ingest
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Headless ingest: one DNS record per ready replica, so agents post every
+# report to each replica (-server-fanout).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ingest-headless
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ingest-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ingest
+      port: 8081
+      targetPort: ingest
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/services.yaml
+# Ops: /metrics, /healthz, /readyz (and /debug/pprof/ with server.pprof).
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubesentry-ops
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+    kubesentry.io/listener: ops
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/component: server
+  ports:
+    - name: ops
+      port: 9090
+      targetPort: ops
+      protocol: TCP
+
+---
+# Source: kubesentry/templates/agent.yaml
+# Node agent: reports the processes inside pods. It reads
+# /proc/<pid>/{cgroup,stat,statm,cmdline} of pod processes only, never
+# environment variables, files or memory, and redacts command lines. hostPID is
+# its only host access: it is not privileged, runs as non-root and mounts
+# nothing from the host.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kubesentry-agent
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: agent
+spec:
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 10%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubesentry
+        app.kubernetes.io/instance: kubesentry
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/version: "0.1.0"
+    spec:
+      serviceAccountName: kubesentry-agent
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostPID: true
+      priorityClassName: system-node-critical
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/os
+                    operator: In
+                    values: ["linux"]
+                  # Fargate runs no DaemonSets; its virtual nodes would leave pods Pending.
+                  - key: eks.amazonaws.com/compute-type
+                    operator: NotIn
+                    values: ["fargate"]
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/byrongary/kubesentry-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -server=http://kubesentry-ingest.kubesentry.svc:8081
+            - -server-fanout=kubesentry-ingest-headless.kubesentry.svc
+            - -interval=15s
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-agent
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 20m
+              memory: 32Mi
+
+---
+# Source: kubesentry/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubesentry
+      app.kubernetes.io/instance: kubesentry
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubesentry
+        app.kubernetes.io/instance: kubesentry
+        app.kubernetes.io/component: server
+        app.kubernetes.io/version: "0.1.0"
+      annotations:
+        kubectl.kubernetes.io/default-container: server
+        checksum/request-profiles: 13627d5409d4da5a9ac5b7104b5c1987ff1b9b3a445651668ffe1edde88a6024
+    spec:
+      serviceAccountName: kubesentry
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - topologyKey: topology.kubernetes.io/zone
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesentry
+              app.kubernetes.io/instance: kubesentry
+              app.kubernetes.io/component: server
+          matchLabelKeys:
+            - pod-template-hash
+        - topologyKey: kubernetes.io/hostname
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: kubesentry
+              app.kubernetes.io/instance: kubesentry
+              app.kubernetes.io/component: server
+          matchLabelKeys:
+            - pod-template-hash
+      containers:
+        - name: server
+          image: ghcr.io/byrongary/kubesentry:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr=:8080
+            - -ingest-addr=:8081
+            - -ops-addr=:9090
+            - -cluster-name=prod-eks
+            - -auth-mode=token
+            - -agent-interval=15s
+            - -owner-annotation=kubesentry.io/owner
+            - -production-label=environment=production
+            - -alerts-default-owner=platform
+            - -prometheus-autodiscover=true
+            - -aws-region=us-east-1
+            - -audit-store=memory
+            - -incidents=true
+            - -incident-events-retention=72h
+            - -incident-interval=30s
+            - -incident-log-lag=15m
+            - -incident-log-lead=2m
+            - -incident-lookbehind=45m
+            - -incident-max-range=12h
+            - -incident-quiet=20m
+            - -incident-retention=14d
+            - -incident-namespaces=payments,checkout
+            - -incident-app-label=example.com/system
+            - -incident-error-crit-ratio=0.3
+            - -incident-error-ratio=0.1
+            - -incident-event-min-count=5
+            - -incident-memory-crit-pct=98
+            - -incident-memory-jump-min=256MiB
+            - -incident-memory-jump-ratio=2
+            - -incident-memory-limit-pct=90
+            - -incident-request-crit-ratio=6
+            - -incident-request-min-rps=0.5
+            - -incident-request-ratio=3
+            - -incident-spike-baseline=2h
+            - -incident-spike-recent=10m
+            - -incident-request-sources=nginx
+            - -incident-request-profiles-file=/etc/kubesentry/incidents/request-profiles.json
+            - -incident-alb=true
+            - -incident-event-normal-reasons=SuccessfulRescale,ScalingReplicaSet
+            - -incident-logs=auto
+            - -incident-logs-group=/aws/containerinsights/prod-eks/application
+            - -incident-logs-max-lines=5000
+            - -incident-logs-max-bytes=2MiB
+            - -incident-redact-patterns=card=[0-9]{12,19}
+            - '-incident-redact-patterns=X-Api-Key: \S+'
+            - -cloudtrail=lookup
+            - -cloudtrail-qps=0.5
+            - -cloudtrail-start=2h
+            - -investigator=bedrock
+            - -investigator-egress-ack=true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # GOMEMLIMIT is left unset on purpose: the server sets it to 90% of the
+            # cgroup memory limit, leaving headroom for non-heap memory.
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: KUBESENTRY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-api
+                  key: token
+            - name: KUBESENTRY_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: kubesentry-agent
+                  key: token
+          ports:
+            - name: web
+              containerPort: 8080
+              protocol: TCP
+            - name: ingest
+              containerPort: 8081
+              protocol: TCP
+            - name: ops
+              containerPort: 9090
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            failureThreshold: 3
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              # Keep serving while the load balancer deregisters this pod.
+              sleep:
+                seconds: 15
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: incidents
+              mountPath: /etc/kubesentry/incidents
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: incidents
+          configMap:
+            name: kubesentry-incidents
+
+---
+# Source: kubesentry/templates/prometheusrule.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kubesentry
+  namespace: kubesentry
+  labels:
+    helm.sh/chart: kubesentry-0.1.0
+    app.kubernetes.io/name: kubesentry
+    app.kubernetes.io/instance: kubesentry
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: kubesentry
+    app.kubernetes.io/component: server
+spec:
+  groups:
+    - name: kubesentry
+      rules:
+        # Stale only while a change is waiting for a rebuild: in a quiet
+        # cluster the view is old and so is the last change.
+        - alert: KubesentrySnapshotStale
+          expr: |
+            max by (namespace, pod) (kubesentry_snapshot_age_seconds{namespace="kubesentry"}) > 120
+            and
+            max by (namespace, pod) (kubesentry_snapshot_last_change_timestamp_seconds{namespace="kubesentry"})
+              > max by (namespace, pod) (time() - kubesentry_snapshot_age_seconds{namespace="kubesentry"})
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is serving a stale view of the cluster.
+            description: >-
+              {{ $labels.pod }} has served a snapshot older than 120s for 5 minutes while
+              cluster changes waited for a rebuild. Its rebuilds are failing or its informers are not keeping up with the API server.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotstale
+        - alert: KubesentrySnapshotBuildSlow
+          expr: |
+            histogram_quantile(0.9, sum by (namespace, pod, le) (rate(kubesentry_snapshot_build_seconds_bucket{namespace="kubesentry"}[15m])))
+              > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry takes too long to rebuild its view of the cluster.
+            description: >-
+              On {{ $labels.pod }}, 90% of view rebuilds over 15 minutes took up to {{ $value | humanizeDuration }}
+              (threshold 5s), so changes reach the UI late and CPU is spent on rebuilds.
+              Usually the cluster grew past the replica's CPU or memory, or object churn is high.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrysnapshotbuildslow
+        - alert: KubesentryAuthzReviewErrors
+          expr: |
+            sum by (namespace) (rate(kubesentry_authz_reviews_total{namespace="kubesentry",result="error"}[5m]))
+              / sum by (namespace) (rate(kubesentry_authz_reviews_total{namespace="kubesentry"}[5m]))
+              > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's SubjectAccessReviews are failing.
+            description: >-
+              More than 5% of SubjectAccessReviews failed over 10 minutes, so users see
+              less than their RBAC allows. Check API server health and APF throttling of kubesentry's ServiceAccount.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryauthzreviewerrors
+        - alert: KubesentryCacheHitRateCollapsed
+          expr: |
+            (
+              sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced"}[30m]))
+                / sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[30m]))
+              < 0.5 * (
+                sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced"}[1d]))
+                  / sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[1d]))
+              )
+            )
+            and
+            sum by (namespace) (rate(kubesentry_http_cache_total{namespace="kubesentry",result=~"hit|coalesced|miss"}[30m]))
+              > 0.5
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's response cache hit rate collapsed.
+            description: >-
+              The response cache in {{ $labels.namespace }} answered {{ $value | humanizePercentage }} of lookups
+              from cache over 30 minutes, less than 50% of its hit ratio over the last day.
+              Every miss runs the handler and its authorization checks, so CPU and SubjectAccessReviews rise.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycachehitratecollapsed
+        - alert: KubesentryRateLimited
+          expr: |
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="429",route!="auth_recheck"}[10m]))
+              > 0.05
+            and
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="429",route!="auth_recheck"}[10m]))
+              / sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is answering 429 Too Many Requests on a route.
+            description: >-
+              The {{ $labels.route }} route has answered 429 at {{ printf "%.2f" $value }}/s, more than
+              5% of its requests, for 15 minutes. Users hit the per-identity cap on expensive
+              routes (server.maxInflightPerIdentity), usually because the backend behind it (Prometheus or Postgres) is slow.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryratelimited
+        - alert: KubesentryServiceUnavailable
+          expr: |
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="503"}[10m]))
+              > 0.05
+            and
+            sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry",code="503"}[10m]))
+              / sum by (namespace, route) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is answering 503 Service Unavailable on a route.
+            description: >-
+              The {{ $labels.route }} route has answered 503 at {{ printf "%.2f" $value }}/s, more than
+              5% of its requests, for 15 minutes: route timeouts, an overloaded audit store,
+              a full audit write queue (ingest_audit_webhook), or an ingest route without its token.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryserviceunavailable
+        - alert: KubesentryRequestsRejected
+          expr: |
+            sum by (namespace, reason) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+              > 0.05
+            and on (namespace)
+            sum by (namespace) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+              / (
+                sum by (namespace) (rate(kubesentry_http_rejected_total{namespace="kubesentry",reason=~"rate_limit|max_inflight"}[10m]))
+                + sum by (namespace) (rate(kubesentry_http_requests_total{namespace="kubesentry"}[10m]))
+              )
+              > 0.05
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry turns API requests away before routing them.
+            description: >-
+              kubesentry in {{ $labels.namespace }} rejected requests ({{ $labels.reason }}) at
+              {{ printf "%.2f" $value }}/s, more than 5% of its API requests, for
+              15 minutes: users exceed the per-identity rate limit (server.rateLimit, 429), or more requests are in flight than
+              server.maxInflight allows (503).
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryrequestsrejected
+        - alert: KubesentryPrometheusUnreachable
+          expr: min by (namespace, pod) (kubesentry_dependency_up{namespace="kubesentry",dependency="prometheus"}) == 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot query Prometheus.
+            description: >-
+              {{ $labels.pod }} has failed to query its Prometheus for 10 minutes: memory charts, the /oom page and the
+              background leak scan (and so memory leak alerts) have no data. /info and the ops /readyz name the error.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryprometheusunreachable
+        - alert: KubesentryLeakScanFailing
+          expr: |
+            sum by (namespace, pod) (increase(kubesentry_leak_scan_runs_total{namespace="kubesentry",result="failed"}[30m])) > 0
+            unless on (namespace, pod)
+            sum by (namespace, pod) (increase(kubesentry_leak_scan_runs_total{namespace="kubesentry",result=~"ok|partial"}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry's background leak scan keeps failing.
+            description: >-
+              No leak scan on {{ $labels.pod }} has succeeded for an hour: the /oom page and the memory leak alerts keep
+              the last good findings, so new leaks go unnoticed. The scan's errors are in /api/v1/oom warnings and the server log.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryleakscanfailing
+        - alert: KubesentryCloudTrailFailing
+          expr: min by (namespace, pod) (kubesentry_dependency_up{namespace="kubesentry",dependency="cloudtrail"}) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read CloudTrail.
+            description: >-
+              {{ $labels.pod }} has failed to read CloudTrail for 15 minutes, so AWS changes (security groups, target
+              groups, node groups, IAM roles) no longer attach to incidents. /info (incidents.sources.cloudtrail) names the error.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycloudtrailfailing
+        # Events that could not be stored, event lists or watches the API
+        # server refused (403) after the permission probe passed, and the
+        # events source in error on the replica running the engine (a refused
+        # permission probe, or a watch that keeps failing).
+        - alert: KubesentryIncidentEventsFailing
+          expr: |
+            sum by (namespace, pod) (increase(kubesentry_k8s_events_total{namespace="kubesentry",result="error"}[10m])) > 0
+            or
+            sum by (namespace, pod) (increase(kubesentry_kube_requests_total{namespace="kubesentry",resource="events",code="403"}[10m])) > 0
+            or
+            (
+              min by (namespace, pod) (kubesentry_incident_source_up{namespace="kubesentry",source="events"}) == 0
+              and on (namespace, pod)
+              max by (namespace, pod) (kubesentry_incidents_leader{namespace="kubesentry"}) == 1
+            )
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry is losing Kubernetes events for incidents.
+            description: >-
+              For 15 minutes {{ $labels.pod }} has failed to store Kubernetes events, or cannot watch them (the API server
+              refused the watch or the permission to watch, or the watch keeps failing). BackOff, Unhealthy and FailedScheduling events
+              stop opening incidents, and incident pages miss their events.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidenteventsfailing
+        # A source the incidents engine reads is in error on the replica
+        # running the engine. CloudTrail has its own alert.
+        - alert: KubesentryIncidentSourceDown
+          expr: |
+            min by (namespace, source) (
+              kubesentry_incident_source_up{namespace="kubesentry",source!="cloudtrail"}
+              and on (namespace, pod)
+              max by (namespace, pod) (kubesentry_incidents_leader{namespace="kubesentry"}) == 1
+            ) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: An incidents source of kubesentry is failing.
+            description: >-
+              For 15 minutes the incidents source {{ $labels.source }} has been in error on the replica running the
+              incidents engine, so incidents miss what it reads (request or memory metrics, events, audit changes or logs).
+              /api/v1/info names the error under incidents.sources and unavailable.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentsourcedown
+        - alert: KubesentryIncidentLogsFailing
+          expr: |
+            sum by (namespace, source) (increase(kubesentry_incident_log_fetches_total{namespace="kubesentry",result="error"}[30m])) > 0
+            unless on (namespace, source)
+            sum by (namespace, source) (increase(kubesentry_incident_log_fetches_total{namespace="kubesentry",result=~"ok|truncated"}[30m])) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: kubesentry cannot read container logs for incidents.
+            description: >-
+              Every read of incident logs from {{ $labels.source }} in the last 30 minutes failed, so incident pages and
+              bundles show no logs. The log panel and the server log name the error: usually a missing permission
+              (pods/log, or logs:FilterLogEvents) or a log group that does not exist.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryincidentlogsfailing
+        - alert: KubesentryAgentNodesDropped
+          expr: |
+            max by (namespace) (kubesentry_agent_nodes_reporting{namespace="kubesentry"})
+              < 0.8 * max by (namespace) (max_over_time(kubesentry_agent_nodes_reporting{namespace="kubesentry"}[1h]))
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Fewer nodes report processes to kubesentry.
+            description: >-
+              Nodes reporting processes dropped by more than 20% within an hour.
+              Agents may be failing, or the cluster scaled down. Compare with the agent DaemonSet's ready count.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryagentnodesdropped
+        - alert: KubesentryCrashLooping
+          expr: |
+            max by (namespace, pod, container) (max_over_time(kube_pod_container_status_waiting_reason{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent",reason="CrashLoopBackOff"}[5m])) >= 1
+            or
+            max by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent"}[30m])) >= 3
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A kubesentry container is crash-looping.
+            description: >-
+              {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }} is in CrashLoopBackOff
+              or restarted at least 3 times in 30 minutes. A restarting server rebuilds its caches; with the memory
+              audit store it also loses its audit history.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentrycrashlooping
+        - alert: KubesentryOOMKilled
+          expr: |
+            max by (namespace, pod, container) (kube_pod_container_status_last_terminated_reason{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent",reason="OOMKilled"}) == 1
+            and on (namespace, pod, container)
+            max by (namespace, pod, container) (increase(kube_pod_container_status_restarts_total{namespace=~"kubesentry",pod=~"kubesentry-.+",container=~"server|agent"}[30m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A kubesentry container was OOM-killed.
+            description: >-
+              {{ $labels.container }} in {{ $labels.namespace }}/{{ $labels.pod }} restarted in the last
+              30 minutes after running out of memory. Its memory limit is too small for the cluster's size or for the agents' report bursts.
+            runbook_url: https://github.com/ByronGary/kubesentry/blob/main/docs/monitoring-eks.md#kubesentryoomkilled

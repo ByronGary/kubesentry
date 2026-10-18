@@ -108,8 +108,9 @@ lint dashboards --set metrics.grafanaDashboards.enabled=true
 lint alerts -f "$TESTDATA/alerts.values.yaml"
 lint incidents -f "$TESTDATA/incidents.values.yaml"
 lint investigator -f "$TESTDATA/investigator.values.yaml"
+# Bedrock is the default provider.
 lint investigator-bedrock -f "$TESTDATA/incidents.values.yaml" --set incidents.investigator.enabled=true \
-  --set incidents.investigator.provider=bedrock --set incidents.investigator.acknowledgeDataEgress=true
+  --set incidents.investigator.acknowledgeDataEgress=true
 
 echo "== golden renders"
 golden default
@@ -126,6 +127,9 @@ golden incidents -f "$TESTDATA/incidents.values.yaml"
 # The AI investigator on the Anthropic API: the key from a Secret, every
 # value set, the investigator role aggregated into admin.
 golden investigator -f "$TESTDATA/investigator.values.yaml"
+# The default: Claude on Amazon Bedrock with the pod's role (no Secret).
+golden investigator-bedrock -f "$TESTDATA/incidents.values.yaml" --set incidents.investigator.enabled=true \
+  --set incidents.investigator.acknowledgeDataEgress=true
 
 echo "== refused configurations"
 # Two replicas would each keep a partial, different audit history.
@@ -170,7 +174,7 @@ refuses guardrail-investigator-incidents --set incidents.investigator.enabled=tr
   --set incidents.investigator.acknowledgeDataEgress=true --set incidents.investigator.existingSecret=anthropic
 # ...and on the Anthropic API needs the key's Secret.
 refuses guardrail-investigator-secret --set incidents.enabled=true --set incidents.investigator.enabled=true \
-  --set incidents.investigator.acknowledgeDataEgress=true
+  --set incidents.investigator.provider=anthropic --set incidents.investigator.acknowledgeDataEgress=true
 refuses schema-investigator-provider --set incidents.investigator.provider=openai
 
 if [ "$failed" -ne 0 ]; then
