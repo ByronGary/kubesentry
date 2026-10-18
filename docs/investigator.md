@@ -4,7 +4,24 @@ The investigator reads one incident and writes a report: the most likely root ca
 
 It is **off by default**. When it is on, starting a run sends a redacted digest of the incident, and the logs, events, audit and CloudTrail records the person who started it may see, to the model provider. The recommended setup is **Claude on Amazon Bedrock in your own AWS account, reached through a VPC endpoint**, so requests never cross the public internet. The Anthropic API is supported as the alternative.
 
-`go run ./cmd/demo` shows the whole flow with a scripted, offline investigator: open an incident and press **Investigate**.
+`go run ./cmd/demo` shows the whole flow with a scripted, offline investigator: open an incident and press **Investigate**, or open **Settings** and turn it off and on.
+
+## Turn it on from Settings
+
+An admin turns the investigator on and off, and changes its provider, model and limits, on the **Settings** page (bottom of the sidebar). Changes apply at once on every replica, without a restart; running investigations finish on what they started with, and turning it off keeps past runs. Every change is recorded with who made it, when, and the old and new values.
+
+1. **Get the role.** The page needs `update` on `settings.kubesentry.io`, cluster-wide (reading it too: it shows role ARNs and the audit). The chart's role is `<release>-settings-admin`; aggregate it with `rbac.viewerRoles.settingsAdmin.aggregateTo`, or bind it with a ClusterRoleBinding.
+2. **Turn incidents on** (`incidents.enabled`): the investigator investigates incidents.
+3. **Give kubesentry a way to reach the model.** The page detects where kubesentry runs and where its AWS credentials come from, and generates the steps, with Copy on every block. **You never type AWS credentials into kubesentry**, and kubesentry stores no long-lived AWS keys; the Anthropic API key only ever comes from a Kubernetes Secret.
+   - **In EKS: no keys.** Give kubesentry's service account a role, with **IRSA** (the role policy, the trust policy on the cluster's OIDC issuer and the `eks.amazonaws.com/role-arn` annotation) or **EKS Pod Identity** (the same role policy, a trust policy for `pods.eks.amazonaws.com`, and `aws eks create-pod-identity-association`). Reach Bedrock through an **interface VPC endpoint** (`com.amazonaws.<region>.bedrock-mantle`, or `.bedrock-runtime`) with private DNS, 443 from the nodes and an endpoint policy, and enable model access in the Bedrock console. Section 3 has the detail.
+   - **Outside EKS.** From a laptop in remote mode (`-kube-context`, `-eks-cluster`), kubesentry calls Bedrock as you: `aws sso login --profile <profile>` and `AWS_PROFILE=<profile>`, with the inference action in your permission set. In another cluster, put a dedicated least-privilege identity's keys in a Kubernetes Secret you manage and rotate, mounted through `extraEnv` (prefer short-lived credentials such as IAM Roles Anywhere).
+   - **Anthropic API.** Create the Secret and set `incidents.investigator.existingSecret`; the chart mounts it as `ANTHROPIC_API_KEY` whether or not the investigator is on, so Settings can switch to it. A newly created Secret needs a restart.
+4. **Test connection.** It asks STS who kubesentry is (for Bedrock), then sends a one-token request to the model, and shows the identity ARN, the credential source, the region, the endpoint and the model, or what failed: no credentials, access denied (with the missing IAM action), model access not enabled, the model not available in the region, the endpoint unreachable (DNS: the VPC endpoint or its private DNS), or an Anthropic `401`. One test per person every 10 seconds.
+5. **Turn it on.** The switch asks you to acknowledge that investigations send redacted incident data to the provider, and records your acknowledgement with your name (with `acknowledgeDataEgress: true` in the chart, the platform has acknowledged it already). Settings that cannot be built, for example Bedrock credentials that do not resolve, are refused and nothing is stored.
+
+Each value shows whether it comes from Helm or was changed on the page (by whom, when); **Reset to Helm values** drops every change. A value saved on the page wins over the chart's; values never changed on the page follow the chart on the next upgrade.
+
+**GitOps: Helm only.** Set `incidents.investigator.settings: locked`: the chart's values are the only source, the page is read-only ("Locked by Helm") and a write answers `409`. Turn it on with `enabled: true` and `acknowledgeDataEgress: true` (sections 3.6 and 4).
 
 ## Contents
 
@@ -135,13 +152,14 @@ incidents:
     bedrockAPI: mantle           # or runtime, with model: us.anthropic.claude-opus-5-5
     # region: us-east-1          # default eks.region
     # endpoint: ""               # only without private DNS (3.3)
+    # settings: locked           # GitOps: these values only; the Settings page is read-only
 rbac:
   viewerRoles:
     investigator:
       aggregateTo: []            # bind <release>-investigator to the people who may start runs
 ```
 
-The region is `incidents.investigator.region`, else `eks.region` (`-aws-region`), else `AWS_REGION`. Credentials are resolved at startup: without them the server stops with an error rather than failing on the first run.
+The region is `incidents.investigator.region`, else `eks.region` (`-aws-region`), else `AWS_REGION`. Credentials are resolved when the settings are applied: with the investigator on in the chart, at startup (without them the server stops with an error rather than failing on the first run); when an admin turns it on in Settings, at the save (which is refused without them).
 
 ### 3.7 Verify
 
@@ -252,7 +270,9 @@ The run's steps note each turn a fallback model answered, and the report's last 
 | Flag | Helm (`incidents.investigator.`) | Default |
 |---|---|---|
 | `-investigator` | `enabled`, `provider` | `off`; chart `provider: bedrock` |
-| `-investigator-egress-ack` | `acknowledgeDataEgress` | false (required) |
+| `-investigator-settings` | `settings` | `ui` (`locked`: Helm only, the Settings page read-only) |
+| `-investigator-default-provider` | `provider` while `enabled: false` | `bedrock` (the provider Settings starts from) |
+| `-investigator-egress-ack` | `acknowledgeDataEgress` | false (required with `-investigator`; otherwise turning it on in Settings asks the admin) |
 | `-investigator-model` | `model` | `claude-opus-5-5`; Bedrock `anthropic.claude-opus-5-5` |
 | `-investigator-effort` | `effort` | `high` (`low`, `medium`, `high`, `xhigh`, `max`) |
 | `-investigator-region` | `region` | `-aws-region` (`eks.region`), then `AWS_REGION` |
@@ -264,7 +284,9 @@ The run's steps note each turn a fallback model answered, and the report's last 
 | `-investigator-max-output-tokens` | none | 16,000 |
 | `-investigator-digest-bytes` | none | 65,536 |
 | `-investigator-per-hour`, `-per-hour-total`, `-concurrency` | `limits.perHour`, `limits.perHourTotal`, `limits.concurrency` | 10, 60, 2 |
-| `ANTHROPIC_API_KEY` (environment) | `existingSecret`, `apiKeyKey` | none, `api-key` |
+| `ANTHROPIC_API_KEY` (environment) | `existingSecret`, `apiKeyKey` | none, `api-key` (mounted whenever `existingSecret` is set) |
+
+With `settings: ui` (the default) the flags are the starting values: an admin's changes on the Settings page win over them field by field and are applied live by every replica (each reads the stored version every 15 seconds; the saving replica at once). The chart passes the investigator's values even while `enabled: false`, so the page starts from them. `rbac.viewerRoles.settingsAdmin.aggregateTo` (default `[]`) aggregates `<release>-settings-admin` (`update settings.kubesentry.io`).
 
 The investigator also needs `-incidents` (`incidents.enabled`). The chart refuses it without the acknowledgement, without incidents, and with `provider: anthropic` but no Secret. Metrics: `kubesentry_investigations_total{provider,result}`, `kubesentry_investigations_running`, `kubesentry_investigation_duration_seconds`, `kubesentry_investigation_tokens_total`, `kubesentry_investigation_tool_calls_total{tool,result}`, `kubesentry_llm_requests_total{provider,code}`.
 
@@ -272,7 +294,12 @@ The investigator also needs `-incidents` (`incidents.enabled`). The chart refuse
 
 | What you see | Why, and what to do |
 |---|---|
-| No Investigate button | `/info` has no `investigator` (it is off, or `-incidents` is off), or you lack the `investigate` capability: bind `<release>-investigator`. |
+| No Investigate button | `/info` has no `investigator` (it is off, or `-incidents` is off), or you lack the `investigate` capability: bind `<release>-investigator`. An admin may turn it on in Settings. |
+| No Settings in the sidebar | You lack `update settings.kubesentry.io` cluster-wide: bind `<release>-settings-admin`. |
+| "Locked by Helm" on the Settings page | `incidents.investigator.settings: locked`: change the chart's values instead. |
+| Settings: "changed by someone else" | Another admin saved first (the version moved): reload and apply your change again. |
+| Settings: "could not be applied" | The settings could not be built on this replica, for example Bedrock credentials that do not resolve: run Test connection and follow its hint. Nothing was stored. |
+| Settings: "Not applied on this replica" | Another replica saved settings this one cannot build; it keeps what it ran before and retries every 15 seconds. |
 | "You may not investigate this incident" | You can see the incident but lack `create investigations.kubesentry.io` in its namespace (cluster-wide for node incidents). |
 | "You have started 10 investigations in the last hour…" | The per-person quota; the message says when to try again. "Everyone together…" is the total quota. Cached answers are free. |
 | "This server is running as many investigations as it may" | `-investigator-concurrency` runs are busy on this replica, or it is shutting down; try again in 30 seconds. |

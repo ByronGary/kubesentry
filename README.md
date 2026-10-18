@@ -23,7 +23,7 @@ Each user sees only what their Kubernetes RBAC allows.
 | **Security, certificates** | Pod security, RBAC, exposure and Pod Security labels; cert-manager expiry and failing issuers. |
 | **Storage** | Unused PVCs with an estimated monthly cost; EBS-aware, with EFS/FSx shown as "billed by usage". |
 | **Processes** | Per-pod processes from an optional node agent. |
-| **AI investigator** | Investigates an incident on request and writes a report: likely root cause with confidence, timeline and read-only checks, every claim citing evidence you can jump to. Runs Claude on Amazon Bedrock in your AWS account (VPC endpoint) or the Anthropic API; off by default. |
+| **AI investigator** | Investigates an incident on request and writes a report: likely root cause with confidence, timeline and read-only checks, every claim citing evidence you can jump to. Runs Claude on Amazon Bedrock in your AWS account (VPC endpoint) or the Anthropic API; off by default, turned on live from the Settings page (or locked to Helm). |
 | **Alerts** | Findings sent to Alertmanager (or the AMP alert manager), routed by owning team, with an Alerts page to acknowledge and silence them. Opt-in. |
 
 **Built for enterprise clusters:**
